@@ -38,6 +38,8 @@ tasks.withType(Test) {
 
   // Enable assertions during tests.
   jvmArgs += "-enableassertions"
+  // Config 1g maximum java heap size for test JVMs.
+  jvmArgs += "-Xmx1g"
   // Hide the Java 9+ warnings about illegal reflective access
   if (JavaVersion.current().isJava9Compatible()) {
     jvmArgs += "--illegal-access=permit"
@@ -60,11 +62,11 @@ tasks.withType(Test) {
   systemProperty "java.net.preferIPv4Stack", true
   systemProperty "java.security.egd", "file:/dev/urandom" // Improve RNG generation speed.
 
-  // Set rerunFailingTestsCount for use in BaseKuduTest.java to rerun failing tests.
-  systemProperty "rerunFailingTestsCount", propertyWithDefault("rerunFailingTestsCount", 0)
-
-  // Set kuduBinDir to the binaries to use with the MiniKuduCluster.
-  systemProperty "kuduBinDir", propertyWithDefault("kuduBinDir", "$project.rootDir/../build/latest/bin")
+  // Only use the local KuduBinDir if we are not using the kudu-binary jar.
+  if (!propertyExists("useBinJar")) {
+    // Set kuduBinDir to the binaries to use with the MiniKuduCluster.
+    systemProperty "kuduBinDir", propertyWithDefault("kuduBinDir", "$project.rootDir/../build/latest/bin")
+  }
 
   // Set testRandomSeed to override the seed for the PRNG exposed in
   // RandomUtils.java and used by various tests. This is useful when trying to

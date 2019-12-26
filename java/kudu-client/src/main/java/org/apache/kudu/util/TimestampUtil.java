@@ -17,13 +17,13 @@
 
 package org.apache.kudu.util;
 
-import org.apache.yetus.audience.InterfaceAudience;
-
 import java.sql.Timestamp;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.TimeZone;
+
+import org.apache.yetus.audience.InterfaceAudience;
 
 @InterfaceAudience.Private
 public class TimestampUtil {
@@ -75,6 +75,17 @@ public class TimestampUtil {
     Timestamp timestamp = new Timestamp(millis);
     timestamp.setNanos((int) nanos);
     return timestamp;
+  }
+
+  /**
+   * Transforms a timestamp into a string, whose formatting and timezone is consistent
+   * across Kudu.
+   * @param timestamp the timestamp
+   * @return a string, in the format: YYYY-MM-DDTHH:MM:SS.ssssssZ
+   */
+  public static String timestampToString(Timestamp timestamp) {
+    long micros = timestampToMicros(timestamp);
+    return timestampToString(micros);
   }
 
   /**

@@ -18,8 +18,6 @@
 #include "kudu/tablet/tablet.h"
 
 #include <algorithm>
-#include <cstdlib>
-#include <cstring>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -47,7 +45,6 @@
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/timestamp.h"
-#include "kudu/common/types.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/consensus/opid.pb.h"
@@ -134,17 +131,13 @@ DEFINE_double(tablet_throttler_burst_factor, 1.0f,
              "base rate.");
 TAG_FLAG(tablet_throttler_burst_factor, experimental);
 
-DEFINE_int32(tablet_history_max_age_sec, 15 * 60,
-             "Number of seconds to retain tablet history. Reads initiated at a "
-             "snapshot that is older than this age will be rejected. "
-             "To disable history removal, set to -1.");
+DEFINE_int32(tablet_history_max_age_sec, 60 * 60 * 24 * 7,
+             "Number of seconds to retain tablet history, including history "
+             "required to perform diff scans and incremental backups. Reads "
+             "initiated at a snapshot that is older than this age will be "
+             "rejected. To disable history removal, set to -1.");
 TAG_FLAG(tablet_history_max_age_sec, advanced);
-
-DEFINE_int32(max_cell_size_bytes, 64 * 1024,
-             "The maximum size of any individual cell in a table. Attempting to store "
-             "string or binary columns with a size greater than this will result "
-             "in errors.");
-TAG_FLAG(max_cell_size_bytes, unsafe);
+TAG_FLAG(tablet_history_max_age_sec, stable);
 
 // Large encoded keys cause problems because we store the min/max encoded key in the
 // CFile footer for the composite key column. The footer has a max length of 64K, so
@@ -160,13 +153,16 @@ TAG_FLAG(max_encoded_key_size_bytes, unsafe);
 METRIC_DEFINE_entity(tablet);
 METRIC_DEFINE_gauge_size(tablet, memrowset_size, "MemRowSet Memory Usage",
                          kudu::MetricUnit::kBytes,
-                         "Size of this tablet's memrowset");
+                         "Size of this tablet's memrowset",
+                         kudu::MetricLevel::kInfo);
 METRIC_DEFINE_gauge_size(tablet, on_disk_data_size, "Tablet Data Size On Disk",
                          kudu::MetricUnit::kBytes,
-                         "Space used by this tablet's data blocks.");
+                         "Space used by this tablet's data blocks.",
+                         kudu::MetricLevel::kInfo);
 METRIC_DEFINE_gauge_size(tablet, num_rowsets_on_disk, "Tablet Number of Rowsets on Disk",
                          kudu::MetricUnit::kUnits,
-                         "Number of diskrowsets in this tablet");
+                         "Number of diskrowsets in this tablet",
+                         kudu::MetricLevel::kInfo);
 
 using kudu::MaintenanceManager;
 using kudu::clock::HybridClock;
@@ -177,6 +173,7 @@ using std::ostream;
 using std::pair;
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::unordered_set;
 using std::vector;
 using strings::Substitute;
@@ -237,6 +234,7 @@ Tablet::Tablet(scoped_refptr<TabletMetadata> metadata,
     METRIC_num_rowsets_on_disk.InstantiateFunctionGauge(
       metric_entity_, Bind(&Tablet::num_rowsets, Unretained(this)))
       ->AutoDetach(&metric_detacher_);
+    METRIC_merged_entities_count_of_tablet.InstantiateHidden(metric_entity_, 1);
   }
 
   if (FLAGS_tablet_throttler_rpc_per_sec > 0 || FLAGS_tablet_throttler_bytes_per_sec > 0) {
@@ -257,13 +255,12 @@ Tablet::~Tablet() {
   std::lock_guard<simple_spinlock> l(state_lock_); \
   RETURN_NOT_OK(CheckHasNotBeenStoppedUnlocked()); \
   CHECK_EQ(expected_state, state_); \
-} while (0);
+} while (0)
 
 Status Tablet::Open() {
   TRACE_EVENT0("tablet", "Tablet::Open");
   RETURN_IF_STOPPED_OR_CHECK_STATE(kInitialized);
 
-  std::lock_guard<rw_spinlock> lock(component_lock_);
   CHECK(schema()->has_column_ids());
 
   next_mrs_id_ = metadata_->last_durable_mrs_id() + 1;
@@ -290,15 +287,6 @@ Status Tablet::Open() {
 
   shared_ptr<RowSetTree> new_rowset_tree(new RowSetTree());
   CHECK_OK(new_rowset_tree->Reset(rowsets_opened));
-  if (metrics_) {
-    // Compute the initial average height of the rowset tree.
-    double avg_height;
-    RowSetInfo::ComputeCdfAndCollectOrdered(*new_rowset_tree,
-                                            &avg_height,
-                                            nullptr,
-                                            nullptr);
-    metrics_->average_diskrowset_height->set_value(avg_height);
-  }
 
   // Now that the current state is loaded, create the new MemRowSet with the next id.
   shared_ptr<MemRowSet> new_mrs;
@@ -306,7 +294,13 @@ Status Tablet::Open() {
                                   log_anchor_registry_.get(),
                                   mem_trackers_.tablet_tracker,
                                   &new_mrs));
-  components_ = new TabletComponents(new_mrs, new_rowset_tree);
+  {
+    std::lock_guard<rw_spinlock> lock(component_lock_);
+    components_ = new TabletComponents(new_mrs, new_rowset_tree);
+  }
+
+  // Compute the initial average rowset height.
+  UpdateAverageRowsetHeight();
 
   {
     std::lock_guard<simple_spinlock> l(state_lock_);
@@ -400,25 +394,26 @@ void Tablet::SplitKeyRange(const EncodedKey* start_key,
                             column_ids, target_chunk_size, key_range_info);
 }
 
-Status Tablet::NewRowIterator(const Schema &projection,
-                              gscoped_ptr<RowwiseIterator> *iter) const {
+Status Tablet::NewRowIterator(const Schema& projection,
+                              unique_ptr<RowwiseIterator>* iter) const {
+  RowIteratorOptions opts;
   // Yield current rows.
-  MvccSnapshot snap(mvcc_);
-  return NewRowIterator(projection, snap, UNORDERED, iter);
+  opts.snap_to_include = MvccSnapshot(mvcc_);
+  opts.projection = &projection;
+  return NewRowIterator(std::move(opts), iter);
 }
 
-
-Status Tablet::NewRowIterator(const Schema &projection,
-                              const MvccSnapshot &snap,
-                              const OrderMode order,
-                              gscoped_ptr<RowwiseIterator> *iter) const {
+Status Tablet::NewRowIterator(RowIteratorOptions opts,
+                              unique_ptr<RowwiseIterator>* iter) const {
   RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   if (metrics_) {
     metrics_->scans_started->Increment();
   }
-  IOContext io_context({ tablet_id() });
-  VLOG_WITH_PREFIX(2) << "Created new Iterator under snap: " << snap.ToString();
-  iter->reset(new Iterator(this, projection, snap, order, std::move(io_context)));
+
+  VLOG_WITH_PREFIX(2) << "Created new Iterator for snapshot range: ("
+                      << (opts.snap_to_exclude ? opts.snap_to_exclude->ToString() : "-Inf")
+                      << ", " << opts.snap_to_include.ToString() << ")";
+  iter->reset(new Iterator(this, std::move(opts)));
   return Status::OK();
 }
 
@@ -426,7 +421,7 @@ Status Tablet::DecodeWriteOperations(const Schema* client_schema,
                                      WriteTransactionState* tx_state) {
   TRACE_EVENT0("tablet", "Tablet::DecodeWriteOperations");
 
-  DCHECK_EQ(tx_state->row_ops().size(), 0);
+  DCHECK(tx_state->row_ops().empty());
 
   // Acquire the schema lock in shared mode, so that the schema doesn't
   // change while this transaction is in-flight.
@@ -434,7 +429,7 @@ Status Tablet::DecodeWriteOperations(const Schema* client_schema,
 
   // The Schema needs to be held constant while any transactions are between
   // PREPARE and APPLY stages
-  TRACE("PREPARE: Decoding operations");
+  TRACE("Decoding operations");
   vector<DecodedRowOperation> ops;
 
   // Decode the ops
@@ -442,7 +437,7 @@ Status Tablet::DecodeWriteOperations(const Schema* client_schema,
                              client_schema,
                              schema(),
                              tx_state->arena());
-  RETURN_NOT_OK(dec.DecodeOperations(&ops));
+  RETURN_NOT_OK(dec.DecodeOperations<DecoderMode::WRITE_OPS>(&ops));
   TRACE_COUNTER_INCREMENT("num_ops", ops.size());
 
   // Important to set the schema before the ops -- we need the
@@ -456,11 +451,12 @@ Status Tablet::DecodeWriteOperations(const Schema* client_schema,
 Status Tablet::AcquireRowLocks(WriteTransactionState* tx_state) {
   TRACE_EVENT1("tablet", "Tablet::AcquireRowLocks",
                "num_locks", tx_state->row_ops().size());
-  TRACE("PREPARE: Acquiring locks for $0 operations", tx_state->row_ops().size());
+  TRACE("Acquiring locks for $0 operations", tx_state->row_ops().size());
   for (RowOp* op : tx_state->row_ops()) {
+    if (op->has_result()) continue;
     RETURN_NOT_OK(AcquireLockForOp(tx_state, op));
   }
-  TRACE("PREPARE: locks acquired");
+  TRACE("Locks acquired");
   return Status::OK();
 }
 
@@ -483,6 +479,9 @@ Status Tablet::CheckRowInTablet(const ConstContiguousRow& row) const {
 Status Tablet::AcquireLockForOp(WriteTransactionState* tx_state, RowOp* op) {
   ConstContiguousRow row_key(&key_schema_, op->decoded_op.row_data);
   op->key_probe.reset(new tablet::RowSetKeyProbe(row_key));
+  if (PREDICT_FALSE(!ValidateOpOrMarkFailed(op))) {
+    return Status::OK();
+  }
   RETURN_NOT_OK(CheckRowInTablet(row_key));
 
   op->row_lock = ScopedRowLock(&lock_manager_,
@@ -518,8 +517,12 @@ void Tablet::StartTransaction(WriteTransactionState* tx_state) {
   tx_state->SetMvccTx(std::move(mvcc_tx));
 }
 
-bool Tablet::ValidateOpOrMarkFailed(RowOp* op) const {
-  if (op->validated) return true;
+bool Tablet::ValidateOpOrMarkFailed(RowOp* op) {
+  if (op->valid) return true;
+  if (PREDICT_FALSE(op->has_result())) {
+    DCHECK(op->result->has_failed_status());
+    return false;
+  }
 
   Status s = ValidateOp(*op);
   if (PREDICT_FALSE(!s.ok())) {
@@ -527,11 +530,11 @@ bool Tablet::ValidateOpOrMarkFailed(RowOp* op) const {
     op->SetFailed(s);
     return false;
   }
-  op->validated = true;
+  op->valid = true;
   return true;
 }
 
-Status Tablet::ValidateOp(const RowOp& op) const {
+Status Tablet::ValidateOp(const RowOp& op) {
   switch (op.decoded_op.type) {
     case RowOperationsPB::INSERT:
     case RowOperationsPB::UPSERT:
@@ -542,28 +545,12 @@ Status Tablet::ValidateOp(const RowOp& op) const {
       return ValidateMutateUnlocked(op);
 
     default:
-      LOG_WITH_PREFIX(FATAL) << RowOperationsPB::Type_Name(op.decoded_op.type);
+      LOG(FATAL) << RowOperationsPB::Type_Name(op.decoded_op.type);
   }
-  abort(); // unreachable
+  __builtin_unreachable();
 }
 
-Status Tablet::ValidateInsertOrUpsertUnlocked(const RowOp& op) const {
-  // Check that no individual cell is larger than the specified max.
-  ConstContiguousRow row(schema(), op.decoded_op.row_data);
-  for (int i = 0; i < schema()->num_columns(); i++) {
-    if (!BitmapTest(op.decoded_op.isset_bitmap, i)) continue;
-    const auto& col = schema()->column(i);
-    if (col.type_info()->physical_type() != BINARY) continue;
-    const auto& cell = row.cell(i);
-    if (cell.is_nullable() && cell.is_null()) continue;
-    Slice s;
-    memcpy(&s, cell.ptr(), sizeof(s));
-    if (PREDICT_FALSE(s.size() > FLAGS_max_cell_size_bytes)) {
-      return Status::InvalidArgument(Substitute(
-          "value too large for column '$0' ($1 bytes, maximum is $2 bytes)",
-          col.name(), s.size(), FLAGS_max_cell_size_bytes));
-    }
-  }
+Status Tablet::ValidateInsertOrUpsertUnlocked(const RowOp& op) {
   // Check that the encoded key is not longer than the maximum.
   auto enc_key_size = op.key_probe->encoded_key_slice().size();
   if (PREDICT_FALSE(enc_key_size > FLAGS_max_encoded_key_size_bytes)) {
@@ -574,7 +561,7 @@ Status Tablet::ValidateInsertOrUpsertUnlocked(const RowOp& op) const {
   return Status::OK();
 }
 
-Status Tablet::ValidateMutateUnlocked(const RowOp& op) const {
+Status Tablet::ValidateMutateUnlocked(const RowOp& op) {
   RowChangeListDecoder rcl_decoder(op.decoded_op.changelist);
   RETURN_NOT_OK(rcl_decoder.Init());
   if (rcl_decoder.is_reinsert()) {
@@ -590,21 +577,7 @@ Status Tablet::ValidateMutateUnlocked(const RowOp& op) const {
     return Status::OK();
   }
 
-  // For updates, just check the new cell values themselves, and not the row key,
-  // following the same logic.
-  while (rcl_decoder.HasNext()) {
-    RowChangeListDecoder::DecodedUpdate cell_update;
-    RETURN_NOT_OK(rcl_decoder.DecodeNext(&cell_update));
-    if (cell_update.null) continue;
-    Slice s = cell_update.raw_value;
-    if (PREDICT_FALSE(s.size() > FLAGS_max_cell_size_bytes)) {
-      const auto& col = schema()->column_by_id(cell_update.col_id);
-      return Status::InvalidArgument(Substitute(
-          "value too large for column '$0' ($1 bytes, maximum is $2 bytes)",
-          col.name(), s.size(), FLAGS_max_cell_size_bytes));
-
-    }
-  }
+  DCHECK(rcl_decoder.is_update());
   return Status::OK();
 }
 
@@ -613,7 +586,7 @@ Status Tablet::InsertOrUpsertUnlocked(const IOContext* io_context,
                                       RowOp* op,
                                       ProbeStats* stats) {
   DCHECK(op->checked_present);
-  DCHECK(op->validated);
+  DCHECK(op->valid);
 
   const bool is_upsert = op->decoded_op.type == RowOperationsPB::UPSERT;
   const TabletComponents* comps = DCHECK_NOTNULL(tx_state->tablet_components());
@@ -710,8 +683,8 @@ Status Tablet::ApplyUpsertAsUpdate(const IOContext* io_context,
 vector<RowSet*> Tablet::FindRowSetsToCheck(const RowOp* op,
                                            const TabletComponents* comps) {
   vector<RowSet*> to_check;
-  if (PREDICT_TRUE(!op->orig_result_from_log_)) {
-    // TODO: could iterate the rowsets in a smart order
+  if (PREDICT_TRUE(!op->orig_result_from_log)) {
+    // TODO(yingchun): could iterate the rowsets in a smart order
     // based on recent statistics - eg if a rowset is getting
     // updated frequently, pick that one first.
     comps->rowsets->FindRowSetsWithKeyInRange(op->key_probe->encoded_key_slice(),
@@ -728,7 +701,7 @@ vector<RowSet*> Tablet::FindRowSetsToCheck(const RowOp* op,
 
   // If we are replaying an operation during bootstrap, then we already have a
   // COMMIT message which tells us specifically which memory store to apply it to.
-  for (const auto& store : op->orig_result_from_log_->mutated_stores()) {
+  for (const auto& store : op->orig_result_from_log->mutated_stores()) {
     if (store.has_mrs_id()) {
       to_check.push_back(comps->memrowset.get());
     } else {
@@ -752,7 +725,7 @@ Status Tablet::MutateRowUnlocked(const IOContext* io_context,
                                  RowOp* mutate,
                                  ProbeStats* stats) {
   DCHECK(mutate->checked_present);
-  DCHECK(mutate->validated);
+  DCHECK(mutate->valid);
 
   gscoped_ptr<OperationResultPB> result(new OperationResultPB());
   const TabletComponents* comps = DCHECK_NOTNULL(tx_state->tablet_components());
@@ -804,7 +777,7 @@ Status Tablet::BulkCheckPresence(const IOContext* io_context, WriteTransactionSt
     RowOp* op = row_ops_base[i];
     // If the op already failed in validation, or if we've got the original result
     // filled in already during replay, then we don't need to consult the RowSetTree.
-    if (op->has_result() || op->orig_result_from_log_) continue;
+    if (op->has_result() || op->orig_result_from_log) continue;
     keys_and_indexes.emplace_back(op->key_probe->encoded_key_slice(), i);
   }
 
@@ -931,11 +904,6 @@ Status Tablet::ApplyRowOperations(WriteTransactionState* tx_state) {
 
   StartApplying(tx_state);
 
-  // Validate all of the ops.
-  for (RowOp* op : tx_state->row_ops()) {
-    ValidateOpOrMarkFailed(op);
-  }
-
   IOContext io_context({ tablet_id() });
   RETURN_NOT_OK(BulkCheckPresence(&io_context, tx_state));
 
@@ -943,7 +911,6 @@ Status Tablet::ApplyRowOperations(WriteTransactionState* tx_state) {
   for (int op_idx = 0; op_idx < num_ops; op_idx++) {
     RowOp* row_op = tx_state->row_ops()[op_idx];
     if (row_op->has_result()) continue;
-
     RETURN_NOT_OK(ApplyRowOperation(&io_context, tx_state, row_op,
                                     tx_state->mutable_op_stats(op_idx)));
     DCHECK(row_op->has_result());
@@ -959,6 +926,10 @@ Status Tablet::ApplyRowOperation(const IOContext* io_context,
                                  WriteTransactionState* tx_state,
                                  RowOp* row_op,
                                  ProbeStats* stats) {
+  if (!ValidateOpOrMarkFailed(row_op)) {
+    return Status::OK();
+  }
+
   {
     std::lock_guard<simple_spinlock> l(state_lock_);
     RETURN_NOT_OK_PREPEND(CheckHasNotBeenStoppedUnlocked(),
@@ -969,10 +940,6 @@ Status Tablet::ApplyRowOperation(const IOContext* io_context,
   DCHECK(tx_state != nullptr) << "must have a WriteTransactionState";
   DCHECK(tx_state->op_id().IsInitialized()) << "TransactionState OpId needed for anchoring";
   DCHECK_EQ(tx_state->schema_at_decode_time(), schema());
-
-  if (!ValidateOpOrMarkFailed(row_op)) {
-    return Status::OK();
-  }
 
   // If we were unable to check rowset presence in batch (e.g. because we are processing
   // a batch which contains some duplicate keys) we need to do so now.
@@ -1051,10 +1018,10 @@ void Tablet::ModifyRowSetTree(const RowSetTree& old_tree,
   CHECK_OK(new_tree->Reset(post_swap));
 }
 
-void Tablet::AtomicSwapRowSets(const RowSetVector &old_rowsets,
-                               const RowSetVector &new_rowsets) {
+void Tablet::AtomicSwapRowSets(const RowSetVector &to_remove,
+                               const RowSetVector &to_add) {
   std::lock_guard<rw_spinlock> lock(component_lock_);
-  AtomicSwapRowSetsUnlocked(old_rowsets, new_rowsets);
+  AtomicSwapRowSetsUnlocked(to_remove, to_add);
 }
 
 void Tablet::AtomicSwapRowSetsUnlocked(const RowSetVector &to_remove,
@@ -1066,38 +1033,31 @@ void Tablet::AtomicSwapRowSetsUnlocked(const RowSetVector &to_remove,
                    to_remove, to_add, new_tree.get());
 
   components_ = new TabletComponents(components_->memrowset, new_tree);
-
-  // Recompute the average rowset height.
-  // TODO(wdberkeley): We should be able to cache the computation of the CDF
-  // and average height and efficiently recompute it instead of doing it from
-  // scratch.
-  if (metrics_) {
-    double avg_height;
-    RowSetInfo::ComputeCdfAndCollectOrdered(*new_tree,
-                                            &avg_height,
-                                            nullptr,
-                                            nullptr);
-    metrics_->average_diskrowset_height->set_value(avg_height);
-  }
 }
 
 Status Tablet::DoMajorDeltaCompaction(const vector<ColumnId>& col_ids,
-                                      const shared_ptr<RowSet>& input_rs) {
+                                      const shared_ptr<RowSet>& input_rs,
+                                      const IOContext* io_context) {
   RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   Status s = down_cast<DiskRowSet*>(input_rs.get())
-      ->MajorCompactDeltaStoresWithColumnIds(col_ids, nullptr, GetHistoryGcOpts());
+      ->MajorCompactDeltaStoresWithColumnIds(col_ids, io_context, GetHistoryGcOpts());
   return s;
 }
 
 bool Tablet::GetTabletAncientHistoryMark(Timestamp* ancient_history_mark) const {
+  int32_t tablet_history_max_age_sec = FLAGS_tablet_history_max_age_sec;
+  if (metadata_->extra_config() && metadata_->extra_config()->has_history_max_age_sec()) {
+    // Override the global configuration with the configuration of the table
+    tablet_history_max_age_sec = metadata_->extra_config()->history_max_age_sec();
+  }
   // We currently only support history GC through a fully-instantiated tablet
   // when using the HybridClock, since we can calculate the age of a mutation.
-  if (!clock_->HasPhysicalComponent() || FLAGS_tablet_history_max_age_sec < 0) {
+  if (!clock_->HasPhysicalComponent() || tablet_history_max_age_sec < 0) {
     return false;
   }
   Timestamp now = clock_->Now();
   uint64_t now_micros = HybridClock::GetPhysicalValueMicros(now);
-  uint64_t max_age_micros = FLAGS_tablet_history_max_age_sec * 1000000ULL;
+  uint64_t max_age_micros = tablet_history_max_age_sec * 1000000ULL;
   // Ensure that the AHM calculation doesn't underflow when
   // '--tablet_history_max_age_sec' is set to a very high value.
   if (max_age_micros <= now_micros) {
@@ -1211,16 +1171,17 @@ Status Tablet::FlushInternal(const RowSetsInCompaction& input,
                           "PostSwapNewMemRowSet hook failed");
   }
 
-  LOG_WITH_PREFIX(INFO) << "Flush: entering stage 1 (old memrowset already frozen for inserts)";
-  input.DumpToLog();
-  LOG_WITH_PREFIX(INFO) << "Memstore in-memory size: " << old_ms->memory_footprint() << " bytes";
+  VLOG_WITH_PREFIX(1) << Substitute("Flush: entering stage 1 (old memrowset"
+                                    "already frozen for inserts). Memstore"
+                                    "in-memory size: $0 bytes",
+                                    old_ms->memory_footprint());
 
   RETURN_NOT_OK(DoMergeCompactionOrFlush(input, mrs_being_flushed));
 
   // Sanity check that no insertions happened during our flush.
   CHECK_EQ(start_insert_count, old_ms->debug_insert_count())
     << "Sanity check failed: insertions continued in memrowset "
-    << "after flush was triggered! Aborting to prevent dataloss.";
+    << "after flush was triggered! Aborting to prevent data loss.";
 
   return Status::OK();
 }
@@ -1242,9 +1203,9 @@ Status Tablet::CreatePreparedAlterSchema(AlterSchemaTransactionState *tx_state,
   return Status::OK();
 }
 
-Status Tablet::AlterSchema(AlterSchemaTransactionState *tx_state) {
-  DCHECK(key_schema_.KeyTypeEquals(*DCHECK_NOTNULL(tx_state->schema()))) <<
-    "Schema keys cannot be altered(except name)";
+Status Tablet::AlterSchema(AlterSchemaTransactionState* tx_state) {
+  DCHECK(key_schema_.KeyTypeEquals(*DCHECK_NOTNULL(tx_state->schema())))
+      << "Schema keys cannot be altered(except name)";
 
   // Prevent any concurrent flushes. Otherwise, we run into issues where
   // we have an MRS in the rowset tree, and we can't alter its schema
@@ -1254,8 +1215,11 @@ Status Tablet::AlterSchema(AlterSchemaTransactionState *tx_state) {
   // If the current version >= new version, there is nothing to do.
   bool same_schema = schema()->Equals(*tx_state->schema());
   if (metadata_->schema_version() >= tx_state->schema_version()) {
-    LOG_WITH_PREFIX(INFO) << "Already running schema version " << metadata_->schema_version()
-                          << " got alter request for version " << tx_state->schema_version();
+    const string msg =
+        Substitute("Skipping requested alter to schema version $0, tablet already "
+                   "version $1", tx_state->schema_version(), metadata_->schema_version());
+    LOG_WITH_PREFIX(INFO) << msg;
+    tx_state->SetError(Status::InvalidArgument(msg));
     return Status::OK();
   }
 
@@ -1270,6 +1234,9 @@ Status Tablet::AlterSchema(AlterSchemaTransactionState *tx_state) {
     if (metric_entity_) {
       metric_entity_->SetAttribute("table_name", tx_state->new_table_name());
     }
+  }
+  if (tx_state->has_new_extra_config()) {
+    metadata_->SetExtraConfig(tx_state->new_extra_config());
   }
 
   // If the current schema and the new one are equal, there is nothing to do.
@@ -1524,8 +1491,9 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
   const IOContext io_context({ tablet_id() });
 
   MvccSnapshot flush_snap(mvcc_);
-  LOG_WITH_PREFIX(INFO) << op_name << ": entering phase 1 (flushing snapshot). Phase 1 snapshot: "
-                        << flush_snap.ToString();
+  VLOG_WITH_PREFIX(1) << Substitute("$0: entering phase 1 (flushing snapshot). "
+                                    "Phase 1 snapshot: $1",
+                                    op_name, flush_snap.ToString());
 
   if (common_hooks_) {
     RETURN_NOT_OK_PREPEND(common_hooks_->PostTakeMvccSnapshot(),
@@ -1610,8 +1578,9 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
   //
   // The way that we avoid this case is that DuplicatingRowSet's FlushDeltas method is a
   // no-op.
-  LOG_WITH_PREFIX(INFO) << op_name << ": entering phase 2 (starting to duplicate updates "
-                        << "in new rowsets)";
+  VLOG_WITH_PREFIX(1) << Substitute("$0: entering phase 2 (starting to "
+                                    "duplicate updates in new rowsets)",
+                                    op_name);
   shared_ptr<DuplicatingRowSet> inprogress_rowset(
     new DuplicatingRowSet(input.rowsets(), new_disk_rowsets));
 
@@ -1665,9 +1634,9 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
 
   // Phase 2. Here we re-scan the compaction input, copying those missed updates into the
   // new rowset's DeltaTracker.
-  LOG_WITH_PREFIX(INFO) << op_name
-                        << " Phase 2: carrying over any updates which arrived during Phase 1";
-  LOG_WITH_PREFIX(INFO) << "Phase 2 snapshot: " << non_duplicated_txns_snap.ToString();
+  VLOG_WITH_PREFIX(1) << Substitute("$0: Phase 2: carrying over any updates "
+                                    "which arrived during Phase 1. Snapshot: $1",
+                                    op_name, non_duplicated_txns_snap.ToString());
   RETURN_NOT_OK_PREPEND(
       input.CreateCompactionInput(non_duplicated_txns_snap, schema(), &io_context, &merge),
           Substitute("Failed to create $0 inputs", op_name).c_str());
@@ -1714,12 +1683,19 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
   // Replace the compacted rowsets with the new on-disk rowsets, making them visible now that
   // their metadata was written to disk.
   AtomicSwapRowSets({ inprogress_rowset }, new_disk_rowsets);
+  UpdateAverageRowsetHeight();
 
-  LOG_WITH_PREFIX(INFO) << Substitute("$0 successful on $1 rows ($2 rowsets, $3 bytes)",
-                                      op_name,
-                                      drsw.rows_written_count(),
-                                      drsw.drs_written_count(),
-                                      drsw.written_size());
+  const auto rows_written = drsw.rows_written_count();
+  const auto drs_written = drsw.drs_written_count();
+  const auto bytes_written = drsw.written_size();
+  TRACE_COUNTER_INCREMENT("rows_written", rows_written);
+  TRACE_COUNTER_INCREMENT("drs_written", drs_written);
+  TRACE_COUNTER_INCREMENT("bytes_written", bytes_written);
+  VLOG_WITH_PREFIX(1) << Substitute("$0 successful on $1 rows ($2 rowsets, $3 bytes)",
+                                    op_name,
+                                    rows_written,
+                                    drs_written,
+                                    bytes_written);
 
   if (common_hooks_) {
     RETURN_NOT_OK_PREPEND(common_hooks_->PostSwapNewRowSet(),
@@ -1738,7 +1714,27 @@ Status Tablet::HandleEmptyCompactionOrFlush(const RowSetVector& rowsets,
                         "Failed to flush new tablet metadata");
 
   AtomicSwapRowSets(rowsets, RowSetVector());
+  UpdateAverageRowsetHeight();
   return Status::OK();
+}
+
+void Tablet::UpdateAverageRowsetHeight() {
+  if (!metrics_) {
+    return;
+  }
+  // TODO(wdberkeley): We should be able to cache the computation of the CDF
+  // and average height and efficiently recompute it instead of doing it from
+  // scratch.
+  scoped_refptr<TabletComponents> comps;
+  GetComponents(&comps);
+  std::lock_guard<std::mutex> l(compact_select_lock_);
+  double rowset_total_height, rowset_total_width;
+  RowSetInfo::ComputeCdfAndCollectOrdered(*comps->rowsets,
+                                          &rowset_total_height,
+                                          &rowset_total_width,
+                                          nullptr,
+                                          nullptr);
+  metrics_->average_diskrowset_height->set_value(rowset_total_height, rowset_total_width);
 }
 
 Status Tablet::Compact(CompactFlags flags) {
@@ -1748,14 +1744,19 @@ Status Tablet::Compact(CompactFlags flags) {
   // Step 1. Capture the rowsets to be merged
   RETURN_NOT_OK_PREPEND(PickRowSetsToCompact(&input, flags),
                         "Failed to pick rowsets to compact");
-  LOG_WITH_PREFIX(INFO) << "Compaction: stage 1 complete, picked "
-                        << input.num_rowsets() << " rowsets to compact or flush";
+  const auto num_input_rowsets = input.num_rowsets();
+  TRACE_COUNTER_INCREMENT("num_input_rowsets", num_input_rowsets);
+  VLOG_WITH_PREFIX(1) << Substitute("Compaction: stage 1 complete, picked $0 "
+                                    "rowsets to compact or flush",
+                                    num_input_rowsets);
   if (compaction_hooks_) {
     RETURN_NOT_OK_PREPEND(compaction_hooks_->PostSelectIterators(),
                           "PostSelectIterators hook failed");
   }
 
-  input.DumpToLog();
+  if (VLOG_IS_ON(1)) {
+    input.DumpToLog();
+  }
 
   return DoMergeCompactionOrFlush(input, TabletMetadata::kNoMrsFlushed);
 }
@@ -1812,31 +1813,25 @@ Status Tablet::DebugDump(vector<string> *lines) {
 }
 
 Status Tablet::CaptureConsistentIterators(
-    const Schema* projection,
-    const MvccSnapshot& snap,
+    const RowIteratorOptions& opts,
     const ScanSpec* spec,
-    OrderMode order,
-    const IOContext* io_context,
-    vector<shared_ptr<RowwiseIterator>>* iters) const {
+    vector<IterWithBounds>* iters) const {
 
   shared_lock<rw_spinlock> l(component_lock_);
   RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
 
   // Construct all the iterators locally first, so that if we fail
   // in the middle, we don't modify the output arguments.
-  vector<shared_ptr<RowwiseIterator>> ret;
+  vector<IterWithBounds> ret;
 
-  RowIteratorOptions opts;
-  opts.projection = projection;
-  opts.snap_to_include = snap;
-  opts.order = order;
 
   // Grab the memrowset iterator.
-  gscoped_ptr<RowwiseIterator> ms_iter;
+  unique_ptr<RowwiseIterator> ms_iter;
   RETURN_NOT_OK(components_->memrowset->NewRowIterator(opts, &ms_iter));
-  ret.emplace_back(ms_iter.release());
+  IterWithBounds mrs_iwb;
+  mrs_iwb.iter = std::move(ms_iter);
+  ret.emplace_back(std::move(mrs_iwb));
 
-  opts.io_context = io_context;
 
   // Cull row-sets in the case of key-range queries.
   if (spec != nullptr && (spec->lower_bound_key() || spec->exclusive_upper_bound_key())) {
@@ -1846,29 +1841,29 @@ Status Tablet::CaptureConsistentIterators(
         boost::optional<Slice>(spec->exclusive_upper_bound_key()->encoded_key()) : boost::none;
     vector<RowSet*> interval_sets;
     components_->rowsets->FindRowSetsIntersectingInterval(lower_bound, upper_bound, &interval_sets);
-    for (const RowSet *rs : interval_sets) {
-      gscoped_ptr<RowwiseIterator> row_it;
-      RETURN_NOT_OK_PREPEND(rs->NewRowIterator(opts, &row_it),
+    for (const auto* rs : interval_sets) {
+      IterWithBounds iwb;
+      RETURN_NOT_OK_PREPEND(rs->NewRowIteratorWithBounds(opts, &iwb),
                             Substitute("Could not create iterator for rowset $0",
                                        rs->ToString()));
-      ret.emplace_back(row_it.release());
+      ret.emplace_back(std::move(iwb));
     }
-    ret.swap(*iters);
+    *iters = std::move(ret);
     return Status::OK();
   }
 
   // If there are no encoded predicates of the primary keys, then
   // fall back to grabbing all rowset iterators.
-  for (const shared_ptr<RowSet> &rs : components_->rowsets->all_rowsets()) {
-    gscoped_ptr<RowwiseIterator> row_it;
-    RETURN_NOT_OK_PREPEND(rs->NewRowIterator(opts, &row_it),
+  for (const shared_ptr<RowSet>& rs : components_->rowsets->all_rowsets()) {
+    IterWithBounds iwb;
+    RETURN_NOT_OK_PREPEND(rs->NewRowIteratorWithBounds(opts, &iwb),
                           Substitute("Could not create iterator for rowset $0",
                                      rs->ToString()));
-    ret.emplace_back(row_it.release());
+    ret.emplace_back(std::move(iwb));
   }
 
   // Swap results into the parameters.
-  ret.swap(*iters);
+  *iters = std::move(ret);
   return Status::OK();
 }
 
@@ -1889,9 +1884,31 @@ Status Tablet::CountRows(uint64_t *count) const {
   return Status::OK();
 }
 
+Status Tablet::CountLiveRows(uint64_t* count) const {
+  if (!metadata_->supports_live_row_count()) {
+    return Status::NotSupported("This tablet doesn't support live row counting");
+  }
+
+  scoped_refptr<TabletComponents> comps;
+  GetComponentsOrNull(&comps);
+  if (!comps) {
+    return Status::RuntimeError("The tablet has been shut down");
+  }
+
+  uint64_t ret = 0;
+  uint64_t tmp = 0;
+  RETURN_NOT_OK(comps->memrowset->CountLiveRows(&ret));
+  for (const shared_ptr<RowSet>& rowset : comps->rowsets->all_rowsets()) {
+    RETURN_NOT_OK(rowset->CountLiveRows(&tmp));
+    ret += tmp;
+  }
+  *count = ret;
+  return Status::OK();
+}
+
 size_t Tablet::MemRowSetSize() const {
   scoped_refptr<TabletComponents> comps;
-  GetComponents(&comps);
+  GetComponentsOrNull(&comps);
 
   if (comps) {
     return comps->memrowset->memory_footprint();
@@ -1915,7 +1932,7 @@ size_t Tablet::MemRowSetLogReplaySize(const ReplaySizeMap& replay_size_map) cons
 
 size_t Tablet::OnDiskSize() const {
   scoped_refptr<TabletComponents> comps;
-  GetComponents(&comps);
+  GetComponentsOrNull(&comps);
 
   if (!comps) return 0;
 
@@ -1929,7 +1946,7 @@ size_t Tablet::OnDiskSize() const {
 
 size_t Tablet::OnDiskDataSize() const {
   scoped_refptr<TabletComponents> comps;
-  GetComponents(&comps);
+  GetComponentsOrNull(&comps);
 
   if (!comps) return 0;
 
@@ -2345,9 +2362,16 @@ void Tablet::PrintRSLayout(ostream* o) {
     out << "</p>";
   }
 
-  double avg_height;
+  double rowset_total_height, rowset_total_width;
   vector<RowSetInfo> min, max;
-  RowSetInfo::ComputeCdfAndCollectOrdered(*rowsets_copy, &avg_height, &min, &max);
+  RowSetInfo::ComputeCdfAndCollectOrdered(*rowsets_copy,
+                                          &rowset_total_height,
+                                          &rowset_total_width,
+                                          &min,
+                                          &max);
+  double average_rowset_height = rowset_total_width > 0
+                               ? rowset_total_height / rowset_total_width
+                               : 0.0;
   DumpCompactionSVG(min, picked, o, /*print_xml_header=*/false);
 
   // Compaction policy ignores rowsets unavailable for compaction. This is good,
@@ -2409,7 +2433,7 @@ void Tablet::PrintRSLayout(ostream* o) {
                       HumanReadableNumBytes::ToString(size_bytes_median),
                       HumanReadableNumBytes::ToString(size_bytes_third_quartile),
                       HumanReadableNumBytes::ToString(size_bytes_max),
-                      avg_height);
+                      average_rowset_height);
     out << "</table>" << endl;
   }
 
@@ -2432,14 +2456,15 @@ string Tablet::LogPrefix() const {
 // Tablet::Iterator
 ////////////////////////////////////////////////////////////
 
-Tablet::Iterator::Iterator(const Tablet* tablet, const Schema& projection,
-                           MvccSnapshot snap, OrderMode order,
-                           IOContext io_context)
+Tablet::Iterator::Iterator(const Tablet* tablet,
+                           RowIteratorOptions opts)
     : tablet_(tablet),
-      projection_(projection),
-      snap_(std::move(snap)),
-      order_(order),
-      io_context_(std::move(io_context)) {}
+      io_context_({ tablet->tablet_id() }),
+      projection_(*CHECK_NOTNULL(opts.projection)),
+      opts_(std::move(opts)) {
+  opts_.io_context = &io_context_;
+  opts_.projection = &projection_;
+}
 
 Tablet::Iterator::~Iterator() {}
 
@@ -2449,18 +2474,17 @@ Status Tablet::Iterator::Init(ScanSpec *spec) {
 
   RETURN_NOT_OK(tablet_->GetMappedReadProjection(projection_, &projection_));
 
-  vector<shared_ptr<RowwiseIterator>> iters;
-  RETURN_NOT_OK(tablet_->CaptureConsistentIterators(&projection_, snap_, spec, order_,
-                                                    &io_context_, &iters));
+  vector<IterWithBounds> iters;
+  RETURN_NOT_OK(tablet_->CaptureConsistentIterators(opts_, spec, &iters));
   TRACE_COUNTER_INCREMENT("rowset_iterators", iters.size());
 
-  switch (order_) {
+  switch (opts_.order) {
     case ORDERED:
-      iter_.reset(new MergeIterator(projection_, std::move(iters)));
+      iter_ = NewMergeIterator(MergeIteratorOptions(opts_.include_deleted_rows), std::move(iters));
       break;
     case UNORDERED:
     default:
-      iter_.reset(new UnionIterator(std::move(iters)));
+      iter_ = NewUnionIterator(std::move(iters));
       break;
   }
 
@@ -2487,6 +2511,10 @@ string Tablet::Iterator::ToString() const {
     s.append(iter_->ToString());
   }
   return s;
+}
+
+const Schema& Tablet::Iterator::schema() const {
+  return *opts_.projection;
 }
 
 void Tablet::Iterator::GetIteratorStats(vector<IteratorStats>* stats) const {

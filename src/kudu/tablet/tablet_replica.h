@@ -47,6 +47,8 @@
 #include "kudu/util/status.h"
 
 namespace kudu {
+class AlterTableTest;
+class DnsResolver;
 class MaintenanceManager;
 class MaintenanceOp;
 class MonoDelta;
@@ -108,7 +110,8 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
                std::shared_ptr<rpc::Messenger> messenger,
                scoped_refptr<rpc::ResultTracker> result_tracker,
                scoped_refptr<log::Log> log,
-               ThreadPool* prepare_pool);
+               ThreadPool* prepare_pool,
+               DnsResolver* resolver);
 
   // Synchronously transition this replica to STOPPED state from any other
   // state. This also stops RaftConsensus. If a Stop() operation is already in
@@ -254,10 +257,7 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
     return log_anchor_registry_;
   }
 
-  // Returns the tablet_id of the tablet managed by this TabletReplica.
-  // Returns the correct tablet_id even if the underlying tablet is not available
-  // yet.
-  const std::string& tablet_id() const { return tablet_id_; }
+  const std::string& tablet_id() const { return meta_->tablet_id(); }
 
   // Convenience method to return the permanent_uuid of this peer.
   std::string permanent_uuid() const { return tablet_->metadata()->fs_manager()->uuid(); }
@@ -300,7 +300,24 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
   // Return the total on-disk size of this tablet replica, in bytes.
   size_t OnDiskSize() const;
 
+  // Counts the number of live rows in this tablet replica.
+  //
+  // Returns a bad Status on failure.
+  Status CountLiveRows(uint64_t* live_row_count) const;
+
+  // Like CountLiveRows but returns 0 on failure.
+  uint64_t CountLiveRowsNoFail() const;
+
+  // Update the tablet stats.
+  // When the replica's stats change and it's the LEADER, it is added to
+  // the 'dirty_tablets'.
+  void UpdateTabletStats(std::vector<std::string>* dirty_tablets);
+
+  // Return the tablet stats.
+  ReportedTabletStatsPB GetTabletStats() const;
+
  private:
+  friend class kudu::AlterTableTest;
   friend class RefCountedThreadSafe<TabletReplica>;
   friend class TabletReplicaTest;
   FRIEND_TEST(TabletReplicaTest, TestMRSAnchorPreventsLogGC);
@@ -322,7 +339,6 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
   const scoped_refptr<TabletMetadata> meta_;
   const scoped_refptr<consensus::ConsensusMetadataManager> cmeta_manager_;
 
-  const std::string tablet_id_;
   const consensus::RaftPeerPB local_peer_pb_;
   scoped_refptr<log::LogAnchorRegistry> log_anchor_registry_; // Assigned in tablet_replica-test
 
@@ -376,6 +392,9 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
   scoped_refptr<rpc::ResultTracker> result_tracker_;
 
   FunctionGaugeDetacher metric_detacher_;
+
+  // Cached stats for the tablet replica.
+  ReportedTabletStatsPB stats_pb_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletReplica);
 };

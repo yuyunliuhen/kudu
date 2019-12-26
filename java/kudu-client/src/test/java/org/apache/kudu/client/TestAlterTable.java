@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
 import static org.apache.kudu.test.ClientTestUtil.countRowsInTable;
@@ -21,17 +22,19 @@ import static org.apache.kudu.test.ClientTestUtil.scanTableToStrings;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
-import org.apache.kudu.test.KuduTestHarness;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -41,6 +44,7 @@ import org.apache.kudu.ColumnSchema.CompressionAlgorithm;
 import org.apache.kudu.ColumnSchema.Encoding;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
+import org.apache.kudu.test.KuduTestHarness;
 import org.apache.kudu.util.Pair;
 
 public class TestAlterTable {
@@ -114,7 +118,7 @@ public class TestAlterTable {
 
   @Test
   public void testAlterAddColumns() throws Exception {
-    KuduTable table = createTable(ImmutableList.<Pair<Integer,Integer>>of());
+    KuduTable table = createTable(ImmutableList.of());
     insertRows(table, 0, 100);
     assertEquals(100, countRowsInTable(table));
 
@@ -128,7 +132,7 @@ public class TestAlterTable {
     assertEquals(5, table.getSchema().getColumnCount());
 
     // Add a row with addNullableDef=null
-    KuduSession session = client.newSession();
+    final KuduSession session = client.newSession();
     Insert insert = table.newInsert();
     PartialRow row = insert.getRow();
     row.addInt("c0", 101);
@@ -142,8 +146,8 @@ public class TestAlterTable {
     assertEquals(String.format("row errors: %s", Arrays.toString(rowErrors)), 0, rowErrors.length);
 
     // Check defaults applied, and that row key=101
-    List<String> actual = scanTableToStrings(table);
-    List<String> expected = new ArrayList<>(101);
+    final List<String> actual = scanTableToStrings(table);
+    final List<String> expected = new ArrayList<>(101);
     for (int i = 0; i < 100; i++) {
       expected.add(i, String.format("INT32 c0=%d, INT32 c1=%d, INT32 addNonNull=100" +
           ", INT32 addNullable=NULL, INT32 addNullableDef=200", i, i));
@@ -156,7 +160,7 @@ public class TestAlterTable {
 
   @Test
   public void testAlterModifyColumns() throws Exception {
-    KuduTable table = createTable(ImmutableList.<Pair<Integer,Integer>>of());
+    KuduTable table = createTable(ImmutableList.of());
     insertRows(table, 0, 100);
     assertEquals(100, countRowsInTable(table));
 
@@ -164,7 +168,7 @@ public class TestAlterTable {
     ColumnSchema col = table.getSchema().getColumns().get(1);
     assertEquals(CompressionAlgorithm.DEFAULT_COMPRESSION, col.getCompressionAlgorithm());
     assertEquals(Encoding.AUTO_ENCODING, col.getEncoding());
-    assertEquals(null, col.getDefaultValue());
+    assertNull(col.getDefaultValue());
 
     // Alter the table.
     client.alterTable(tableName, new AlterTableOptions()
@@ -182,7 +186,7 @@ public class TestAlterTable {
 
   @Test
   public void testRenameKeyColumn() throws Exception {
-    KuduTable table = createTable(ImmutableList.<Pair<Integer,Integer>>of());
+    KuduTable table = createTable(ImmutableList.of());
     insertRows(table, 0, 100);
     assertEquals(100, countRowsInTable(table));
 
@@ -231,7 +235,7 @@ public class TestAlterTable {
 
   @Test
   public void testAlterRangePartitioning() throws Exception {
-    KuduTable table = createTable(ImmutableList.<Pair<Integer,Integer>>of());
+    KuduTable table = createTable(ImmutableList.of());
     Schema schema = table.getSchema();
 
     // Insert some rows, and then drop the partition and ensure that the table is empty.
@@ -321,7 +325,7 @@ public class TestAlterTable {
                                     RangePartitionBound.EXCLUSIVE_BOUND,
                                     RangePartitionBound.INCLUSIVE_BOUND);
 
-    KuduTable table = client.createTable(tableName, schema, createOptions);
+    final KuduTable table = client.createTable(tableName, schema, createOptions);
 
     lower.addInt("c0", 199);
     upper.addInt("c0", 299);
@@ -478,5 +482,45 @@ public class TestAlterTable {
           "No range partition found for drop range partition step"));
     }
     assertEquals(100, countRowsInTable(table));
+  }
+
+  @Test
+  public void testAlterExtraConfigs() throws Exception {
+    KuduTable table = createTable(ImmutableList.of());
+    insertRows(table, 0, 100);
+    assertEquals(100, countRowsInTable(table));
+
+    // 1. Check for expected defaults.
+    table = client.openTable(tableName);
+    Map<String, String> extraConfigs = table.getExtraConfig();
+    assertFalse(extraConfigs.containsKey("kudu.table.history_max_age_sec"));
+
+    // 2. Alter history max age second to 3600
+    Map<String, String> alterExtraConfigs = new HashMap<>();
+    alterExtraConfigs.put("kudu.table.history_max_age_sec", "3600");
+    client.alterTable(tableName, new AlterTableOptions().alterExtraConfigs(alterExtraConfigs));
+
+    table = client.openTable(tableName);
+    extraConfigs = table.getExtraConfig();
+    assertTrue(extraConfigs.containsKey("kudu.table.history_max_age_sec"));
+    assertEquals("3600", extraConfigs.get("kudu.table.history_max_age_sec"));
+
+    // 3. Alter history max age second to 7200
+    alterExtraConfigs = new HashMap<>();
+    alterExtraConfigs.put("kudu.table.history_max_age_sec", "7200");
+    client.alterTable(tableName, new AlterTableOptions().alterExtraConfigs(alterExtraConfigs));
+
+    table = client.openTable(tableName);
+    extraConfigs = table.getExtraConfig();
+    assertTrue(extraConfigs.containsKey("kudu.table.history_max_age_sec"));
+    assertEquals("7200", extraConfigs.get("kudu.table.history_max_age_sec"));
+
+    // 4. Reset history max age second to default
+    alterExtraConfigs = new HashMap<>();
+    alterExtraConfigs.put("kudu.table.history_max_age_sec", "");
+    client.alterTable(tableName, new AlterTableOptions().alterExtraConfigs(alterExtraConfigs));
+
+    table = client.openTable(tableName);
+    assertTrue(table.getExtraConfig().isEmpty());
   }
 }

@@ -1,19 +1,20 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package org.apache.kudu.spark.kudu
 
 import java.io.ByteArrayInputStream
@@ -21,6 +22,7 @@ import java.io.ByteArrayOutputStream
 import java.io.ObjectInputStream
 import java.io.ObjectOutputStream
 import java.math.BigDecimal
+import java.nio.charset.StandardCharsets.UTF_8
 import java.sql.Timestamp
 
 import org.apache.kudu.util.TimestampUtil
@@ -82,7 +84,8 @@ class KuduContextTest extends KuduTestSuite with Matchers {
           "c10_byte",
           "c11_decimal32",
           "c12_decimal64",
-          "c13_decimal128"
+          "c13_decimal128",
+          "c14_varchar"
         )
       )
       .map(r => r.toSeq)
@@ -97,7 +100,7 @@ class KuduContextTest extends KuduTestSuite with Matchers {
       assert(r.apply(5).asInstanceOf[Boolean] == (rows.apply(index)._2 % 2 == 1))
       assert(r.apply(6).asInstanceOf[Short] == rows.apply(index)._2.toShort)
       assert(r.apply(7).asInstanceOf[Float] == rows.apply(index)._2.toFloat)
-      val binaryBytes = s"bytes ${rows.apply(index)._2}".getBytes().toSeq
+      val binaryBytes = s"bytes ${rows.apply(index)._2}".getBytes(UTF_8).toSeq
       assert(r.apply(8).asInstanceOf[Array[Byte]].toSeq == binaryBytes)
       assert(
         r.apply(9).asInstanceOf[Timestamp] ==
@@ -106,6 +109,7 @@ class KuduContextTest extends KuduTestSuite with Matchers {
       assert(r.apply(11).asInstanceOf[BigDecimal] == BigDecimal.valueOf(rows.apply(index)._2))
       assert(r.apply(12).asInstanceOf[BigDecimal] == BigDecimal.valueOf(rows.apply(index)._2))
       assert(r.apply(13).asInstanceOf[BigDecimal] == BigDecimal.valueOf(rows.apply(index)._2))
+      assert(r.apply(14).asInstanceOf[String] == rows.apply(index)._3)
     })
   }
 
@@ -115,14 +119,15 @@ class KuduContextTest extends KuduTestSuite with Matchers {
     val sqlContext = ss.sqlContext
     val dataDF = sqlContext.read
       .options(Map("kudu.master" -> harness.getMasterAddressesAsString, "kudu.table" -> "test"))
-      .kudu
+      .format("kudu")
+      .load
     dataDF
       .sort("key")
       .select("c8_binary")
       .first
       .get(0)
       .asInstanceOf[Array[Byte]]
-      .shouldBe("bytes 0".getBytes)
+      .shouldBe("bytes 0".getBytes(UTF_8))
     // decode the binary to string and compare
     dataDF
       .sort("key")

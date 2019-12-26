@@ -22,7 +22,9 @@ import java.util.List;
 
 import com.google.protobuf.Message;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.jboss.netty.util.Timer;
 
+import org.apache.kudu.client.ListTablesResponse.TableInfo;
 import org.apache.kudu.master.Master;
 import org.apache.kudu.util.Pair;
 
@@ -31,8 +33,11 @@ class ListTablesRequest extends KuduRpc<ListTablesResponse> {
 
   private final String nameFilter;
 
-  ListTablesRequest(KuduTable masterTable, String nameFilter) {
-    super(masterTable);
+  ListTablesRequest(KuduTable masterTable,
+                    String nameFilter,
+                    Timer timer,
+                    long timeoutMillis) {
+    super(masterTable, timer, timeoutMillis);
     this.nameFilter = nameFilter;
   }
 
@@ -62,13 +67,13 @@ class ListTablesRequest extends KuduRpc<ListTablesResponse> {
     final Master.ListTablesResponsePB.Builder respBuilder =
         Master.ListTablesResponsePB.newBuilder();
     readProtobuf(callResponse.getPBMessage(), respBuilder);
-    int serversCount = respBuilder.getTablesCount();
-    List<String> tables = new ArrayList<String>(serversCount);
-    for (Master.ListTablesResponsePB.TableInfo info : respBuilder.getTablesList()) {
-      tables.add(info.getName());
+    int tablesCount = respBuilder.getTablesCount();
+    List<TableInfo> tableInfos = new ArrayList<>(tablesCount);
+    for (Master.ListTablesResponsePB.TableInfo infoPb : respBuilder.getTablesList()) {
+      tableInfos.add(new TableInfo(infoPb.getId().toStringUtf8(), infoPb.getName()));
     }
-    ListTablesResponse response = new ListTablesResponse(deadlineTracker.getElapsedMillis(),
-                                                         tsUUID, tables);
+    ListTablesResponse response = new ListTablesResponse(timeoutTracker.getElapsedMillis(),
+                                                         tsUUID, tableInfos);
     return new Pair<ListTablesResponse, Object>(
         response, respBuilder.hasError() ? respBuilder.getError() : null);
   }

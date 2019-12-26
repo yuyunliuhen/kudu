@@ -14,13 +14,20 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.util;
 
 import static org.junit.Assert.assertEquals;
 
+import org.junit.Rule;
 import org.junit.Test;
 
+import org.apache.kudu.test.junit.RetryRule;
+
 public class TestStringUtil {
+
+  @Rule
+  public RetryRule retryRule = new RetryRule();
 
   private String escapeSQLString(String s) {
     StringBuilder sb = new StringBuilder();

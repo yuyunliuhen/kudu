@@ -22,6 +22,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
@@ -40,7 +41,6 @@
 #include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/strcat.h"
@@ -51,6 +51,7 @@
 #include "kudu/util/faststring.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/memory/arena.h"
+#include "kudu/util/random.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
@@ -61,6 +62,10 @@ DEFINE_int32(roundtrip_num_rows, 10000,
              "Number of rows to use for the round-trip test");
 DEFINE_int32(num_scan_passes, 1,
              "Number of passes to run the scan portion of the round-trip test");
+DEFINE_double(update_ratio, 0.2,
+              "Percent of rows to be updated for the update performance test");
+DEFINE_int32(times_to_update, 5000,
+             "Number of updates for each row for the update performance test");
 
 namespace kudu {
 namespace tablet {
@@ -70,6 +75,7 @@ using log::LogAnchorRegistry;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
+using std::unordered_set;
 using std::vector;
 
 class TestMemRowSet : public KuduTest {
@@ -96,9 +102,9 @@ class TestMemRowSet : public KuduTest {
 
  protected:
   // Check that the given row in the memrowset contains the given data.
-  void CheckValue(const shared_ptr<MemRowSet> &mrs, string key,
-                  const string &expected_row) {
-    gscoped_ptr<MemRowSet::Iterator> iter(mrs->NewIterator());
+  void CheckValue(const shared_ptr<MemRowSet>& mrs, const string& key,
+                  const string& expected_row) {
+    unique_ptr<MemRowSet::Iterator> iter(mrs->NewIterator());
     ASSERT_OK(iter->Init(nullptr));
 
     Slice keystr_slice(key);
@@ -117,7 +123,7 @@ class TestMemRowSet : public KuduTest {
 
   Status CheckRowPresent(const MemRowSet &mrs,
                          const string &key, bool *present) {
-    RowBuilder rb(key_schema_);
+    RowBuilder rb(&key_schema_);
     rb.AddString(Slice(key));
     RowSetKeyProbe probe(rb.row());
     ProbeStats stats;
@@ -126,7 +132,7 @@ class TestMemRowSet : public KuduTest {
   }
 
   Status InsertRows(MemRowSet *mrs, int num_rows) {
-    RowBuilder rb(schema_);
+    RowBuilder rb(&schema_);
     char keybuf[256];
     for (uint32_t i = 0; i < num_rows; i++) {
       rb.Reset();
@@ -141,7 +147,7 @@ class TestMemRowSet : public KuduTest {
 
   Status InsertRow(MemRowSet *mrs, const string &key, uint32_t val) {
     ScopedTransaction tx(&mvcc_, clock_->Now());
-    RowBuilder rb(schema_);
+    RowBuilder rb(&schema_);
     rb.AddString(key);
     rb.AddUint32(val);
     tx.StartApplying();
@@ -161,7 +167,7 @@ class TestMemRowSet : public KuduTest {
     RowChangeListEncoder update(&mutation_buf_);
     update.AddColumnUpdate(schema_.column(1), schema_.column_id(1), &new_val);
 
-    RowBuilder rb(key_schema_);
+    RowBuilder rb(&key_schema_);
     rb.AddString(Slice(key));
     RowSetKeyProbe probe(rb.row());
     ProbeStats stats;
@@ -184,7 +190,7 @@ class TestMemRowSet : public KuduTest {
     RowChangeListEncoder update(&mutation_buf_);
     update.SetToDelete();
 
-    RowBuilder rb(key_schema_);
+    RowBuilder rb(&key_schema_);
     rb.AddString(Slice(key));
     RowSetKeyProbe probe(rb.row());
     ProbeStats stats;
@@ -200,11 +206,11 @@ class TestMemRowSet : public KuduTest {
   }
 
   int ScanAndCount(MemRowSet* mrs, const RowIteratorOptions& opts) {
-    gscoped_ptr<MemRowSet::Iterator> iter(mrs->NewIterator(opts));
+    unique_ptr<MemRowSet::Iterator> iter(mrs->NewIterator(opts));
     CHECK_OK(iter->Init(nullptr));
 
     Arena arena(1024);
-    RowBlock block(schema_, 100, &arena);
+    RowBlock block(&schema_, 100, &arena);
     int fetched = 0;
     while (iter->HasNext()) {
       CHECK_OK(iter->NextBlock(&block));
@@ -268,7 +274,7 @@ TEST_F(TestMemRowSet, TestInsertAndIterate) {
 
   ASSERT_EQ(2, mrs->entry_count());
 
-  gscoped_ptr<MemRowSet::Iterator> iter(mrs->NewIterator());
+  unique_ptr<MemRowSet::Iterator> iter(mrs->NewIterator());
   ASSERT_OK(iter->Init(nullptr));
 
   // The first row returned from the iterator should
@@ -299,7 +305,7 @@ TEST_F(TestMemRowSet, TestInsertAndIterateCompoundKey) {
   ASSERT_OK(MemRowSet::Create(0, compound_key_schema, log_anchor_registry_.get(),
                               MemTracker::GetRootTracker(), &mrs));
 
-  RowBuilder rb(compound_key_schema);
+  RowBuilder rb(&compound_key_schema);
   {
     ScopedTransaction tx(&mvcc_, clock_->Now());
     tx.StartApplying();
@@ -337,7 +343,7 @@ TEST_F(TestMemRowSet, TestInsertAndIterateCompoundKey) {
 
   ASSERT_EQ(3, mrs->entry_count());
 
-  gscoped_ptr<MemRowSet::Iterator> iter(mrs->NewIterator());
+  unique_ptr<MemRowSet::Iterator> iter(mrs->NewIterator());
   ASSERT_OK(iter->Init(nullptr));
 
   // The first row returned from the iterator should
@@ -543,7 +549,7 @@ TEST_F(TestMemRowSet, TestInsertionMVCC) {
     {
       ScopedTransaction tx(&mvcc_, clock_->Now());
       tx.StartApplying();
-      RowBuilder rb(schema_);
+      RowBuilder rb(&schema_);
       char keybuf[256];
       rb.Reset();
       snprintf(keybuf, sizeof(keybuf), "tx%d", i);
@@ -721,7 +727,7 @@ TEST_P(ParameterizedTestMemRowSet, TestScanSnapToExclude) {
   }
 
   {
-    NO_FATALS(DumpAndCheck(snaps[0], snaps[3], deleted_v, true)); // INSERT, UPDATE, DELETE
+    NO_FATALS(DumpAndCheck(snaps[0], snaps[3], boost::none)); // INSERT, UPDATE, DELETE
     NO_FATALS(DumpAndCheck(snaps[1], snaps[4], 2)); // UPDATE, DELETE, REINSERT
   }
 
@@ -771,6 +777,75 @@ TEST_F(TestMemRowSet, TestScanVirtualColumnIsDeleted) {
   for (const auto& row_idx_deleted : { 2, 3, 6 }) {
     ASSERT_STR_CONTAINS(rows[row_idx_deleted], "=true");
   }
+}
+
+// Test for update performance.
+// Can simulates zipfian distribution of updates by setting --update_ratio to a small value
+// and --times_to_update to a high value.
+TEST_F(TestMemRowSet, TestMemRowSetUpdatePerformance) {
+  shared_ptr<MemRowSet> mrs;
+  ASSERT_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
+                              MemTracker::GetRootTracker(), &mrs));
+  int num_rows = 1000;
+  LOG_TIMING(INFO, "Inserting rows") {
+    ASSERT_OK(InsertRows(mrs.get(), num_rows));
+  }
+
+  LOG_TIMING(INFO, "Counting rows") {
+    int count = mrs->entry_count();
+    ASSERT_EQ(num_rows, count);
+  }
+
+  int nums_to_update = FLAGS_update_ratio * num_rows;
+  unordered_set<int> rows_to_update;
+  Random rand(SeedRandom());
+  while (rows_to_update.size() < nums_to_update) {
+    int next = rand.Uniform(num_rows);
+    rows_to_update.insert(next);
+  }
+
+  LOG_TIMING(INFO, "Updating rows") {
+    for (int i = 0; i < FLAGS_times_to_update; ++i) {
+      for (auto row_idx : rows_to_update) {
+        OperationResultPB result;
+        string key = "hello " + std::to_string(row_idx);
+        ASSERT_OK(UpdateRow(mrs.get(), key, i, &result));
+        ASSERT_EQ(1, result.mutated_stores_size());
+        ASSERT_EQ(0L, result.mutated_stores(0).mrs_id());
+      }
+    }
+  }
+}
+
+TEST_F(TestMemRowSet, TestCountLiveRows) {
+  shared_ptr<MemRowSet> mrs;
+  ASSERT_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
+                              MemTracker::GetRootTracker(), &mrs));
+
+  const auto CheckLiveRowsCount = [&](int64_t expect) {
+    uint64_t count = 0;
+    ASSERT_OK(mrs->CountLiveRows(&count));
+    ASSERT_EQ(expect, count);
+  };
+
+  NO_FATALS(CheckLiveRowsCount(0));
+  ASSERT_OK(GenerateTestData(mrs.get()));
+  NO_FATALS(CheckLiveRowsCount(4));
+
+  ASSERT_OK(InsertRow(mrs.get(), "liverow 0", 0));
+  NO_FATALS(CheckLiveRowsCount(5));
+  ASSERT_OK(InsertRow(mrs.get(), "liverow 1", 0));
+  NO_FATALS(CheckLiveRowsCount(6));
+
+  OperationResultPB result;
+  ASSERT_OK(DeleteRow(mrs.get(), "liverow 0", &result));
+  NO_FATALS(CheckLiveRowsCount(5));
+
+  ASSERT_OK(InsertRow(mrs.get(), "liverow 0", 0));
+  NO_FATALS(CheckLiveRowsCount(6));
+
+  ASSERT_OK(UpdateRow(mrs.get(), "liverow 0", 1, &result));
+  NO_FATALS(CheckLiveRowsCount(6));
 }
 
 } // namespace tablet

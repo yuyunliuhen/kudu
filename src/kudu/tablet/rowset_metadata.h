@@ -93,7 +93,7 @@ class RowSetMetadata {
 
   Status Flush();
 
-  void AddOrphanedBlocks(const std::vector<BlockId>& blocks);
+  void AddOrphanedBlocks(const BlockIdContainer& blocks);
 
   const std::string ToString() const;
 
@@ -117,7 +117,11 @@ class RowSetMetadata {
 
   void SetColumnDataBlocks(const std::map<ColumnId, BlockId>& blocks_by_col_id);
 
-  Status CommitRedoDeltaDataBlock(int64_t dms_id, const BlockId& block_id);
+  // Atomically commit the new redo delta block to RowSetMetadata.
+  // This atomic operation includes updates to last_durable_redo_dms_id_ and live_row_count_.
+  Status CommitRedoDeltaDataBlock(int64_t dms_id,
+                                  int64_t num_deleted_rows,
+                                  const BlockId& block_id);
 
   Status CommitUndoDeltaDataBlock(const BlockId& block_id);
 
@@ -218,11 +222,20 @@ class RowSetMetadata {
   // Returns the blocks removed from the rowset metadata during the update.
   // These blocks must be added to the TabletMetadata's orphaned blocks list.
   void CommitUpdate(const RowSetMetadataUpdate& update,
-                    std::vector<BlockId>* removed);
+                    BlockIdContainer* removed);
 
   void ToProtobuf(RowSetDataPB *pb);
 
-  std::vector<BlockId> GetAllBlocks();
+  BlockIdContainer GetAllBlocks();
+
+  // Increase the row count.
+  // Note:
+  //   1) A positive number means plus the live rows,
+  //   2) A negative number means minus the deleted rows.
+  void IncrementLiveRows(int64_t row_count);
+
+  // Returns the number of live rows in this metadata.
+  int64_t live_row_count() const;
 
  private:
   friend class TabletMetadata;
@@ -232,7 +245,8 @@ class RowSetMetadata {
   explicit RowSetMetadata(TabletMetadata *tablet_metadata)
     : tablet_metadata_(tablet_metadata),
       initted_(false),
-      last_durable_redo_dms_id_(kNoDurableMemStore) {
+      last_durable_redo_dms_id_(kNoDurableMemStore),
+      live_row_count_(0) {
   }
 
   RowSetMetadata(TabletMetadata *tablet_metadata,
@@ -240,10 +254,13 @@ class RowSetMetadata {
     : tablet_metadata_(DCHECK_NOTNULL(tablet_metadata)),
       initted_(true),
       id_(id),
-      last_durable_redo_dms_id_(kNoDurableMemStore) {
+      last_durable_redo_dms_id_(kNoDurableMemStore),
+      live_row_count_(0) {
   }
 
   Status InitFromPB(const RowSetDataPB& pb);
+
+  void IncrementLiveRowsUnlocked(int64_t row_count);
 
   TabletMetadata* const tablet_metadata_;
   bool initted_;
@@ -265,6 +282,9 @@ class RowSetMetadata {
   std::vector<BlockId> undo_delta_blocks_;
 
   int64_t last_durable_redo_dms_id_;
+
+  // Number of live rows on disk, excluding those in [MRS/DMS].
+  int64_t live_row_count_;
 
   DISALLOW_COPY_AND_ASSIGN(RowSetMetadata);
 };

@@ -24,6 +24,7 @@
 #include <ostream>
 #include <string>
 
+#include <boost/optional/optional.hpp>
 #include <glog/logging.h>
 
 #include "kudu/gutil/strings/substitute.h"
@@ -36,6 +37,7 @@
 #include "kudu/util/subprocess.h"
 #include "kudu/util/test_util.h"
 
+using boost::none;
 using kudu::rpc::SaslProtection;
 using std::map;
 using std::string;
@@ -54,11 +56,6 @@ MiniHms::~MiniHms() {
   WARN_NOT_OK(Stop(), "Failed to stop MiniHms");
 }
 
-void MiniHms::SetNotificationLogTtl(MonoDelta ttl) {
-  CHECK(hms_process_);
-  notification_log_ttl_ = ttl;
-}
-
 void MiniHms::EnableKerberos(string krb5_conf,
                              string service_principal,
                              string keytab_file,
@@ -73,7 +70,25 @@ void MiniHms::EnableKerberos(string krb5_conf,
   protection_ = protection;
 }
 
+void MiniHms::EnableSentry(const HostPort& sentry_address,
+                           string sentry_service_principal,
+                           int sentry_client_rpc_retry_num,
+                           int sentry_client_rpc_retry_interval_ms) {
+  CHECK(!hms_process_);
+  DCHECK(!sentry_service_principal.empty());
+  VLOG(1) << Substitute("Enabling Sentry, at $0, for HMS", sentry_address.ToString());
+  sentry_address_ = sentry_address.ToString();
+  sentry_service_principal_ = std::move(sentry_service_principal);
+  sentry_client_rpc_retry_num_ = sentry_client_rpc_retry_num;
+  sentry_client_rpc_retry_interval_ms_ = sentry_client_rpc_retry_interval_ms;
+}
+
+void MiniHms::EnableKuduPlugin(bool enable) {
+  enable_kudu_plugin_ = enable;
+}
+
 void MiniHms::SetDataRoot(string data_root) {
+  CHECK(!hms_process_);
   data_root_ = std::move(data_root);
 }
 
@@ -92,9 +107,11 @@ Status MiniHms::Start() {
   string hadoop_home;
   string hive_home;
   string java_home;
+  string sentry_home;
   RETURN_NOT_OK(FindHomeDir("hadoop", bin_dir, &hadoop_home));
   RETURN_NOT_OK(FindHomeDir("hive", bin_dir, &hive_home));
   RETURN_NOT_OK(FindHomeDir("java", bin_dir, &java_home));
+  RETURN_NOT_OK(FindHomeDir("sentry", bin_dir, &sentry_home));
 
   if (data_root_.empty()) {
     data_root_ = GetTestDataDirectory();
@@ -104,9 +121,10 @@ Status MiniHms::Start() {
   RETURN_NOT_OK(CreateCoreSite());
   RETURN_NOT_OK(CreateLogConfig());
 
-  // Comma-separated list of additional jars to add to the HMS classpath.
-  string aux_jars = Substitute("$0/hms-plugin.jar,$1/hcatalog/share/hcatalog/*",
-                               bin_dir, hive_home);
+  // Comma-separated list of additional jars to add to the HMS classpath, including
+  // the HMS plugins of Kudu and Sentry.
+  string aux_jars = Substitute("$0/hms-plugin.jar,$1/hcatalog/share/hcatalog/*,$2/lib/*",
+                               bin_dir, hive_home, sentry_home);
 
   // List of JVM environment options to pass to the HMS.
   string java_options =
@@ -120,6 +138,10 @@ Status MiniHms::Start() {
     // timeout.
     "-Dderby.locks.deadlockTimeout=1";
 
+  // By default, Derby will create its log file in the current working
+  // directory. We want it in data_root_.
+  java_options += Substitute(" -Dderby.stream.error.file=$0/derby.log", data_root_);
+
   if (!krb5_conf_.empty()) {
     java_options += Substitute(" -Djava.security.krb5.conf=$0", krb5_conf_);
   }
@@ -127,11 +149,25 @@ Status MiniHms::Start() {
   map<string, string> env_vars {
       { "JAVA_HOME", java_home },
       { "HADOOP_HOME", hadoop_home },
+      { "HADOOP_CONF_DIR",  Substitute("$0/etc/hadoop", hadoop_home) },
       { "HIVE_AUX_JARS_PATH", aux_jars },
       { "HIVE_CONF_DIR", data_root_ },
       { "JAVA_TOOL_OPTIONS", java_options },
-      { "HADOOP_CONF_DIR", data_root_ },
+      // Set HADOOP_OS_TYPE=Linux due to HADOOP-8719.
+      // TODO(ghenke): Remove after HADOOP-15966 is available (Hadoop 3.1.3+)
+      { "HADOOP_OS_TYPE", "Linux" }
   };
+
+  // Run the schematool to initialize the database if not yet initialized.
+  // Instead of running slow 'schematool -dbType derby -info' to check whether
+  // the database has been created already, a faster way is to check whether
+  // Derby's database sub-directory exists.
+  if (!Env::Default()->FileExists(JoinPathSegments(data_root_, metadb_subdir_))) {
+    RETURN_NOT_OK(Subprocess::Call({Substitute("$0/bin/schematool", hive_home),
+                                    "-dbType", "derby", "-initSchema"}, "",
+                                   nullptr, nullptr,
+                                   env_vars));
+  }
 
   // Start the HMS.
   hms_process_.reset(new Subprocess({
@@ -144,9 +180,10 @@ Status MiniHms::Start() {
   hms_process_->SetEnvVars(env_vars);
   RETURN_NOT_OK(hms_process_->Start());
 
-  // Wait for HMS to start listening on its ports and commencing operation.
+  // Wait for HMS to start listening on its ports and commencing operation
+  // with a wildcard binding.
   VLOG(1) << "Waiting for HMS ports";
-  Status wait = WaitForTcpBind(hms_process_->pid(), &port_,
+  Status wait = WaitForTcpBind(hms_process_->pid(), &port_, /*addr=*/none,
                                MonoDelta::FromMilliseconds(kHmsStartTimeoutMs));
   if (!wait.ok()) {
     WARN_NOT_OK(hms_process_->Kill(SIGQUIT), "failed to send SIGQUIT to HMS");
@@ -183,12 +220,15 @@ string MiniHms::uris() const {
   return Substitute("thrift://127.0.0.1:$0", port_);
 }
 
+bool MiniHms::IsAuthorizationEnabled() const {
+  return !sentry_address_.empty() && IsKerberosEnabled();
+}
+
 Status MiniHms::CreateHiveSite() const {
 
-  // - datanucleus.schema.autoCreateAll
-  // - hive.metastore.schema.verification
-  //     Allow Hive to startup and run without first running the schemaTool.
-  //
+  const string listeners = Substitute("org.apache.hive.hcatalog.listener.DbNotificationListener$0",
+      enable_kudu_plugin_ ? ",org.apache.kudu.hive.metastore.KuduMetastorePlugin" : "");
+
   // - hive.metastore.event.db.listener.timetolive
   //     Configures how long the Metastore will store notification log events
   //     before GCing them.
@@ -206,61 +246,59 @@ Status MiniHms::CreateHiveSite() const {
   //     names.
   //
   // - hive.metastore.notifications.add.thrift.objects
-  //     Configured the HMS to add the entire thrift Table/Partition
+  //     Configures the HMS to add the entire thrift Table/Partition
   //     objects to the HMS notifications.
-  static const string kFileTemplate = R"(
+  //
+  // - hive.metastore.event.db.notification.api.auth
+  //     Disables the authorization on the DbNotificationListener related
+  //     metastore APIs such as get_next_notification. If set to true, then
+  //     only the superusers in proxy settings have the permission.
+  //
+  // - hive.log4j.file
+  //     Configures the location of the HMS log4j configuration.
+  //
+  static const string kHiveFileTemplate = R"(
 <configuration>
   <property>
     <name>hive.metastore.transactional.event.listeners</name>
     <value>
-      org.apache.hive.hcatalog.listener.DbNotificationListener,
-      org.apache.kudu.hive.metastore.KuduMetastorePlugin
+      $0
     </value>
   </property>
 
   <property>
-    <name>datanucleus.schema.autoCreateAll</name>
-    <value>true</value>
-  </property>
-
-  <property>
-    <name>hive.metastore.schema.verification</name>
-    <value>false</value>
-  </property>
-
-  <property>
     <name>hive.metastore.warehouse.dir</name>
-    <value>file://$1/warehouse/</value>
+    <value>file://$2/warehouse/</value>
   </property>
 
   <property>
     <name>javax.jdo.option.ConnectionURL</name>
-    <value>jdbc:derby:$1/metadb;create=true</value>
+    <value>jdbc:derby:$2/$9;create=true</value>
   </property>
 
   <property>
     <name>hive.metastore.event.db.listener.timetolive</name>
-    <value>$0s</value>
+    <value>$1s</value>
   </property>
 
   <property>
     <name>hive.metastore.sasl.enabled</name>
-    <value>$2</value>
-  </property>
-
-  <property>
-    <name>hive.metastore.kerberos.keytab.file</name>
     <value>$3</value>
   </property>
 
   <property>
-    <name>hive.metastore.kerberos.principal</name>
+    <name>hive.metastore.kerberos.keytab.file</name>
     <value>$4</value>
   </property>
 
   <property>
-    <name>hadoop.rpc.protection</name>
+    <name>hive.metastore.kerberos.principal</name>
     <value>$5</value>
+  </property>
+
+  <property>
+    <name>hadoop.rpc.protection</name>
+    <value>$6</value>
   </property>
 
   <property>
@@ -277,19 +315,142 @@ Status MiniHms::CreateHiveSite() const {
     <name>hive.metastore.notifications.add.thrift.objects</name>
     <value>true</value>
   </property>
+
+  <property>
+    <name>hive.metastore.event.db.notification.api.auth</name>
+    <value>false</value>
+  </property>
+
+  <property>
+    <name>hive.log4j.file</name>
+    <value>$7</value>
+  </property>
+
+  $8
 </configuration>
   )";
 
-  string file_contents = Substitute(kFileTemplate,
-                                    notification_log_ttl_.ToSeconds(),
-                                    data_root_,
-                                    !keytab_file_.empty(),
-                                    keytab_file_,
-                                    service_principal_,
-                                    SaslProtection::name_of(protection_));
+  string sentry_properties;
+  if (IsAuthorizationEnabled()) {
+
+    // - hive.sentry.conf.url
+    //     Configuration URL of the Sentry authorization plugin in the HMS.
+    //
+    // - hive.metastore.filter.hook
+    //     Configures the HMS to use the Sentry plugin for filtering
+    //     out information user has no privileges to access for operations
+    //     as SHOWTABLES and SHOWDATABASES.
+    //
+    // - hive.metastore.pre.event.listeners
+    //     Configures the HMS to use the Sentry event listener to
+    //     consult Sentry service for authorization metadata when servicing
+    //     requests.
+    //
+    // - hive.metastore.event.listeners
+    //     Configures the HMS to use the Sentry post-event listener, which
+    //     synchronizes the HMS events with the Sentry service. The Sentry
+    //     service will be made aware of events like table renames and
+    //     update itself accordingly.
+    static const string kHiveSentryFileTemplate = R"(
+<property>
+  <name>hive.sentry.conf.url</name>
+  <value>file://$0/hive-sentry-site.xml</value>
+</property>
+
+<property>
+  <name>hive.metastore.filter.hook</name>
+  <value>org.apache.sentry.binding.metastore.SentryMetaStoreFilterHook</value>
+</property>
+
+<property>
+  <name>hive.metastore.pre.event.listeners</name>
+  <value>org.apache.sentry.binding.metastore.MetastoreAuthzBinding</value>
+</property>
+
+<property>
+  <name>hive.metastore.event.listeners</name>
+  <value>org.apache.sentry.binding.metastore.SentrySyncHMSNotificationsPostEventListener</value>
+</property>
+    )";
+
+    sentry_properties = Substitute(kHiveSentryFileTemplate, data_root_);
+  }
+
+  string hive_file_contents = Substitute(kHiveFileTemplate,
+                                         listeners,
+                                         notification_log_ttl_.ToSeconds(),
+                                         data_root_,
+                                         IsKerberosEnabled(),
+                                         keytab_file_,
+                                         service_principal_,
+                                         SaslProtection::name_of(protection_),
+                                         JoinPathSegments(data_root_, "hive-log4j2.properties"),
+                                         sentry_properties,
+                                         metadb_subdir_);
+
+  if (IsAuthorizationEnabled()) {
+    // - hive.sentry.server
+    //     Server namespace the HMS instance belongs to for defining
+    //     server-level privileges in Sentry.
+    //
+    // - sentry.metastore.service.users
+    //     Set of service users whose access will be excluded from
+    //     Sentry authorization checks.
+    //
+    // - sentry.service.client.rpc.retry-total
+    //     Maximum number of attempts that Sentry RPC client does while
+    //     re-trying a remote call to Sentry.
+    //
+    // - sentry.service.client.rpc.retry.interval.msec
+    //     Time interval between attempts of Sentry's client to retry a remote
+    //     call to Sentry.
+    static const string kSentryFileTemplate = R"(
+<configuration>
+  <property>
+    <name>sentry.service.client.server.rpc-addresses</name>
+    <value>$0</value>
+  </property>
+
+  <property>
+    <name>sentry.service.server.principal</name>
+    <value>$1</value>
+  </property>
+
+  <property>
+    <name>hive.sentry.server</name>
+    <value>$2</value>
+  </property>
+
+  <property>
+    <name>sentry.metastore.service.users</name>
+    <value>kudu</value>
+  </property>
+
+  <property>
+    <name>sentry.service.client.rpc.retry-total</name>
+    <value>$3</value>
+  </property>
+
+  <property>
+    <name>sentry.service.client.rpc.retry.interval.msec</name>
+    <value>$4</value>
+  </property>
+</configuration>
+  )";
+    auto sentry_file_contents = Substitute(
+        kSentryFileTemplate,
+        sentry_address_,
+        sentry_service_principal_,
+        "server1",
+        sentry_client_rpc_retry_num_,
+        sentry_client_rpc_retry_interval_ms_);
+    RETURN_NOT_OK(WriteStringToFile(Env::Default(),
+                                    sentry_file_contents,
+                                    JoinPathSegments(data_root_, "hive-sentry-site.xml")));
+  }
 
   return WriteStringToFile(Env::Default(),
-                           file_contents,
+                           hive_file_contents,
                            JoinPathSegments(data_root_, "hive-site.xml"));
 }
 
@@ -311,7 +472,7 @@ Status MiniHms::CreateCoreSite() const {
 </configuration>
   )";
 
-  string file_contents = Substitute(kFileTemplate, keytab_file_.empty() ? "simple" : "kerberos");
+  string file_contents = Substitute(kFileTemplate, IsKerberosEnabled() ? "kerberos" : "simple");
 
   return WriteStringToFile(Env::Default(),
                            file_contents,
@@ -321,9 +482,7 @@ Status MiniHms::CreateCoreSite() const {
 Status MiniHms::CreateLogConfig() const {
   // Configure the HMS to output ERROR messages to the stderr console, and INFO
   // and above to hms.log in the data root. The console messages have a special
-  // 'HMS' tag included to disambiguate them from other Java component logs. The
-  // HMS automatically looks for a logging configuration named
-  // 'hive-log4j2.properties' in the configured HIVE_CONF_DIR.
+  // 'HMS' tag included to disambiguate them from other Java component logs.
   static const string kFileTemplate = R"(
 appender.console.type = Console
 appender.console.name = console

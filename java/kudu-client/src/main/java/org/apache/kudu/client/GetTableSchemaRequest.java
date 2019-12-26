@@ -21,13 +21,18 @@ import static org.apache.kudu.master.Master.GetTableSchemaRequestPB;
 import static org.apache.kudu.master.Master.GetTableSchemaResponsePB;
 import static org.apache.kudu.master.Master.TableIdentifierPB;
 
+import java.util.Collection;
+import java.util.List;
+
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.jboss.netty.util.Timer;
 
 import org.apache.kudu.Schema;
-import org.apache.kudu.master.Master.TableIdentifierPB.Builder;
+import org.apache.kudu.master.Master;
 import org.apache.kudu.util.Pair;
 
 /**
@@ -37,21 +42,29 @@ import org.apache.kudu.util.Pair;
 public class GetTableSchemaRequest extends KuduRpc<GetTableSchemaResponse> {
   private final String id;
   private final String name;
+  private final List<Integer> requiredFeatures;
 
-
-  GetTableSchemaRequest(KuduTable masterTable, String id, String name) {
-    super(masterTable);
+  GetTableSchemaRequest(KuduTable masterTable,
+                        String id,
+                        String name,
+                        Timer timer,
+                        long timeoutMillis,
+                        boolean requiresAuthzTokenSupport) {
+    super(masterTable, timer, timeoutMillis);
     Preconditions.checkArgument(id != null ^ name != null,
         "Only one of table ID or the table name should be provided");
     this.id = id;
     this.name = name;
+    this.requiredFeatures = requiresAuthzTokenSupport ?
+        ImmutableList.of(Master.MasterFeatures.GENERATE_AUTHZ_TOKEN_VALUE) :
+        ImmutableList.of();
   }
 
   @Override
   Message createRequestPB() {
     final GetTableSchemaRequestPB.Builder builder =
         GetTableSchemaRequestPB.newBuilder();
-    Builder identifierBuilder = TableIdentifierPB.newBuilder();
+    TableIdentifierPB.Builder identifierBuilder = TableIdentifierPB.newBuilder();
     if (id != null) {
       identifierBuilder.setTableId(ByteString.copyFromUtf8(id));
     } else {
@@ -79,13 +92,21 @@ public class GetTableSchemaRequest extends KuduRpc<GetTableSchemaResponse> {
     readProtobuf(callResponse.getPBMessage(), respBuilder);
     Schema schema = ProtobufHelper.pbToSchema(respBuilder.getSchema());
     GetTableSchemaResponse response = new GetTableSchemaResponse(
-        deadlineTracker.getElapsedMillis(),
+        timeoutTracker.getElapsedMillis(),
         tsUUID,
         schema,
         respBuilder.getTableId().toStringUtf8(),
+        respBuilder.getTableName(),
         respBuilder.getNumReplicas(),
-        ProtobufHelper.pbToPartitionSchema(respBuilder.getPartitionSchema(), schema));
+        ProtobufHelper.pbToPartitionSchema(respBuilder.getPartitionSchema(), schema),
+        respBuilder.hasAuthzToken() ? respBuilder.getAuthzToken() : null,
+        respBuilder.getExtraConfigsMap());
     return new Pair<GetTableSchemaResponse, Object>(
         response, respBuilder.hasError() ? respBuilder.getError() : null);
+  }
+
+  @Override
+  Collection<Integer> getRequiredFeatures() {
+    return requiredFeatures;
   }
 }

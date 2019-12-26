@@ -50,16 +50,21 @@ namespace kudu {
 class HostPort;
 class MetricEntityPrototype;
 class MetricPrototype;
+class MiniKdc;
 class MonoDelta;
 class Status;
 
 namespace client {
 class KuduSchema;
-}
+} // namespace client
+
+namespace cluster {
+class ExternalTabletServer;
+} // namespace cluster
 
 namespace consensus {
 class OpId;
-}
+} // namespace consensus
 
 namespace master {
 class MasterServiceProxy;
@@ -67,9 +72,15 @@ class MasterServiceProxy;
 
 namespace rpc {
 class Messenger;
-}
+} // namespace rpc
 
 namespace itest {
+
+// Mode to indicate whether external service Sentry is enabled or not.
+enum class SentryMode {
+  DISABLED,
+  ENABLED
+};
 
 struct TServerDetails {
   NodeInstancePB instance_id;
@@ -210,7 +221,7 @@ Status WaitForReplicasReportedToMaster(
     WaitForLeader wait_for_leader,
     master::ReplicaTypeFilter filter,
     bool* has_leader,
-    master::TabletLocationsPB* tablet_locations);
+    master::GetTabletLocationsResponsePB* tablet_locations);
 
 // Wait until the last committed OpId has index exactly 'opid_index'.
 Status WaitUntilCommittedOpIdIndexIs(int64_t opid_index,
@@ -340,13 +351,15 @@ Status GetTabletLocations(const std::shared_ptr<master::MasterServiceProxy>& mas
                           const std::string& tablet_id,
                           const MonoDelta& timeout,
                           master::ReplicaTypeFilter filter,
-                          master::TabletLocationsPB* tablet_locations);
+                          master::GetTabletLocationsResponsePB* tablet_locations);
 
-// Get the list of tablet locations for all tablets in the specified table from the Master.
+// Get the list of tablet locations for all tablets in the specified table via the given
+// table name (and table ID if provided) from the Master.
 Status GetTableLocations(const std::shared_ptr<master::MasterServiceProxy>& master_proxy,
                          const std::string& table_name,
                          const MonoDelta& timeout,
                          master::ReplicaTypeFilter filter,
+                         boost::optional<const std::string&> table_id,
                          master::GetTableLocationsResponsePB* table_locations);
 
 // Wait for the specified number of voters to be reported to the config on the
@@ -362,31 +375,31 @@ Status WaitForNumVotersInConfigOnMaster(
 // must also be in the specified state for the wait to be considered
 // successful.
 Status WaitForNumTabletsOnTS(
-    TServerDetails* ts,
+    const TServerDetails* ts,
     int count,
     const MonoDelta& timeout,
     std::vector<tserver::ListTabletsResponsePB::StatusAndSchemaPB>* tablets = nullptr,
     boost::optional<tablet::TabletStatePB> state = boost::none);
 
 // Check if the tablet is in the specified state.
-Status CheckIfTabletInState(TServerDetails* ts,
+Status CheckIfTabletInState(const TServerDetails* ts,
                             const std::string& tablet_id,
                             tablet::TabletStatePB expected_state,
                             const MonoDelta& timeout);
 
 // Check if the given tablet is RUNNING.
-Status CheckIfTabletRunning(TServerDetails* ts,
+Status CheckIfTabletRunning(const TServerDetails* ts,
                             const std::string& tablet_id,
                             const MonoDelta& timeout);
 
 // Wait until the specified replica is in the specified state.
-Status WaitUntilTabletInState(TServerDetails* ts,
+Status WaitUntilTabletInState(const TServerDetails* ts,
                               const std::string& tablet_id,
                               tablet::TabletStatePB state,
                               const MonoDelta& timeout);
 
 // Wait until the specified tablet is in RUNNING state.
-Status WaitUntilTabletRunning(TServerDetails* ts,
+Status WaitUntilTabletRunning(const TServerDetails* ts,
                               const std::string& tablet_id,
                               const MonoDelta& timeout);
 
@@ -443,6 +456,29 @@ Status GetInt64Metric(const HostPort& http_hp,
                       const char* value_field,
                       int64_t* value);
 
+// Retrieve the value of a given metric from tserver. The metric must be of
+// int64_t type.
+Status GetTsCounterValue(cluster::ExternalTabletServer* ets,
+                         MetricPrototype* metric,
+                         int64_t* value);
 
+// Grants the 'test-admin' user Sentry privileges to perform any operation,
+// using 'kdc' to authenticate with the Sentry instance at 'address'. Once
+// called, the 'test-admin' user will be logged in.
+Status SetupAdministratorPrivileges(MiniKdc* kdc,
+                                    const HostPort& address);
+
+// Alter the table name.
+Status AlterTableName(const std::shared_ptr<master::MasterServiceProxy>& master_proxy,
+                      const std::string& table_id,
+                      const std::string& old_table_name,
+                      const std::string& new_table_name,
+                      const MonoDelta& timeout);
+
+// Delete the table.
+Status DeleteTable(const std::shared_ptr<master::MasterServiceProxy>& master_proxy,
+                   const std::string& table_id,
+                   const std::string& table_name,
+                   const MonoDelta& timeout);
 } // namespace itest
 } // namespace kudu

@@ -19,22 +19,31 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <functional>
 #include <string>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/common/columnblock.h"
 #include "kudu/common/common.pb.h"
+#include "kudu/common/rowblock.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
+#include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/walltime.h"
 #include "kudu/util/bloom_filter.h"
+#include "kudu/util/hash.pb.h"
 #include "kudu/util/int128.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/random.h"
 #include "kudu/util/slice.h"
+#include "kudu/util/stopwatch.h"
 #include "kudu/util/test_util.h"
 
 using std::vector;
@@ -1112,6 +1121,7 @@ TEST_F(TestColumnPredicate, TestLess) {
     ColumnSchema d128("d128", DECIMAL128);
     ColumnSchema string("string", STRING);
     ColumnSchema binary("binary", BINARY);
+    ColumnSchema varchar("varchar", VARCHAR);
 
     ASSERT_EQ(PredicateType::None,
               ColumnPredicate::Range(i8, nullptr, TypeTraits<INT8>::min_value())
@@ -1149,6 +1159,9 @@ TEST_F(TestColumnPredicate, TestLess) {
     ASSERT_EQ(PredicateType::None,
               ColumnPredicate::Range(binary, nullptr, TypeTraits<BINARY>::min_value())
                               .predicate_type());
+    ASSERT_EQ(PredicateType::None,
+              ColumnPredicate::Range(varchar, nullptr, TypeTraits<VARCHAR>::min_value())
+                              .predicate_type());
 }
 
 TEST_F(TestColumnPredicate, TestGreaterThanEquals) {
@@ -1164,6 +1177,7 @@ TEST_F(TestColumnPredicate, TestGreaterThanEquals) {
     ColumnSchema d128("d128", DECIMAL128);
     ColumnSchema string("string", STRING);
     ColumnSchema binary("binary", BINARY);
+    ColumnSchema varchar("varchar", VARCHAR);
 
     ASSERT_EQ(PredicateType::IsNotNull,
               ColumnPredicate::Range(i8, TypeTraits<INT8>::min_value(), nullptr)
@@ -1200,6 +1214,9 @@ TEST_F(TestColumnPredicate, TestGreaterThanEquals) {
                               .predicate_type());
     ASSERT_EQ(PredicateType::IsNotNull,
               ColumnPredicate::Range(binary, TypeTraits<BINARY>::min_value(), nullptr)
+                              .predicate_type());
+    ASSERT_EQ(PredicateType::IsNotNull,
+              ColumnPredicate::Range(varchar, TypeTraits<VARCHAR>::min_value(), nullptr)
                               .predicate_type());
 
     ASSERT_EQ(PredicateType::Equality,
@@ -1238,6 +1255,8 @@ TEST_F(TestColumnPredicate, TestGreaterThanEquals) {
               ColumnPredicate::Range(string, &s, nullptr).predicate_type());
     ASSERT_EQ(PredicateType::Range,
               ColumnPredicate::Range(binary, &s, nullptr).predicate_type());
+    ASSERT_EQ(PredicateType::Range,
+              ColumnPredicate::Range(varchar, &s, nullptr).predicate_type());
 }
 
 // Test the InList constructor.
@@ -1447,5 +1466,146 @@ TEST_F(TestColumnPredicate, TestBloomFilterMerge) {
   bfs.emplace_back(bfb4.slice(), bfb4.n_hashes(), MURMUR_HASH_2);
   TestMergeBloomFilterCombinations(ColumnSchema("c", STRING, true), &bfs, binary_keys);
 }
+
+// Test ColumnPredicate operator (in-)equality.
+TEST_F(TestColumnPredicate, TestEquals) {
+  ColumnSchema c1("c1", INT32, true);
+  ASSERT_EQ(ColumnPredicate::None(c1), ColumnPredicate::None(c1));
+
+  ColumnSchema c1a("c1", INT32, true);
+  ASSERT_EQ(ColumnPredicate::None(c1), ColumnPredicate::None(c1a));
+
+  ColumnSchema c2("c2", INT32, true);
+  ASSERT_NE(ColumnPredicate::None(c1), ColumnPredicate::None(c2));
+
+  ColumnSchema c1string("c1", STRING, true);
+  ASSERT_NE(ColumnPredicate::None(c1), ColumnPredicate::None(c1string));
+
+  const int kDefaultOf3 = 3;
+  ColumnSchema c1dflt("c1", INT32, /*is_nullable=*/false, /*read_default=*/&kDefaultOf3);
+  ASSERT_NE(ColumnPredicate::None(c1), ColumnPredicate::None(c1dflt));
+}
+
+using TestColumnPredicateDeathTest = TestColumnPredicate;
+
+// Ensure that ColumnPredicate::Merge(other) requires the 'other' predicate to
+// have the same column name and type as 'this'.
+TEST_F(TestColumnPredicateDeathTest, TestMergeRequiresNameAndType) {
+
+  ColumnSchema c1int32("c1", INT32, true);
+  ColumnSchema c2int32("c2", INT32, true);
+  vector<int32_t> values = { 0, 1, 2, 3 };
+
+  EXPECT_DEATH({
+    // This should crash because the columns have different names.
+    TestMerge(ColumnPredicate::Equality(c1int32, &values[0]),
+              ColumnPredicate::Equality(c2int32, &values[0]),
+              ColumnPredicate::None(c1int32), // unused
+              PredicateType::None);
+  }, "COMPARE_NAME_AND_TYPE");
+
+  ColumnSchema c1int16("c1", INT16, true);
+  EXPECT_DEATH({
+    // This should crash because the columns have different types.
+    TestMerge(ColumnPredicate::Equality(c1int32, &values[0]),
+              ColumnPredicate::Equality(c1int16, &values[0]),
+              ColumnPredicate::None(c1int32), // unused
+              PredicateType::None);
+  }, "COMPARE_NAME_AND_TYPE");
+}
+
+template<typename TypeParam>
+class ColumnPredicateBenchmark : public KuduTest {
+  protected:
+   static constexpr auto kColType = TypeParam::physical_type;
+   static constexpr int kNumRows = 1024;
+
+   void DoTest(const std::function<ColumnPredicate(const ColumnSchema&)>& pred_factory) {
+     const int num_iters = AllowSlowTests() ? 1000000 : 100;
+     const int num_evals = num_iters * kNumRows;
+
+     for (bool nullable : {false, true}) {
+       ColumnSchema cs("c", kColType, nullable);
+       auto pred = pred_factory(cs);
+       if (pred.predicate_type() == PredicateType::None) {
+         // The predicate factory might return None in the case of
+         // NULL on a NOT NULL column.
+         continue;
+       }
+
+       ScopedColumnBlock<kColType> b(kNumRows);
+       for (int i = 0; i < kNumRows; i++) {
+         b[i] = rand() % 3;
+         if (nullable) {
+           b.SetCellIsNull(i, rand() % 10 == 1);
+         }
+       }
+
+       SelectionVector selvec(kNumRows);
+       int64_t tot_cycles = 0;
+       Stopwatch sw;
+       sw.start();
+       for (int i = 0; i < num_iters; i++) {
+         selvec.SetAllTrue();
+         int64_t cycles_start = CycleClock::Now();
+         pred.Evaluate(b, &selvec);
+         tot_cycles += CycleClock::Now() - cycles_start;
+       }
+       sw.stop();
+       LOG(INFO) << StringPrintf(
+             "%-6s %-10s (%s) %.1fM evals/sec\t%.2f cycles/eval",
+             TypeParam::name(), nullable ? "NULL" : "NOT NULL",
+             pred.ToString().c_str(),
+             num_evals / sw.elapsed().user_cpu_seconds() / 1000000,
+             static_cast<double>(tot_cycles) / num_evals);
+     }
+   }
+};
+
+template<class T>
+class RangePredicateBenchmark : public ColumnPredicateBenchmark<T> {};
+
+using test_types = ::testing::Types<
+  DataTypeTraits<INT8>,
+  DataTypeTraits<INT16>,
+  DataTypeTraits<INT32>,
+  DataTypeTraits<INT64>,
+  DataTypeTraits<FLOAT>,
+  DataTypeTraits<DOUBLE>>;
+
+TYPED_TEST_CASE(RangePredicateBenchmark, test_types);
+
+TYPED_TEST(RangePredicateBenchmark, TestEquals) {
+  const typename TypeParam::cpp_type ref_val = 0;
+  RangePredicateBenchmark<TypeParam>::DoTest(
+      [&](const ColumnSchema& cs) { return ColumnPredicate::Equality(cs, &ref_val); });
+}
+
+TYPED_TEST(RangePredicateBenchmark, TestLessThan) {
+  const typename TypeParam::cpp_type upper = 0;
+  RangePredicateBenchmark<TypeParam>::DoTest(
+      [&](const ColumnSchema& cs) { return ColumnPredicate::Range(cs, nullptr, &upper); });
+}
+
+TYPED_TEST(RangePredicateBenchmark, TestRange) {
+  const typename TypeParam::cpp_type lower = 0;
+  const typename TypeParam::cpp_type upper = 2;
+  RangePredicateBenchmark<TypeParam>::DoTest(
+      [&](const ColumnSchema& cs) { return ColumnPredicate::Range(cs, &lower, &upper); });
+}
+
+// IS NULL and IS NOT NULL predicates don't look at the data itself, so no need
+// to type-parameterize them.
+class NullPredicateBenchmark : public ColumnPredicateBenchmark<DataTypeTraits<INT32>> {};
+
+TEST_F(NullPredicateBenchmark, TestIsNull) {
+  NullPredicateBenchmark::DoTest(
+      [&](const ColumnSchema& cs) { return ColumnPredicate::IsNull(cs); });
+}
+TEST_F(NullPredicateBenchmark, TestIsNotNull) {
+  NullPredicateBenchmark::DoTest(
+      [&](const ColumnSchema& cs) { return ColumnPredicate::IsNotNull(cs); });
+}
+
 
 } // namespace kudu

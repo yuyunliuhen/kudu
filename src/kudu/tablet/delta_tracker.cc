@@ -52,6 +52,7 @@
 #include "kudu/util/logging.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
+#include "kudu/util/trace.h"
 
 namespace kudu {
 
@@ -94,7 +95,9 @@ DeltaTracker::DeltaTracker(shared_ptr<RowSetMetadata> rowset_metadata,
       read_only_(false),
       log_anchor_registry_(log_anchor_registry),
       mem_trackers_(std::move(mem_trackers)),
-      dms_empty_(true) {}
+      next_dms_id_(rowset_metadata_->last_durable_redo_dms_id() + 1),
+      dms_exists_(false),
+      deleted_row_count_(0) {}
 
 Status DeltaTracker::OpenDeltaReaders(const vector<BlockId>& blocks,
                                       const IOContext* io_context,
@@ -149,28 +152,38 @@ Status DeltaTracker::DoOpen(const IOContext* io_context) {
                                  &undo_delta_stores_,
                                  UNDO));
 
-  // the id of the first DeltaMemStore is the max id of the current ones +1
-  RETURN_NOT_OK(DeltaMemStore::Create(rowset_metadata_->last_durable_redo_dms_id() + 1,
+  open_ = true;
+  return Status::OK();
+}
+
+Status DeltaTracker::CreateAndInitDMSUnlocked(const fs::IOContext* io_context) {
+  DCHECK(component_lock_.is_write_locked());
+  shared_ptr<DeltaMemStore> dms;
+  RETURN_NOT_OK(DeltaMemStore::Create(next_dms_id_++,
                                       rowset_metadata_->id(),
                                       log_anchor_registry_,
                                       mem_trackers_.dms_tracker,
-                                      &dms_));
-  RETURN_NOT_OK(dms_->Init(io_context));
+                                      &dms));
+  RETURN_NOT_OK(dms->Init(io_context));
 
-  open_ = true;
+  dms_.swap(dms);
+  dms_exists_.Store(true);
   return Status::OK();
 }
 
 Status DeltaTracker::MakeDeltaIteratorMergerUnlocked(const IOContext* io_context,
                                                      size_t start_idx, size_t end_idx,
                                                      const Schema* projection,
-                                                     vector<shared_ptr<DeltaStore> > *target_stores,
+                                                     SharedDeltaStoreVector* target_stores,
                                                      vector<BlockId> *target_blocks,
-                                                     std::unique_ptr<DeltaIterator> *out) {
+                                                     std::unique_ptr<DeltaIterator>* out) {
   CHECK(open_);
   CHECK_LE(start_idx, end_idx);
   CHECK_LT(end_idx, redo_delta_stores_.size());
-  vector<shared_ptr<DeltaStore> > inputs;
+  SharedDeltaStoreVector inputs;
+  int64_t delete_count = 0;
+  int64_t reinsert_count = 0;
+  int64_t update_count = 0;
   for (size_t idx = start_idx; idx <= end_idx; ++idx) {
     shared_ptr<DeltaStore> &delta_store = redo_delta_stores_[idx];
 
@@ -179,12 +192,21 @@ Status DeltaTracker::MakeDeltaIteratorMergerUnlocked(const IOContext* io_context
     ignore_result(down_cast<DeltaFileReader*>(delta_store.get()));
     shared_ptr<DeltaFileReader> dfr = std::static_pointer_cast<DeltaFileReader>(delta_store);
 
-    LOG_WITH_PREFIX(INFO) << "Preparing to minor compact delta file: " << dfr->ToString();
+    if (dfr->Initted()) {
+      delete_count += dfr->delta_stats().delete_count();
+      reinsert_count += dfr->delta_stats().reinsert_count();
+      update_count += dfr->delta_stats().UpdateCount();
+    }
+    VLOG_WITH_PREFIX(1) << "Preparing to minor compact delta file: "
+                        << dfr->ToString();
 
     inputs.push_back(delta_store);
     target_stores->push_back(delta_store);
     target_blocks->push_back(dfr->block_id());
   }
+  TRACE_COUNTER_INCREMENT("delete_count", delete_count);
+  TRACE_COUNTER_INCREMENT("reinsert_count", reinsert_count);
+  TRACE_COUNTER_INCREMENT("update_count", update_count);
   RowIteratorOptions opts;
   opts.projection = projection;
   opts.io_context = io_context;
@@ -204,8 +226,10 @@ string JoinDeltaStoreStrings(const SharedDeltaStoreVector& stores) {
 
 } // anonymous namespace
 
+#ifndef NDEBUG
 Status DeltaTracker::ValidateDeltaOrder(const std::shared_ptr<DeltaStore>& first,
                                         const std::shared_ptr<DeltaStore>& second,
+                                        const IOContext* io_context,
                                         DeltaType type) {
   shared_ptr<DeltaStore> first_copy = first;
   shared_ptr<DeltaStore> second_copy = second;
@@ -216,14 +240,14 @@ Status DeltaTracker::ValidateDeltaOrder(const std::shared_ptr<DeltaStore>& first
     shared_ptr<DeltaFileReader> first_clone;
     RETURN_NOT_OK(down_cast<DeltaFileReader*>(first.get())->CloneForDebugging(
         rowset_metadata_->fs_manager(), mem_trackers_.tablet_tracker, &first_clone));
-    RETURN_NOT_OK(first_clone->Init(nullptr));
+    RETURN_NOT_OK(first_clone->Init(io_context));
     first_copy = first_clone;
   }
   if (!second_copy->Initted()) {
     shared_ptr<DeltaFileReader> second_clone;
     RETURN_NOT_OK(down_cast<DeltaFileReader*>(second.get())->CloneForDebugging(
         rowset_metadata_->fs_manager(), mem_trackers_.tablet_tracker, &second_clone));
-    RETURN_NOT_OK(second_clone->Init(nullptr));
+    RETURN_NOT_OK(second_clone->Init(io_context));
     second_copy = second_clone;
   }
 
@@ -244,15 +268,19 @@ Status DeltaTracker::ValidateDeltaOrder(const std::shared_ptr<DeltaStore>& first
   return Status::OK();
 }
 
-Status DeltaTracker::ValidateDeltasOrdered(const SharedDeltaStoreVector& list, DeltaType type) {
+Status DeltaTracker::ValidateDeltasOrdered(const SharedDeltaStoreVector& list,
+                                           const IOContext* io_context,
+                                           DeltaType type) {
   for (size_t i = 1; i < list.size(); i++) {
-    RETURN_NOT_OK(ValidateDeltaOrder(list[i - 1], list[i], type));
+    RETURN_NOT_OK(ValidateDeltaOrder(list[i - 1], list[i], io_context, type));
   }
   return Status::OK();
 }
+#endif // NDEBUG
 
 void DeltaTracker::AtomicUpdateStores(const SharedDeltaStoreVector& stores_to_replace,
                                       const SharedDeltaStoreVector& new_stores,
+                                      const IOContext* io_context,
                                       DeltaType type) {
   std::lock_guard<rw_spinlock> lock(component_lock_);
   SharedDeltaStoreVector* stores_to_update =
@@ -299,11 +327,12 @@ void DeltaTracker::AtomicUpdateStores(const SharedDeltaStoreVector& stores_to_re
     // Make sure the new stores are already ordered. Non-OK Statuses here don't
     // indicate ordering errors, but rather, physical errors (e.g. disk
     // failure). These don't indicate incorrectness and are thusly ignored.
-    WARN_NOT_OK(ValidateDeltasOrdered(new_stores, type), "Could not validate delta order");
+    WARN_NOT_OK(ValidateDeltasOrdered(new_stores, io_context, type),
+                "Could not validate delta order");
     if (start_it != stores_to_update->end()) {
       // Sanity check that the last store we are adding would logically appear
       // before the first store that would follow it.
-      WARN_NOT_OK(ValidateDeltaOrder(*new_stores.rbegin(), *start_it, type),
+      WARN_NOT_OK(ValidateDeltaOrder(*new_stores.rbegin(), *start_it, io_context, type),
                   "Could not validate delta order");
     }
   }
@@ -338,12 +367,12 @@ Status DeltaTracker::CommitDeltaStoreMetadataUpdate(const RowSetMetadataUpdate& 
                                          &new_stores, type),
                         "Unable to open delta blocks");
 
-  vector<BlockId> removed_blocks;
+  BlockIdContainer removed_blocks;
   rowset_metadata_->CommitUpdate(update, &removed_blocks);
   rowset_metadata_->AddOrphanedBlocks(removed_blocks);
   // Once we successfully commit to the rowset metadata, let's ensure we update
   // the delta stores to maintain consistency between the two.
-  AtomicUpdateStores(to_remove, new_stores, type);
+  AtomicUpdateStores(to_remove, new_stores, io_context, type);
 
   if (flush_type == FLUSH_METADATA) {
     // Flushing the metadata is considered best-effort in this function.
@@ -404,11 +433,13 @@ Status DeltaTracker::CompactStores(const IOContext* io_context, int start_idx, i
   RowSetMetadataUpdate update;
   update.ReplaceRedoDeltaBlocks(compacted_blocks, new_blocks);
 
-  LOG_WITH_PREFIX(INFO) << Substitute("Flushing compaction of $0 redo delta "
-                                      "blocks { $1 } into block $2",
-                                      compacted_blocks.size(),
-                                      BlockId::JoinStrings(compacted_blocks),
-                                      new_block_id.ToString());
+  const auto num_blocks_compacted = compacted_blocks.size();
+  TRACE_COUNTER_INCREMENT("delta_blocks_compacted", num_blocks_compacted);
+  VLOG_WITH_PREFIX(1) << Substitute("Flushing compaction of $0 redo delta "
+                                    "blocks { $1 } into block $2",
+                                    num_blocks_compacted,
+                                    BlockId::JoinStrings(compacted_blocks),
+                                    new_block_id.ToString());
   RETURN_NOT_OK_PREPEND(CommitDeltaStoreMetadataUpdate(update, compacted_stores, new_blocks,
                                                        io_context, REDO, FLUSH_METADATA),
                         "DeltaTracker: CompactStores: Unable to commit delta update");
@@ -529,7 +560,7 @@ Status DeltaTracker::DeleteAncientUndoDeltas(Timestamp ancient_history_mark,
 Status DeltaTracker::DoCompactStores(const IOContext* io_context,
                                      size_t start_idx, size_t end_idx,
                                      unique_ptr<WritableBlock> block,
-                                     vector<shared_ptr<DeltaStore> > *compacted_stores,
+                                     SharedDeltaStoreVector* compacted_stores,
                                      vector<BlockId> *compacted_blocks) {
   unique_ptr<DeltaIterator> inputs_merge;
 
@@ -541,14 +572,12 @@ Status DeltaTracker::DoCompactStores(const IOContext* io_context,
   RETURN_NOT_OK(MakeDeltaIteratorMergerUnlocked(io_context, start_idx, end_idx,
                                                 &empty_schema, compacted_stores,
                                                 compacted_blocks, &inputs_merge));
-  LOG_WITH_PREFIX(INFO) << "Compacting " << (end_idx - start_idx + 1) << " delta files.";
   DeltaFileWriter dfw(std::move(block));
   RETURN_NOT_OK(dfw.Start());
   RETURN_NOT_OK(WriteDeltaIteratorToFile<REDO>(inputs_merge.get(),
                                                ITERATE_OVER_ALL_ROWS,
                                                &dfw));
   RETURN_NOT_OK(dfw.Finish());
-  LOG_WITH_PREFIX(INFO) << "Succesfully compacted the specified delta files.";
   return Status::OK();
 }
 
@@ -560,7 +589,9 @@ void DeltaTracker::CollectStores(vector<shared_ptr<DeltaStore>>* deltas,
   }
   if (which != UNDOS_ONLY) {
     deltas->insert(deltas->end(), redo_delta_stores_.begin(), redo_delta_stores_.end());
-    deltas->push_back(dms_);
+    if (dms_exists_.Load() && !dms_->Empty()) {
+      deltas->push_back(dms_);
+    }
   }
 }
 
@@ -603,7 +634,7 @@ Status DeltaTracker::NewDeltaFileIterator(
 
 Status DeltaTracker::WrapIterator(const shared_ptr<CFileSet::Iterator> &base,
                                   const RowIteratorOptions& opts,
-                                  gscoped_ptr<ColumnwiseIterator>* out) const {
+                                  unique_ptr<ColumnwiseIterator>* out) const {
   unique_ptr<DeltaIterator> iter;
   RETURN_NOT_OK(NewDeltaIterator(opts, &iter));
 
@@ -616,17 +647,32 @@ Status DeltaTracker::Update(Timestamp timestamp,
                             const RowChangeList &update,
                             const consensus::OpId& op_id,
                             OperationResultPB* result) {
-  // TODO(todd): can probably lock this more fine-grained.
-  shared_lock<rw_spinlock> lock(component_lock_);
+  Status s;
+  while (true) {
+    if (!dms_exists_.Load()) {
+      std::lock_guard<rw_spinlock> lock(component_lock_);
+      // Should check dms_exists_ here in case multiple threads are blocked.
+      if (!dms_exists_.Load()) {
+        RETURN_NOT_OK(CreateAndInitDMSUnlocked(nullptr));
+      }
+    }
 
-  Status s = dms_->Update(timestamp, row_idx, update, op_id);
-  if (s.ok()) {
-    dms_empty_.Store(false);
+    // TODO(todd): can probably lock this more fine-grained.
+    shared_lock<rw_spinlock> lock(component_lock_);
 
-    MemStoreTargetPB* target = result->add_mutated_stores();
-    target->set_rs_id(rowset_metadata_->id());
-    target->set_dms_id(dms_->id());
+    // Should check dms_exists_ here again since there is a gap
+    // between the two critical sections defined by component_lock_.
+    if (!dms_exists_.Load()) continue;
+
+    s = dms_->Update(timestamp, row_idx, update, op_id);
+    if (s.ok()) {
+      MemStoreTargetPB* target = result->add_mutated_stores();
+      target->set_rs_id(rowset_metadata_->id());
+      target->set_dms_id(dms_->id());
+    }
+    break;
   }
+
   return s;
 }
 
@@ -634,12 +680,13 @@ Status DeltaTracker::CheckRowDeleted(rowid_t row_idx, const IOContext* io_contex
                                      bool *deleted, ProbeStats* stats) const {
   shared_lock<rw_spinlock> lock(component_lock_);
 
-
   *deleted = false;
   // Check if the row has a deletion in DeltaMemStore.
-  RETURN_NOT_OK(dms_->CheckRowDeleted(row_idx, io_context, deleted));
-  if (*deleted) {
-    return Status::OK();
+  if (dms_exists_.Load()) {
+    RETURN_NOT_OK(dms_->CheckRowDeleted(row_idx, io_context, deleted));
+    if (*deleted) {
+      return Status::OK();
+    }
   }
 
   // Then check backwards through the list of trackers.
@@ -674,9 +721,16 @@ Status DeltaTracker::FlushDMS(DeltaMemStore* dms,
   gscoped_ptr<DeltaStats> stats;
   RETURN_NOT_OK(dms->FlushToFile(&dfw, &stats));
   RETURN_NOT_OK(dfw.Finish());
-  LOG_WITH_PREFIX(INFO) << "Flushed delta block " << block_id.ToString()
-                        << " (" << dfw.written_size() << " bytes on disk) "
-                        << "stats: " << stats->ToString();
+  const auto bytes_written = dfw.written_size();
+  TRACE_COUNTER_INCREMENT("bytes_written", bytes_written);
+  TRACE_COUNTER_INCREMENT("delete_count", stats->delete_count());
+  TRACE_COUNTER_INCREMENT("reinsert_count", stats->reinsert_count());
+  TRACE_COUNTER_INCREMENT("update_count", stats->UpdateCount());
+  VLOG_WITH_PREFIX(1) << Substitute("Flushed delta block $0 ($1 bytes on disk) "
+                                    "stats: $2",
+                                    block_id.ToString(),
+                                    bytes_written,
+                                    stats->ToString());
 
   // Now re-open for read
   unique_ptr<ReadableBlock> readable_block;
@@ -690,7 +744,16 @@ Status DeltaTracker::FlushDMS(DeltaMemStore* dms,
                                             dfr));
   VLOG_WITH_PREFIX(1) << "Opened new delta block " << block_id.ToString() << " for read";
 
-  RETURN_NOT_OK(rowset_metadata_->CommitRedoDeltaDataBlock(dms->id(), block_id));
+  {
+    // Merge the deleted row count of the old DMS to the RowSetMetadata
+    // and reset deleted_row_count_ should be atomic, so we lock the
+    // component_lock_ in exclusive mode.
+    std::lock_guard<rw_spinlock> lock(component_lock_);
+    RETURN_NOT_OK(rowset_metadata_->CommitRedoDeltaDataBlock(dms->id(),
+                                                             deleted_row_count_,
+                                                             block_id));
+    deleted_row_count_ = 0;
+  }
   if (flush_type == FLUSH_METADATA) {
     RETURN_NOT_OK_PREPEND(rowset_metadata_->Flush(),
                           Substitute("Unable to commit Delta block metadata for: $0",
@@ -713,17 +776,11 @@ Status DeltaTracker::Flush(const IOContext* io_context, MetadataFlushType flush_
     // This shuts out any concurrent readers or writers.
     std::lock_guard<rw_spinlock> lock(component_lock_);
 
-    count = dms_->Count();
+    count = dms_exists_.Load() ? dms_->Count() : 0;
 
-    // Swap the DeltaMemStore to use the new schema
-    old_dms = dms_;
-    RETURN_NOT_OK(DeltaMemStore::Create(old_dms->id() + 1,
-                                        rowset_metadata_->id(),
-                                        log_anchor_registry_,
-                                        mem_trackers_.dms_tracker,
-                                        &dms_));
-    RETURN_NOT_OK(dms_->Init(nullptr));
-    dms_empty_.Store(true);
+    // Swap the DeltaMemStore and dms_ is null now.
+    old_dms.swap(dms_);
+    dms_exists_.Store(false);
 
     if (count == 0) {
       // No need to flush if there are no deltas.
@@ -731,11 +788,13 @@ Status DeltaTracker::Flush(const IOContext* io_context, MetadataFlushType flush_
       return Status::OK();
     }
 
+    deleted_row_count_ = old_dms->deleted_row_count();
     redo_delta_stores_.push_back(old_dms);
   }
 
-  LOG_WITH_PREFIX(INFO) << "Flushing " << count << " deltas (" << old_dms->EstimateSize()
-                        << " bytes in memory) from DMS " << old_dms->id();
+  VLOG_WITH_PREFIX(1) << Substitute("Flushing $0 deltas ($1 bytes in memory) "
+                                    "from DMS $2",
+                                    count, old_dms->EstimateSize(), old_dms->id());
 
   // Now, actually flush the contents of the old DMS.
   //
@@ -768,12 +827,12 @@ Status DeltaTracker::Flush(const IOContext* io_context, MetadataFlushType flush_
 
 size_t DeltaTracker::DeltaMemStoreSize() const {
   shared_lock<rw_spinlock> lock(component_lock_);
-  return dms_->EstimateSize();
+  return dms_exists_.Load() ? dms_->EstimateSize() : 0;
 }
 
 int64_t DeltaTracker::MinUnflushedLogIndex() const {
   shared_lock<rw_spinlock> lock(component_lock_);
-  return dms_->MinLogIndex();
+  return dms_exists_.Load() ? dms_->MinLogIndex() : 0;
 }
 
 size_t DeltaTracker::CountUndoDeltaStores() const {
@@ -832,6 +891,12 @@ Status DeltaTracker::InitAllDeltaStoresForTests(WhichStores stores) {
     }
   }
   return Status::OK();
+}
+
+int64_t DeltaTracker::CountDeletedRows() const {
+  shared_lock<rw_spinlock> lock(component_lock_);
+  DCHECK_GE(deleted_row_count_, 0);
+  return deleted_row_count_ + (dms_exists_.Load() ? dms_->deleted_row_count() : 0);
 }
 
 string DeltaTracker::LogPrefix() const {

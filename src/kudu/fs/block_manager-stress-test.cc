@@ -28,7 +28,6 @@
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -41,7 +40,6 @@
 #include "kudu/fs/fs_report.h"
 #include "kudu/fs/log_block_manager-test-util.h"
 #include "kudu/fs/log_block_manager.h"  // IWYU pragma: keep
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/split.h"
@@ -161,7 +159,7 @@ class BlockManagerStressTest : public KuduTest {
     // If non-standard paths were provided we need to delete them in between
     // test runs.
     if (!FLAGS_block_manager_paths.empty()) {
-      for (const auto& dd : dd_manager_->GetDataRoots()) {
+      for (const auto& dd : dd_manager_->GetRoots()) {
         WARN_NOT_OK(env_->DeleteRecursively(dd),
                     Substitute("Couldn't recursively delete $0", dd));
       }
@@ -269,7 +267,7 @@ class BlockManagerStressTest : public KuduTest {
   simple_spinlock lock_;
 
   // The block manager.
-  gscoped_ptr<BlockManager> bm_;
+  unique_ptr<BlockManager> bm_;
 
   // The directory manager.
   unique_ptr<DataDirManager> dd_manager_;
@@ -408,7 +406,7 @@ void BlockManagerStressTest<T>::ReaderThread() {
     // Read it fully into memory.
     uint64_t block_size;
     CHECK_OK(block->Size(&block_size));
-    gscoped_ptr<uint8_t[]> scratch(new uint8_t[block_size]);
+    unique_ptr<uint8_t[]> scratch(new uint8_t[block_size]);
     Slice data(scratch.get(), block_size);
     CHECK_OK(block->Read(0, data));
 
@@ -511,7 +509,7 @@ void BlockManagerStressTest<FileBlockManager>::InjectNonFatalInconsistencies() {
 
 template <>
 void BlockManagerStressTest<LogBlockManager>::InjectNonFatalInconsistencies() {
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), rand_seed_);
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), rand_seed_);
   ASSERT_OK(corruptor.Init());
 
   for (int i = 0; i < FLAGS_num_inconsistencies; i++) {
@@ -546,6 +544,11 @@ TYPED_TEST(BlockManagerStressTest, StressTest) {
   LOG(INFO) << "Running on fresh block manager";
   checker.Start();
   this->RunTest(FLAGS_test_duration_secs / kNumStarts);
+
+  // Quiesce the block manager before injecting inconsistencies so that the two
+  // don't interfere with one another.
+  this->bm_.reset();
+
   NO_FATALS(this->InjectNonFatalInconsistencies());
 
   for (int i = 1; i < kNumStarts; i++) {

@@ -27,6 +27,7 @@
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
+#include "kudu/common/common.pb.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
@@ -66,6 +67,7 @@
 #include "kudu/util/random_util.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
+#include "kudu/util/trace.h"
 
 DEFINE_int32(tablet_copy_begin_session_timeout_ms, 30000,
              "Tablet server RPC client timeout for BeginTabletCopySession calls. "
@@ -102,12 +104,14 @@ DECLARE_int32(tablet_copy_transfer_chunk_size_bytes);
 METRIC_DEFINE_counter(server, tablet_copy_bytes_fetched,
                       "Bytes Fetched By Tablet Copy",
                       kudu::MetricUnit::kBytes,
-                      "Number of bytes fetched during tablet copy operations since server start");
+                      "Number of bytes fetched during tablet copy operations since server start",
+                      kudu::MetricLevel::kDebug);
 
 METRIC_DEFINE_gauge_int32(server, tablet_copy_open_client_sessions,
                           "Open Table Copy Client Sessions",
                           kudu::MetricUnit::kSessions,
-                          "Number of currently open tablet copy client sessions on this server");
+                          "Number of currently open tablet copy client sessions on this server",
+                          kudu::MetricLevel::kInfo);
 
 // RETURN_NOT_OK_PREPEND() with a remote-error unwinding step.
 #define RETURN_NOT_OK_UNWIND_PREPEND(status, controller, msg) \
@@ -236,8 +240,9 @@ Status TabletCopyClient::Start(const HostPort& copy_source_addr,
                                    Substitute("$0 (resolved to $1)",
                                               copy_source_addr.host(), addr.host()));
   }
-  LOG_WITH_PREFIX(INFO) << "Beginning tablet copy session"
-                        << " from remote peer at address " << copy_source_addr.ToString();
+  LOG_WITH_PREFIX(INFO) <<
+      Substitute("Beginning tablet copy session from remote peer at address $0",
+                 copy_source_addr.ToString());
 
   // Set up an RPC proxy for the TabletCopyService.
   proxy_.reset(new TabletCopyServiceProxy(messenger_, addr, copy_source_addr.host()));
@@ -253,6 +258,8 @@ Status TabletCopyClient::Start(const HostPort& copy_source_addr,
   RETURN_NOT_OK_PREPEND(SendRpcWithRetry(&controller, [&] {
     return proxy_->BeginTabletCopySession(req, &resp, &controller);
   }), "unable to begin tablet copy session");
+
+  TRACE("Tablet copy session begun");
 
   string copy_peer_uuid = resp.has_responder_uuid()
       ? resp.responder_uuid() : "(unknown uuid)";
@@ -331,6 +338,8 @@ Status TabletCopyClient::Start(const HostPort& copy_source_addr,
                                           tablet::TABLET_DATA_COPYING,
                                           /*last_logged_opid=*/ boost::none),
         "Could not replace superblock with COPYING data state");
+    TRACE("Replaced tombstoned tablet metadata.");
+
     RETURN_NOT_OK_PREPEND(fs_manager_->dd_manager()->CreateDataDirGroup(tablet_id_),
         "Could not create a new directory group for tablet copy");
   } else {
@@ -354,7 +363,12 @@ Status TabletCopyClient::Start(const HostPort& copy_source_addr,
                                             partition,
                                             superblock_->tablet_data_state(),
                                             superblock_->tombstone_last_logged_opid(),
+                                            remote_superblock_->supports_live_row_count(),
+                                            superblock_->extra_config(),
+                                            superblock_->dimension_label(),
                                             &meta_));
+    TRACE("Wrote new tablet metadata");
+
     // We have begun persisting things to disk. Update the tablet copy state
     // machine so we know there is state to clean up in case we fail.
     state_ = kStarting;
@@ -365,6 +379,7 @@ Status TabletCopyClient::Start(const HostPort& copy_source_addr,
   // Create the ConsensusMetadata before returning from Start() so that it's
   // possible to vote while we are copying the replica for the first time.
   RETURN_NOT_OK(WriteConsensusMetadata());
+  TRACE("Wrote new consensus metadata");
 
   state_ = kStarted;
   if (meta) {

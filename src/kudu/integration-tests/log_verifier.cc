@@ -78,7 +78,7 @@ Status LogVerifier::ScanForCommittedOpIds(int ts_idx, const string& tablet_id,
   RETURN_NOT_OK(LogReader::Open(env_, wal_dir, scoped_refptr<log::LogIndex>(), tablet_id,
                                 scoped_refptr<MetricEntity>(), &reader));
   log::SegmentSequence segs;
-  RETURN_NOT_OK(reader->GetSegmentsSnapshot(&segs));
+  reader->GetSegmentsSnapshot(&segs);
   unique_ptr<log::LogEntryPB> entry;
   for (const auto& seg : segs) {
     log::LogEntryReader reader(seg.get());
@@ -149,7 +149,7 @@ Status LogVerifier::VerifyCommittedOpIdsMatch() {
         committed_terms.push_back(FindWithDefault(maps_by_ts[ts], index, kNotOnThisServer));
       }
       // 'committed_terms' entries should all be kNotOnThisServer or the same as each other.
-      boost::optional<int64_t> expected_term;
+      auto expected_term = boost::make_optional<int64_t>(false, 0);
       for (int ts = 0; ts < cluster_->num_tablet_servers(); ts++) {
         int64_t this_ts_term = committed_terms[ts];
         if (this_ts_term == kNotOnThisServer) continue; // this TS doesn't have the op

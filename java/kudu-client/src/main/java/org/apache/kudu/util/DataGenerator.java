@@ -17,20 +17,21 @@
 
 package org.apache.kudu.util;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.util.List;
+import java.util.Random;
+import javax.xml.bind.DatatypeConverter;
+
 import com.google.common.base.Preconditions;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
+
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.ColumnTypeAttributes;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.client.PartialRow;
-import org.apache.yetus.audience.InterfaceAudience;
-import org.apache.yetus.audience.InterfaceStability;
-
-import javax.xml.bind.DatatypeConverter;
-import java.math.BigDecimal;
-import java.math.BigInteger;
-import java.util.List;
-import java.util.Random;
 
 /**
  * A utility class to generate random data and rows.
@@ -62,43 +63,71 @@ public class DataGenerator {
    * @param row the PartialRow to randomize.
    */
   public void randomizeRow(PartialRow row) {
+    this.randomizeRow(row, true);
+  }
+
+  /**
+   * Randomizes the fields in a given PartialRow.
+   * @param row the PartialRow to randomize.
+   * @param randomizeKeys true if the key columns should be randomized.
+   */
+  public void randomizeRow(PartialRow row, boolean randomizeKeys) {
     Schema schema = row.getSchema();
     List<ColumnSchema> columns = schema.getColumns();
     for (int i = 0; i < columns.size(); i++) {
       ColumnSchema col = columns.get(i);
+      if (col.isKey() && !randomizeKeys) {
+        continue;
+      }
       Type type = col.getType();
       if (col.isNullable() && random.nextFloat() <= nullRate) {
         // Sometimes set nullable columns to null.
         row.setNull(i);
-      } else if(col.getDefaultValue() != null && !col.isKey() && random.nextFloat() <= defaultRate) {
+        continue;
+      }
+      if (col.getDefaultValue() != null && !col.isKey() && random.nextFloat() <= defaultRate) {
         // Sometimes use the column default value.
-      } else {
-        switch (type) {
-          // TODO(ghenke): Support range bound configuration.
-          case BOOL:
-            row.addBoolean(i, random.nextBoolean()); break;
-          case INT8:
-            row.addByte(i, (byte) random.nextInt()); break;
-          case INT16:
-            row.addShort(i, (short) random.nextInt()); break;
-          case INT32:
-            row.addInt(i, random.nextInt()); break;
-          case INT64:
-          case UNIXTIME_MICROS:
-            row.addLong(i, random.nextLong()); break;
-          case FLOAT:
-            row.addFloat(i, random.nextFloat()); break;
-          case DOUBLE:
-            row.addDouble(i, random.nextDouble()); break;
-          case DECIMAL:
-            row.addDecimal(i, randomDecimal(col.getTypeAttributes(), random)); break;
-          case STRING:
-            row.addString(i, randomString(stringLength, random)); break;
-          case BINARY:
-            row.addBinary(i, randomBinary(binaryLength, random)); break;
-          default:
-            throw new UnsupportedOperationException("Unsupported type " + type);
-        }
+        continue;
+      }
+      switch (type) {
+        // TODO(ghenke): Support range bound configuration.
+        case BOOL:
+          row.addBoolean(i, random.nextBoolean());
+          break;
+        case INT8:
+          row.addByte(i, (byte) random.nextInt());
+          break;
+        case INT16:
+          row.addShort(i, (short) random.nextInt());
+          break;
+        case INT32:
+          row.addInt(i, random.nextInt());
+          break;
+        case INT64:
+        case UNIXTIME_MICROS:
+          row.addLong(i, random.nextLong());
+          break;
+        case FLOAT:
+          row.addFloat(i, random.nextFloat());
+          break;
+        case DOUBLE:
+          row.addDouble(i, random.nextDouble());
+          break;
+        case DECIMAL:
+          row.addDecimal(i, randomDecimal(col.getTypeAttributes(), random));
+          break;
+        case VARCHAR:
+          row.addVarchar(i, randomString(Math.min(col.getTypeAttributes().getLength(),
+                                                  stringLength), random));
+          break;
+        case STRING:
+          row.addString(i, randomString(stringLength, random));
+          break;
+        case BINARY:
+          row.addBinary(i, randomBinary(binaryLength, random));
+          break;
+        default:
+          throw new UnsupportedOperationException("Unsupported type " + type);
       }
     }
   }
@@ -117,7 +146,7 @@ public class DataGenerator {
    * Utility method to return a random string value.
    */
   public static String randomString(int length, Random random) {
-    byte bytes[] = new byte[length];
+    byte[] bytes = new byte[length];
     random.nextBytes(bytes);
     return DatatypeConverter.printBase64Binary(bytes);
   }
@@ -126,7 +155,7 @@ public class DataGenerator {
    * Utility method to return a random binary value.
    */
   public static byte[] randomBinary(int length, Random random) {
-    byte bytes[] = new byte[length];
+    byte[] bytes = new byte[length];
     random.nextBytes(bytes);
     return bytes;
   }
@@ -142,7 +171,8 @@ public class DataGenerator {
     private float nullRate = 0.1f;
     private float defaultRate = 0.1f;
 
-    public DataGeneratorBuilder() {}
+    public DataGeneratorBuilder() {
+    }
 
     /**
      * Define a custom Random instance to use for any random generation.

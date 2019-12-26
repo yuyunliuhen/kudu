@@ -17,6 +17,7 @@
 
 #include "kudu/tablet/deltamemstore.h"
 
+#include <memory>
 #include <ostream>
 #include <utility>
 
@@ -44,6 +45,7 @@ using fs::IOContext;
 using log::LogAnchorRegistry;
 using std::string;
 using std::shared_ptr;
+using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
 
@@ -78,7 +80,8 @@ DeltaMemStore::DeltaMemStore(int64_t id,
     tree_(arena_),
     anchorer_(log_anchor_registry,
               Substitute("Rowset-$0/DeltaMemStore-$1", rs_id_, id_)),
-    disambiguator_sequence_number_(0) {
+    disambiguator_sequence_number_(0),
+    deleted_row_count_(0) {
 }
 
 Status DeltaMemStore::Init(const IOContext* /*io_context*/) {
@@ -116,6 +119,10 @@ Status DeltaMemStore::Update(Timestamp timestamp,
 
   anchorer_.AnchorIfMinimum(op_id.index());
 
+  if (update.is_delete()) {
+    deleted_row_count_.Increment();
+  }
+
   return Status::OK();
 }
 
@@ -142,8 +149,8 @@ Status DeltaMemStore::FlushToFile(DeltaFileWriter *dfw,
 }
 
 Status DeltaMemStore::NewDeltaIterator(const RowIteratorOptions& opts,
-                                       DeltaIterator** iterator) const {
-  *iterator = new DMSIterator(shared_from_this(), opts);
+                                       unique_ptr<DeltaIterator>* iterator) const {
+  iterator->reset(new DMSIterator(shared_from_this(), opts));
   return Status::OK();
 }
 
@@ -151,42 +158,40 @@ Status DeltaMemStore::CheckRowDeleted(rowid_t row_idx,
                                       const IOContext* /*io_context*/,
                                       bool *deleted) const {
   *deleted = false;
-
-  DeltaKey key(row_idx, Timestamp(0));
+  DeltaKey key(row_idx, Timestamp(Timestamp::kMax));
   faststring buf;
   key.EncodeTo(&buf);
   Slice key_slice(buf);
 
   bool exact;
 
-  // TODO(unknown): can we avoid the allocation here?
   gscoped_ptr<DMSTreeIter> iter(tree_.NewIterator());
-  if (!iter->SeekAtOrAfter(key_slice, &exact)) {
+  if (!iter->SeekAtOrBefore(key_slice, &exact)) {
     return Status::OK();
   }
 
-  while (iter->IsValid()) {
-    // Iterate forward until reaching an entry with a larger row idx.
-    Slice key_slice, v;
-    iter->GetCurrentEntry(&key_slice, &v);
-    RETURN_NOT_OK(key.DecodeFrom(&key_slice));
-    DCHECK_GE(key.row_idx(), row_idx);
-    if (key.row_idx() != row_idx) break;
+  DCHECK(!exact);
 
-    RowChangeList val(v);
-    // Mutation is for the target row, check deletion status.
-    RowChangeListDecoder decoder((RowChangeList(v)));
-    decoder.InitNoSafetyChecks();
-    decoder.TwiddleDeleteStatus(deleted);
-
-    iter->Next();
+  Slice current_key_slice, v;
+  iter->GetCurrentEntry(&current_key_slice, &v);
+  RETURN_NOT_OK(key.DecodeFrom(&current_key_slice));
+  if (key.row_idx() != row_idx) {
+    return Status::OK();
   }
-
+  RowChangeListDecoder decoder((RowChangeList(v)));
+  decoder.InitNoSafetyChecks();
+  *deleted = decoder.is_delete();
   return Status::OK();
 }
 
 void DeltaMemStore::DebugPrint() const {
   tree_.DebugPrint();
+}
+
+int64_t DeltaMemStore::deleted_row_count() const {
+  int64_t count = deleted_row_count_.Load();
+  DCHECK_GE(count, 0);
+  return count;
 }
 
 ////////////////////////////////////////////////////////////
@@ -284,8 +289,8 @@ Status DMSIterator::ApplyDeletes(SelectionVector* sel_vec) {
   return preparer_.ApplyDeletes(sel_vec);
 }
 
-Status DMSIterator::SelectUpdates(SelectionVector* sel_vec) {
-  return preparer_.SelectUpdates(sel_vec);
+Status DMSIterator::SelectDeltas(SelectedDeltas* deltas) {
+  return preparer_.SelectDeltas(deltas);
 }
 
 Status DMSIterator::CollectMutations(vector<Mutation*>*dst, Arena* arena) {

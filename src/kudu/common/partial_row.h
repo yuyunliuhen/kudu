@@ -42,7 +42,11 @@
 namespace kudu {
 class ColumnSchema;
 namespace client {
+class ClientTest_TestProjectionPredicatesFuzz_Test;
 class KuduWriteOperation;
+namespace internal {
+class WriteRpc;
+} // namespace internal
 template<typename KeyTypeWrapper> struct SliceKeysTestSetup;// IWYU pragma: keep
 template<typename KeyTypeWrapper> struct IntKeysTestSetup;  // IWYU pragma: keep
 } // namespace client
@@ -51,6 +55,10 @@ namespace tablet {
   template<typename KeyTypeWrapper> struct SliceTypeRowOps; // IWYU pragma: keep
   template<typename KeyTypeWrapper> struct NumTypeRowOps;   // IWYU pragma: keep
 } // namespace tablet
+
+namespace tools {
+class TableScanner;
+} // namespace tools
 
 /// @endcond
 
@@ -102,6 +110,8 @@ class KUDU_EXPORT KuduPartialRow {
   Status SetInt64(const Slice& col_name, int64_t val) WARN_UNUSED_RESULT;
   Status SetUnixTimeMicros(const Slice& col_name,
                            int64_t micros_since_utc_epoch) WARN_UNUSED_RESULT;
+  Status SetDate(const Slice& col_name,
+                 int32_t days_since_unix_epoch) WARN_UNUSED_RESULT;
 
   Status SetFloat(const Slice& col_name, float val) WARN_UNUSED_RESULT;
   Status SetDouble(const Slice& col_name, double val) WARN_UNUSED_RESULT;
@@ -133,6 +143,7 @@ class KUDU_EXPORT KuduPartialRow {
   Status SetInt32(int col_idx, int32_t val) WARN_UNUSED_RESULT;
   Status SetInt64(int col_idx, int64_t val) WARN_UNUSED_RESULT;
   Status SetUnixTimeMicros(int col_idx, int64_t micros_since_utc_epoch) WARN_UNUSED_RESULT;
+  Status SetDate(int col_idx, int32_t days_since_unix_epoch) WARN_UNUSED_RESULT;
 
   Status SetFloat(int col_idx, float val) WARN_UNUSED_RESULT;
   Status SetDouble(int col_idx, double val) WARN_UNUSED_RESULT;
@@ -162,10 +173,23 @@ class KUDU_EXPORT KuduPartialRow {
   Status SetString(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
   ///@}
 
+  /// @name Setters for varchar columns by name (copying).
+  ///
+  /// Set the varchar value for a column by name, copying the
+  /// specified data immediately.
+  ///
+  /// @param [in] col_name
+  ///   Name of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  Status SetVarchar(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
+
   /// @name Setters for binary/string columns by index (copying).
   ///
-  /// Set the binary/string value for a column by index, copying the specified
-  /// data immediately.
+  /// Set the binary/string value for a column by index, copying
+  /// the specified data immediately.
   ///
   /// These setters are the same as the corresponding column-name-based setters,
   /// but with numeric column indexes. These are faster since they avoid
@@ -187,6 +211,24 @@ class KUDU_EXPORT KuduPartialRow {
   Status SetBinary(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
   Status SetString(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
   ///@}
+
+  /// @name Setter for varchar columns by index (copying).
+  ///
+  /// Set the varchar value for a column by index, copying
+  /// the specified data immediately.
+  ///
+  /// These setters are the same as the corresponding column-name-based setters,
+  /// but with numeric column indexes. These are faster since they avoid
+  /// hashmap lookups, so should be preferred in performance-sensitive code
+  /// (e.g. bulk loaders).
+  ///
+  /// @param [in] col_idx
+  ///   The index of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  Status SetVarchar(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
 
   /// @name Setters for binary/string columns by name (copying).
   ///
@@ -246,6 +288,30 @@ class KUDU_EXPORT KuduPartialRow {
   Status SetStringNoCopy(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
   ///@}
 
+  /// @name [Advanced][Unstable] Setter for varchar columns by name (non-copying).
+  ///
+  /// Set the varchar value for a column by name, not copying the
+  /// specified data.
+  ///
+  /// This method expects the values to be truncated already and they only do a
+  /// basic validation that the data is not larger than the maximum column
+  /// length (as indicated by the schema) multiplied by 4, as that's the upper
+  /// limit if only 4-byte UTF8 characters are used. This is subject to change in
+  /// the future.
+  ///
+  /// @note The specified data must remain valid until the corresponding
+  ///   RPC calls are completed to be able to access error buffers,
+  ///   if any errors happened (the errors can be fetched using the
+  ///   KuduSession::GetPendingErrors() method).
+  ///
+  /// @param [in] col_name
+  ///   Name of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  Status SetVarcharNoCopyUnsafe(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
+
   /// @name Setters for binary/string columns by index (non-copying).
   ///
   /// Set the binary/string value for a column by index, not copying the
@@ -271,6 +337,34 @@ class KUDU_EXPORT KuduPartialRow {
   Status SetBinaryNoCopy(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
   Status SetStringNoCopy(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
   ///@}
+
+  /// @name [Advanced][Unstable] Setter for varchar columns by index (non-copying).
+  ///
+  /// Set the varchar value for a column by index, not copying the specified data.
+  ///
+  /// This method expects the values to be truncated already and they only do a
+  /// basic validation that the data is not larger than the maximum column
+  /// length (as indicated by the schema) multiplied by 4, as that's the upper
+  /// limit if only 4-byte UTF8 characters are used. This is subject to change in
+  /// the future.
+  ///
+  /// This setter is the same as the corresponding column-name-based setter,
+  /// but with numeric column indexes. This is faster since it avoids
+  /// hashmap lookups, so should be preferred in performance-sensitive code
+  /// (e.g. bulk loaders).
+  ///
+  /// @note The specified data must remain valid until the corresponding
+  ///   RPC calls are completed to be able to access error buffers,
+  ///   if any errors happened (the errors can be fetched using the
+  ///   KuduSession::GetPendingErrors() method).
+  ///
+  /// @param [in] col_idx
+  ///   The index of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  Status SetVarcharNoCopyUnsafe(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
 
   /// Set column value to @c NULL; the column is identified by its name.
   ///
@@ -355,13 +449,15 @@ class KUDU_EXPORT KuduPartialRow {
   Status GetInt16(const Slice& col_name, int16_t* val) const WARN_UNUSED_RESULT;
   Status GetInt32(const Slice& col_name, int32_t* val) const WARN_UNUSED_RESULT;
   Status GetInt64(const Slice& col_name, int64_t* val) const WARN_UNUSED_RESULT;
-  Status GetUnixTimeMicros(const Slice& col_name,
-                      int64_t* micros_since_utc_epoch) const WARN_UNUSED_RESULT;
-
+  Status GetUnixTimeMicros(const Slice& col_name, int64_t* micros_since_utc_epoch)
+    const WARN_UNUSED_RESULT;
+  Status GetDate(const Slice& col_name, int32_t* days_since_unix_epoch) const WARN_UNUSED_RESULT;
   Status GetFloat(const Slice& col_name, float* val) const WARN_UNUSED_RESULT;
   Status GetDouble(const Slice& col_name, double* val) const WARN_UNUSED_RESULT;
 #if KUDU_INT128_SUPPORTED
+  // NOTE: The non-const version of this function is kept for backwards compatibility.
   Status GetUnscaledDecimal(const Slice& col_name, int128_t* val) WARN_UNUSED_RESULT;
+  Status GetUnscaledDecimal(const Slice& col_name, int128_t* val) const WARN_UNUSED_RESULT;
 #endif
   ///@}
 
@@ -390,17 +486,20 @@ class KUDU_EXPORT KuduPartialRow {
   Status GetInt32(int col_idx, int32_t* val) const WARN_UNUSED_RESULT;
   Status GetInt64(int col_idx, int64_t* val) const WARN_UNUSED_RESULT;
   Status GetUnixTimeMicros(int col_idx, int64_t* micros_since_utc_epoch) const WARN_UNUSED_RESULT;
+  Status GetDate(int col_idx, int32_t* days_since_unix_epoch) const WARN_UNUSED_RESULT;
 
   Status GetFloat(int col_idx, float* val) const WARN_UNUSED_RESULT;
   Status GetDouble(int col_idx, double* val) const WARN_UNUSED_RESULT;
 #if KUDU_INT128_SUPPORTED
+  // NOTE: The non-const version of this function is kept for backwards compatibility.
   Status GetUnscaledDecimal(int col_idx, int128_t* val) WARN_UNUSED_RESULT;
+  Status GetUnscaledDecimal(int col_idx, int128_t* val) const WARN_UNUSED_RESULT;
 #endif
   ///@}
 
-  /// @name Getters for string/binary column by column name.
+  /// @name Getters for string/binary/varchar column by column name.
   ///
-  /// Get the string/binary value for a column by its name.
+  /// Get the string/binary/varchar value for a column by its name.
   ///
   /// @param [in] col_name
   ///   Name of the column.
@@ -417,11 +516,12 @@ class KUDU_EXPORT KuduPartialRow {
   ///@{
   Status GetString(const Slice& col_name, Slice* val) const WARN_UNUSED_RESULT;
   Status GetBinary(const Slice& col_name, Slice* val) const WARN_UNUSED_RESULT;
+  Status GetVarchar(const Slice& col_name, Slice* val) const WARN_UNUSED_RESULT;
   ///@}
 
-  /// @name Getters for string/binary column by column index.
+  /// @name Getters for string/binary/varchar column by column index.
   ///
-  /// Get the string/binary value for a column by its index.
+  /// Get the string/binary/varchar value for a column by its index.
   ///
   /// These methods are faster than their name-based counterparts
   /// since they use indices to avoid hashmap lookups, so index-based getters
@@ -442,6 +542,7 @@ class KUDU_EXPORT KuduPartialRow {
   ///@{
   Status GetString(int col_idx, Slice* val) const WARN_UNUSED_RESULT;
   Status GetBinary(int col_idx, Slice* val) const WARN_UNUSED_RESULT;
+  Status GetVarchar(int col_idx, Slice* val) const WARN_UNUSED_RESULT;
   ///@}
 
   //------------------------------------------------------------
@@ -492,19 +593,25 @@ class KUDU_EXPORT KuduPartialRow {
 
  private:
   friend class client::KuduWriteOperation;   // for row_data_.
+  friend class client::internal::WriteRpc;   // for row_data_.
   friend class KeyUtilTest;
   friend class PartitionSchema;
   friend class RowOperationsPBDecoder;
   friend class RowOperationsPBEncoder;
+  friend class tools::TableScanner;
   friend class TestScanSpec;
   template<typename KeyTypeWrapper> friend struct client::SliceKeysTestSetup;
   template<typename KeyTypeWrapper> friend struct client::IntKeysTestSetup;
   template<typename KeyTypeWrapper> friend struct tablet::SliceTypeRowOps;
   template<typename KeyTypeWrapper> friend struct tablet::NumTypeRowOps;
+  FRIEND_TEST(client::ClientTest, TestProjectionPredicatesFuzz);
   FRIEND_TEST(KeyUtilTest, TestIncrementInt128PrimaryKey);
   FRIEND_TEST(PartitionPrunerTest, TestIntPartialPrimaryKeyRangePruning);
   FRIEND_TEST(PartitionPrunerTest, TestPartialPrimaryKeyRangePruning);
   FRIEND_TEST(PartitionPrunerTest, TestPrimaryKeyRangePruning);
+  FRIEND_TEST(RowOperationsTest, ProjectionTestWholeSchemaSpecified);
+  FRIEND_TEST(RowOperationsTest, TestProjectUpdates);
+  FRIEND_TEST(RowOperationsTest, TestProjectDeletes);
 
   template<typename T>
   Status Set(const Slice& col_name, const typename T::cpp_type& val,

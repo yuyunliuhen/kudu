@@ -36,11 +36,12 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/array_view.h"
 #include "kudu/util/cache.h"
+#include "kudu/util/cache_metrics.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/env.h"
+#include "kudu/util/file_cache_metrics.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/locks.h"
-#include "kudu/util/metrics.h"  // IWYU pragma: keep
 #include "kudu/util/monotime.h"
 #include "kudu/util/once.h"
 #include "kudu/util/slice.h"
@@ -121,14 +122,12 @@ class BaseDescriptor {
     // The allocated charge is always one byte. This is incorrect with respect
     // to memory tracking, but it's necessary if the cache capacity is to be
     // equivalent to the max number of fds.
-    Cache::PendingHandle* pending = CHECK_NOTNULL(cache()->Allocate(
-        filename(), sizeof(file_ptr), 1));
-    memcpy(cache()->MutableValue(pending),
-           &file_ptr,
-           sizeof(file_ptr));
-    return ScopedOpenedDescriptor<FileType>(this, Cache::UniqueHandle(
-        cache()->Insert(pending, file_cache_->eviction_cb_.get()),
-        Cache::HandleDeleter(cache())));
+    auto pending(cache()->Allocate(filename(), sizeof(file_ptr), 1));
+    CHECK(pending);
+    memcpy(cache()->MutableValue(&pending), &file_ptr, sizeof(file_ptr));
+    return ScopedOpenedDescriptor<FileType>(
+        this, cache()->Insert(std::move(pending),
+                              file_cache_->eviction_cb_.get()));
   }
 
   // Retrieves a pointer to an open file object from the file cache with the
@@ -137,9 +136,8 @@ class BaseDescriptor {
   // Returns a handle to the looked up entry. The handle may or may not contain
   // an open file, depending on whether the cache hit or missed.
   ScopedOpenedDescriptor<FileType> LookupFromCache() const {
-    return ScopedOpenedDescriptor<FileType>(this, Cache::UniqueHandle(
-        cache()->Lookup(filename(), Cache::EXPECT_IN_CACHE),
-        Cache::HandleDeleter(cache())));
+    return ScopedOpenedDescriptor<FileType>(
+        this, cache()->Lookup(filename(), Cache::EXPECT_IN_CACHE));
   }
 
   // Mark this descriptor as to-be-deleted later.
@@ -206,7 +204,7 @@ class ScopedOpenedDescriptor {
 
   FileType* file() const {
     DCHECK(opened());
-    return CacheValueToFileType<FileType>(desc_->cache()->Value(handle_.get()));
+    return CacheValueToFileType<FileType>(desc_->cache()->Value(handle_));
   }
 
  private:
@@ -332,7 +330,7 @@ class Descriptor<RWFile> : public RWFile {
 
     // The file was evicted, reopen it.
     RWFileOptions opts;
-    opts.mode = Env::OPEN_EXISTING;
+    opts.mode = Env::MUST_EXIST;
     unique_ptr<RWFile> f;
     RETURN_NOT_OK(base_.env()->NewRWFile(opts, base_.filename(), &f));
 
@@ -458,10 +456,11 @@ FileCache<FileType>::FileCache(const string& cache_name,
     : env_(env),
       cache_name_(cache_name),
       eviction_cb_(new EvictionCallback<FileType>()),
-      cache_(NewLRUCache(DRAM_CACHE, max_open_files, cache_name)),
+      cache_(NewCache(max_open_files, cache_name)),
       running_(1) {
   if (entity) {
-    cache_->SetMetrics(entity);
+    unique_ptr<FileCacheMetrics> metrics(new FileCacheMetrics(entity));
+    cache_->SetMetrics(std::move(metrics));
   }
   LOG(INFO) << Substitute("Constructed file cache $0 with capacity $1",
                           cache_name, max_open_files);

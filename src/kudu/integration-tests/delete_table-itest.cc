@@ -77,6 +77,7 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+using boost::none;
 using kudu::client::KuduClient;
 using kudu::client::KuduScanner;
 using kudu::client::KuduScanBatch;
@@ -310,6 +311,7 @@ TEST_F(DeleteTableITest, TestDeleteEmptyTable) {
     master::GetTabletLocationsResponsePB resp;
     rpc.set_timeout(MonoDelta::FromSeconds(10));
     req.add_tablet_ids()->assign(tablet_id);
+    req.set_intern_ts_infos_in_response(true);
     ASSERT_OK(cluster_->master_proxy()->GetTabletLocations(req, &resp, &rpc));
     SCOPED_TRACE(SecureDebugString(resp));
     ASSERT_EQ(1, resp.errors_size());
@@ -1175,14 +1177,15 @@ TEST_F(DeleteTableITest, TestNoDeleteTombstonedTablets) {
   ASSERT_OK(inspect_->WaitForReplicaCount(kNumReplicas));
   master::GetTableLocationsResponsePB table_locations;
   ASSERT_OK(itest::GetTableLocations(cluster_->master_proxy(), TestWorkload::kDefaultTableName,
-                                     kTimeout, master::VOTER_REPLICA, &table_locations));
+                                     kTimeout, master::VOTER_REPLICA, /*table_id=*/none,
+                                     &table_locations));
   ASSERT_EQ(1, table_locations.tablet_locations_size()); // Only 1 tablet.
   string tablet_id;
   std::set<string> replicas;
   for (const auto& t : table_locations.tablet_locations()) {
     tablet_id = t.tablet_id();
-    for (const auto& r : t.replicas()) {
-      replicas.insert(r.ts_info().permanent_uuid());
+    for (const auto& r : t.interned_replicas()) {
+      replicas.insert(table_locations.ts_infos(r.ts_info_idx()).permanent_uuid());
     }
   }
 
@@ -1379,12 +1382,15 @@ TEST_P(DeleteTableTombstonedParamTest, TestTabletTombstone) {
   ASSERT_OK(split_row->SetInt32(0, numeric_limits<int32_t>::max() / kNumTablets));
   split_rows.push_back(split_row);
   gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   ASSERT_OK(table_creator->table_name(TestWorkload::kDefaultTableName)
                           .split_rows(split_rows)
                           .schema(&client_schema)
                           .set_range_partition_columns({ "key" })
                           .num_replicas(3)
                           .Create());
+#pragma GCC diagnostic pop
 
   // Start a workload on the cluster, and run it until we find WALs on disk.
   TestWorkload workload(cluster_.get());

@@ -55,7 +55,7 @@ class MockRowSet : public RowSet {
     return Status::OK();
   }
   virtual Status NewRowIterator(const RowIteratorOptions& /*opts*/,
-                                gscoped_ptr<RowwiseIterator>* /*out*/) const OVERRIDE {
+                                std::unique_ptr<RowwiseIterator>* /*out*/) const OVERRIDE {
     LOG(FATAL) << "Unimplemented";
     return Status::OK();
   }
@@ -67,6 +67,10 @@ class MockRowSet : public RowSet {
     return Status::OK();
   }
   virtual Status CountRows(const fs::IOContext* /*io_context*/, rowid_t* /*count*/) const OVERRIDE {
+    LOG(FATAL) << "Unimplemented";
+    return Status::OK();
+  }
+  virtual Status CountLiveRows(uint64_t* /*count*/) const OVERRIDE {
     LOG(FATAL) << "Unimplemented";
     return Status::OK();
   }

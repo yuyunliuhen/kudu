@@ -182,9 +182,6 @@ class MvccSnapshot {
 //
 // NOTE: we do not support "rollback" of in-memory edits. Thus, once we call
 // StartApplyingTransaction(), the transaction _must_ commit.
-//
-// See: docs/design_docs/repeatable-reads.md for more information on some of the concepts in
-// this class like "clean" and "safe" time.
 class MvccManager {
  public:
   MvccManager();
@@ -357,7 +354,9 @@ class MvccManager {
   // Adjusts the clean time, i.e. the timestamp such that all transactions with
   // lower timestamps are committed or aborted, based on which transactions are
   // currently in flight and on what is the latest value of 'safe_time_'.
-  void AdjustCleanTime();
+  //
+  // Must be called with lock_ held.
+  void AdjustCleanTimeUnlocked();
 
   // Advances the earliest in-flight timestamp, based on which transactions are
   // currently in-flight. Usually called when the previous earliest transaction

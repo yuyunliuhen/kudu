@@ -124,7 +124,10 @@ endif()
 
 # compiler flags that are common across debug/release builds
 #  -msse4.2: Enable sse4.2 compiler intrinsics.
-set(CXX_COMMON_FLAGS "-msse4.2")
+execute_process(COMMAND uname -p OUTPUT_VARIABLE ARCH_NAME)
+if (NOT "${ARCH_NAME}" MATCHES "aarch64")
+  set(CXX_COMMON_FLAGS "-msse4.2")
+endif()
 #  -Wall: Enable all warnings.
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wall")
 #  -Wno-sign-compare: suppress warnings for comparison between signed and unsigned
@@ -134,9 +137,6 @@ set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-sign-compare")
 #     which appear in the Kudu source code due to the use of ASCII art and
 #     multi-line command line examples in comments.
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-comment")
-#  -Wno-deprecated: we currently have a number of places using deprecated functions
-#     (mostly our own functions). TODO(todd) remove or individually suppress call sites.
-set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-deprecated")
 #  -pthread: enable multithreaded malloc
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -pthread")
 #  -fno-strict-aliasing
@@ -207,18 +207,19 @@ if ("${CMAKE_BUILD_TYPE}" STREQUAL "RELWITHDEBINFO" OR "${CMAKE_BUILD_TYPE}" STR
   set(CMAKE_BUILD_TYPE RELEASE)
 endif ()
 
-# Set compile flags based on the build type.
+# Append to compile flags based on the build type. It's important not to clobber
+# CMAKE_CXX_FLAGS because it may contain flags specified by the user.
 message("Configured for ${CMAKE_BUILD_TYPE} build (set with cmake -DCMAKE_BUILD_TYPE={release,debug,...})")
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG")
-  set(CMAKE_CXX_FLAGS ${CXX_FLAGS_DEBUG})
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_FLAGS_DEBUG}")
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "FASTDEBUG")
-  set(CMAKE_CXX_FLAGS ${CXX_FLAGS_FASTDEBUG})
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_FLAGS_FASTDEBUG}")
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
-  set(CMAKE_CXX_FLAGS ${CXX_FLAGS_RELEASE})
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_FLAGS_RELEASE}")
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "PROFILE_GEN")
-  set(CMAKE_CXX_FLAGS ${CXX_FLAGS_PROFILE_GEN})
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_FLAGS_PROFILE_GEN}")
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "PROFILE_BUILD")
-  set(CMAKE_CXX_FLAGS ${CXX_FLAGS_PROFILE_BUILD})
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_FLAGS_PROFILE_BUILD}")
 else()
   message(FATAL_ERROR "Unknown build type: ${CMAKE_BUILD_TYPE}")
 endif ()
@@ -352,10 +353,11 @@ if (${KUDU_USE_UBSAN})
   # Enable UB and unsigned integer overflow detection.
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined,integer")
   # Disable 'alignment' because unaligned access is really OK on Nehalem and we do it all over the place.
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-sanitize=alignment")
+  # TODO(todd): enable implicit-integer-sign-change checking after fixing issues.
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-sanitize=alignment,implicit-integer-sign-change,implicit-unsigned-integer-truncation,implicit-signed-integer-truncation")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize-blacklist=${CMAKE_CURRENT_SOURCE_DIR}/build-support/ubsan-blacklist.txt")
   # Stop execution after UB or overflow is detected.
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-sanitize-recover")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-sanitize-recover=undefined,integer")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DUNDEFINED_SANITIZER")
 endif ()
 
@@ -493,11 +495,11 @@ endif()
 if (GOLD_VERSION)
   # Older versions of the gold linker are vulnerable to a bug [1] which
   # prevents weak symbols from being overridden properly. This leads to
-  # omitting of Kudu's tcmalloc dependency.
+  # omitting of Kudu's tcmalloc dependency if using dynamic linking.
   #
   # How we handle this situation depends on other factors:
   # - If gold is optional, we won't use it.
-  # - If gold is required, we'll either:
+  # - If gold is required and we're using dynamic linking, we'll either:
   #   - Raise an error in RELEASE builds (we shouldn't release such a product), or
   #   - Drop tcmalloc in all other builds.
   #
@@ -507,13 +509,13 @@ if (GOLD_VERSION)
   endif()
   if (MUST_USE_GOLD)
     message("Using hard-wired gold linker (version ${GOLD_VERSION})")
-    if (KUDU_BUGGY_GOLD)
-      if ("${KUDU_LINK}" STREQUAL "d" AND
-          "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
+    if (KUDU_BUGGY_GOLD AND "${KUDU_LINK}" STREQUAL "d")
+      if ("${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
         message(SEND_ERROR "Configured to use buggy gold with dynamic linking "
           "in a RELEASE build; this would cause tcmalloc symbols to get dropped")
       endif()
       message("Hard-wired gold linker is buggy, dropping tcmalloc dependency")
+      set(GOLD_INCOMPATIBLE_WITH_TCMALLOC 1)
     endif()
   elseif (NOT KUDU_BUGGY_GOLD)
     # The Gold linker must be manually enabled.
@@ -1122,13 +1124,17 @@ include_directories(${KERBEROS_INCLUDE_DIR})
 ADD_THIRDPARTY_LIB(krb5
   SHARED_LIB "${KERBEROS_LIBRARY}")
 
+if (NO_CHRONY)
+  add_definitions("-DNO_CHRONY")
+endif()
+
 ## Google PerfTools
 ##
 ## Disabled with TSAN/ASAN as well as with gold+dynamic linking (see
 ## earlier comment).
 if (NOT "${KUDU_USE_ASAN}" AND
     NOT "${KUDU_USE_TSAN}" AND
-    NOT ("${KUDU_BUGGY_GOLD}" AND "${KUDU_LINK}" STREQUAL "d"))
+    NOT "${GOLD_INCOMPATIBLE_WITH_TCMALLOC}")
   find_package(GPerf REQUIRED)
   ADD_THIRDPARTY_LIB(tcmalloc
     STATIC_LIB "${TCMALLOC_STATIC_LIB}"
@@ -1139,26 +1145,6 @@ if (NOT "${KUDU_USE_ASAN}" AND
   list(APPEND KUDU_BASE_LIBS tcmalloc profiler)
   add_definitions("-DTCMALLOC_ENABLED")
   set(KUDU_TCMALLOC_AVAILABLE 1)
-endif()
-
-# Required pmem libraries
-if (NOT APPLE)
-find_package(Pmem REQUIRED)
-include_directories(${PMEM_INCLUDE_DIR})
-ADD_THIRDPARTY_LIB(vmem
-  STATIC_LIB "${VMEM_STATIC_LIB}"
-  SHARED_LIB "${VMEM_SHARED_LIB}")
-ADD_THIRDPARTY_LIB(pmem
-  STATIC_LIB "${PMEM_STATIC_LIB}"
-  SHARED_LIB "${PMEM_SHARED_LIB}")
-ADD_THIRDPARTY_LIB(pmemobj
-  STATIC_LIB "${PMEMOBJ_STATIC_LIB}"
-  SHARED_LIB "${PMEMOBJ_SHARED_LIB}")
-endif()
-
-if (EXISTS ${VMEM_SHARED_LIB})
-  set(HAVE_LIB_VMEM 1)
-  add_definitions(-DHAVE_LIB_VMEM=1)
 endif()
 
 ## curl
@@ -1223,6 +1209,28 @@ else()
   set(SANITIZER_OPTIONS_OVERRIDE -Wl,-U,_sanitizer_options_link_helper sanitizer_options)
   set(KRB5_REALM_OVERRIDE -Wl,-U,krb5_realm_override_loaded krb5_realm_override)
 endif()
+
+## yaml
+find_package(Yaml REQUIRED)
+include_directories(SYSTEM ${YAML_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(yaml
+  STATIC_LIB "${YAML_STATIC_LIB}"
+  SHARED_LIB "${YAML_SHARED_LIB}")
+
+## gumbo-parser
+find_package(GumboParser REQUIRED)
+include_directories(SYSTEM ${GUMBO_PARSER_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(gumbo-parser
+  STATIC_LIB "${GUMBO_PARSER_STATIC_LIB}"
+  SHARED_LIB "${GUMBO_PARSER_SHARED_LIB}")
+
+## gumbo-query
+find_package(GumboQuery REQUIRED)
+include_directories(SYSTEM ${GUMBO_QUERY_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(gumbo-query
+  STATIC_LIB "${GUMBO_QUERY_STATIC_LIB}"
+  SHARED_LIB "${GUMBO_QUERY_SHARED_LIB}"
+  DEPS gumbo-parser)
 
 ## Boost
 
@@ -1365,15 +1373,21 @@ if (UNIX)
 endif (UNIX)
 
 ############################################################
+# "generated-headers" target
+############################################################
+if (UNIX)
+  add_custom_target(generated-headers
+    DEPENDS pb-gen krpc-gen hms_thrift sentry_thrift)
+endif (UNIX)
+
+############################################################
 # "make iwyu" and "make iwyu-fix" target
 ############################################################
 if (UNIX)
-  add_custom_target(iwyu-generated-headers
-    DEPENDS pb-gen krpc-gen hms_thrift sentry_thrift)
   add_custom_target(iwyu ${BUILD_SUPPORT_DIR}/iwyu.py --from-git
-    DEPENDS iwyu-generated-headers)
+    DEPENDS generated-headers)
   add_custom_target(iwyu-fix ${BUILD_SUPPORT_DIR}/iwyu.py --fix --from-git
-    DEPENDS iwyu-generated-headers)
+    DEPENDS generated-headers)
 endif (UNIX)
 
 ############################################################
@@ -1381,7 +1395,7 @@ endif (UNIX)
 ############################################################
 if (UNIX)
   add_custom_target(tidy ${BUILD_SUPPORT_DIR}/tidy.sh)
-  add_dependencies(tidy pb-gen krpc-gen)
+  add_dependencies(tidy generated-headers)
 endif (UNIX)
 
 ############################################################
@@ -1396,10 +1410,13 @@ endif (UNIX)
 
 ############################################################
 # "make doxygen" target
-# Needs the doxygen system package to work.
+# Requires doxygen of version >= 1.8.11 to leverage the
+# WARN_AS_ERROR configuration parameter (introduced in
+# version 1.8.11) for spotting various issues in the Kudu
+# C++ client API documentation.
 ############################################################
 if (UNIX)
-  find_package(Doxygen)
+  find_package(Doxygen 1.8.11)
   if (NOT (DOXYGEN_FOUND AND DOXYGEN_DOT_FOUND))
     message(WARNING "Doxygen with Dot support (graphviz) not found: 'doxygen' target is not available")
   else ()
@@ -1472,10 +1489,12 @@ add_subdirectory(src/kudu/integration-tests)
 add_subdirectory(src/kudu/kserver)
 add_subdirectory(src/kudu/master)
 add_subdirectory(src/kudu/mini-cluster)
+add_subdirectory(src/kudu/rebalance)
 add_subdirectory(src/kudu/rpc)
 add_subdirectory(src/kudu/security)
 add_subdirectory(src/kudu/sentry)
 add_subdirectory(src/kudu/server)
+add_subdirectory(src/kudu/subprocess)
 add_subdirectory(src/kudu/tablet)
 add_subdirectory(src/kudu/thrift)
 add_subdirectory(src/kudu/tools)

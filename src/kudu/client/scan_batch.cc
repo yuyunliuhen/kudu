@@ -27,7 +27,6 @@
 #include "kudu/common/common.pb.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
-#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/bitmap.h"
 #include "kudu/util/int128.h"
@@ -75,15 +74,6 @@ Slice KuduScanBatch::indirect_data() const {
 
 namespace {
 
-inline Status FindColumn(const Schema& schema, const Slice& col_name, int* idx) {
-  StringPiece sp(reinterpret_cast<const char*>(col_name.data()), col_name.size());
-  *idx = schema.find_column(sp);
-  if (PREDICT_FALSE(*idx == -1)) {
-    return Status::NotFound("No such column", col_name);
-  }
-  return Status::OK();
-}
-
 // Just enough of a "cell" to support the Schema::DebugCellAppend calls
 // made by KuduScanBatch::RowPtr::ToString.
 class RowCell {
@@ -118,8 +108,16 @@ bool KuduScanBatch::RowPtr::IsNull(int col_idx) const {
 
 bool KuduScanBatch::RowPtr::IsNull(const Slice& col_name) const {
   int col_idx;
-  CHECK_OK(FindColumn(*schema_, col_name, &col_idx));
+  CHECK_OK(schema_->FindColumn(col_name, &col_idx));
   return IsNull(col_idx);
+}
+
+Status KuduScanBatch::RowPtr::IsDeleted(bool* val) const {
+  int col_idx = schema_->first_is_deleted_virtual_column_idx();
+  if (col_idx == Schema::kColumnNotFound) {
+    return Status::NotFound("IS_DELETED virtual column not found");
+  }
+  return Get<TypeTraits<IS_DELETED> >(col_idx, val);
 }
 
 Status KuduScanBatch::RowPtr::GetBool(const Slice& col_name, bool* val) const {
@@ -146,6 +144,10 @@ Status KuduScanBatch::RowPtr::GetUnixTimeMicros(const Slice& col_name, int64_t* 
   return Get<TypeTraits<UNIXTIME_MICROS> >(col_name, val);
 }
 
+Status KuduScanBatch::RowPtr::GetDate(const Slice& col_name, int32_t* days_since_unix_epoch) const {
+  return Get<TypeTraits<DATE> >(col_name, days_since_unix_epoch);
+}
+
 Status KuduScanBatch::RowPtr::GetFloat(const Slice& col_name, float* val) const {
   return Get<TypeTraits<FLOAT> >(col_name, val);
 }
@@ -156,7 +158,7 @@ Status KuduScanBatch::RowPtr::GetDouble(const Slice& col_name, double* val) cons
 
 Status KuduScanBatch::RowPtr::GetUnscaledDecimal(const Slice& col_name, int128_t* val) const {
   int col_idx;
-  RETURN_NOT_OK(FindColumn(*schema_, col_name, &col_idx));
+  RETURN_NOT_OK(schema_->FindColumn(col_name, &col_idx));
   return GetUnscaledDecimal(col_idx, val);
 }
 
@@ -166,6 +168,10 @@ Status KuduScanBatch::RowPtr::GetString(const Slice& col_name, Slice* val) const
 
 Status KuduScanBatch::RowPtr::GetBinary(const Slice& col_name, Slice* val) const {
   return Get<TypeTraits<BINARY> >(col_name, val);
+}
+
+Status KuduScanBatch::RowPtr::GetVarchar(const Slice& col_name, Slice* val) const {
+  return Get<TypeTraits<VARCHAR> >(col_name, val);
 }
 
 Status KuduScanBatch::RowPtr::GetBool(int col_idx, bool* val) const {
@@ -192,6 +198,10 @@ Status KuduScanBatch::RowPtr::GetUnixTimeMicros(int col_idx, int64_t* val) const
   return Get<TypeTraits<UNIXTIME_MICROS> >(col_idx, val);
 }
 
+Status KuduScanBatch::RowPtr::GetDate(int col_idx, int32_t* days_since_unix_epoch) const {
+  return Get<TypeTraits<DATE> >(col_idx, days_since_unix_epoch);
+}
+
 Status KuduScanBatch::RowPtr::GetFloat(int col_idx, float* val) const {
   return Get<TypeTraits<FLOAT> >(col_idx, val);
 }
@@ -208,10 +218,14 @@ Status KuduScanBatch::RowPtr::GetBinary(int col_idx, Slice* val) const {
   return Get<TypeTraits<BINARY> >(col_idx, val);
 }
 
+Status KuduScanBatch::RowPtr::GetVarchar(int col_idx, Slice* val) const {
+  return Get<TypeTraits<VARCHAR> >(col_idx, val);
+}
+
 template<typename T>
 Status KuduScanBatch::RowPtr::Get(const Slice& col_name, typename T::cpp_type* val) const {
   int col_idx;
-  RETURN_NOT_OK(FindColumn(*schema_, col_name, &col_idx));
+  RETURN_NOT_OK(schema_->FindColumn(col_name, &col_idx));
   return Get<T>(col_idx, val);
 }
 
@@ -267,6 +281,9 @@ Status KuduScanBatch::RowPtr::Get<TypeTraits<UNIXTIME_MICROS> >(
     const Slice& col_name, int64_t* val) const;
 
 template
+Status KuduScanBatch::RowPtr::Get<TypeTraits<DATE> >(const Slice& col_name, int32_t* val) const;
+
+template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<FLOAT> >(const Slice& col_name, float* val) const;
 
 template
@@ -277,6 +294,9 @@ Status KuduScanBatch::RowPtr::Get<TypeTraits<STRING> >(const Slice& col_name, Sl
 
 template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<BINARY> >(const Slice& col_name, Slice* val) const;
+
+template
+Status KuduScanBatch::RowPtr::Get<TypeTraits<VARCHAR> >(const Slice& col_name, Slice* val) const;
 
 template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<BOOL> >(int col_idx, bool* val) const;
@@ -300,6 +320,9 @@ template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<UNIXTIME_MICROS> >(int col_idx, int64_t* val) const;
 
 template
+Status KuduScanBatch::RowPtr::Get<TypeTraits<DATE> >(int col_idx, int32_t* val) const;
+
+template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<FLOAT> >(int col_idx, float* val) const;
 
 template
@@ -310,6 +333,9 @@ Status KuduScanBatch::RowPtr::Get<TypeTraits<STRING> >(int col_idx, Slice* val) 
 
 template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<BINARY> >(int col_idx, Slice* val) const;
+
+template
+Status KuduScanBatch::RowPtr::Get<TypeTraits<VARCHAR> >(int col_idx, Slice* val) const;
 
 template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<DECIMAL32> >(int col_idx, int32_t* val) const;
@@ -341,7 +367,7 @@ Status KuduScanBatch::RowPtr::GetUnscaledDecimal(int col_idx, int128_t* val) con
       return Status::OK();
     default:
       return Status::InvalidArgument(
-          Substitute("invalid type $0 provided for column '$1' (expected DECIMAL)",
+          Substitute("invalid type $0 provided for column '$1' (expected decimal)",
                      col.type_info()->name(), col.name()));
   }
 }

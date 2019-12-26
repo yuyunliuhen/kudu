@@ -74,8 +74,8 @@ class TRServer(object):
     self.s3_bucket = self.s3.get_bucket(os.environ["TEST_RESULT_BUCKET"])
 
   def connect_s3(self):
-    access_key = os.environ.get("AWS_ACCESS_KEY")
-    secret_key = os.environ.get("AWS_SECRET_KEY")
+    access_key = os.environ["AWS_ACCESS_KEY"]
+    secret_key = os.environ["AWS_SECRET_KEY"]
     s3 = boto.connect_s3(access_key, secret_key)
     logging.info("Connected to S3 with access key %s" % access_key)
     return s3
@@ -140,7 +140,7 @@ class TRServer(object):
         revision varchar(50),
         build_config varchar(100),
         hostname varchar(255),
-        test_name varchar(100),
+        test_name varchar(200),
         status int,
         log_key char(40),
         INDEX (test_name, timestamp),

@@ -18,14 +18,18 @@
 #define KUDU_TSERVER_TABLET_SERVICE_H
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "kudu/consensus/consensus.service.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_admin.service.h"
 #include "kudu/tserver/tserver_service.service.h"
+
+namespace boost {
+template <class T> class optional;
+} // namespace boost
 
 namespace google {
 namespace protobuf {
@@ -104,6 +108,15 @@ class TabletServiceImpl : public TabletServerServiceIf {
                                     google::protobuf::Message* resp,
                                     rpc::RpcContext* context) override;
 
+  // Note: we authorize ListTablets separately because our fine-grained access
+  // model is simpler when authorization is scoped to a single table, which
+  // isn't the case for ListTablets. Rather than authorizing multiple tables at
+  // once, if enforcing access control, we require the super-user role and omit
+  // checking table privileges, and authorize as a client otherwise.
+  bool AuthorizeListTablets(const google::protobuf::Message* req,
+                            google::protobuf::Message* resp,
+                            rpc::RpcContext* context) override;
+
   virtual void Ping(const PingRequestPB* req,
                     PingResponsePB* resp,
                     rpc::RpcContext* context) OVERRIDE;
@@ -151,13 +164,18 @@ class TabletServiceImpl : public TabletServerServiceIf {
                                    bool* has_more_results,
                                    TabletServerErrorPB::Code* error_code);
 
+  // Handle READ_AT_SNAPSHOT and READ_YOUR_WRITES scans.
+  // Returns the opened row iterator, the start timestamp of a snapshot scan,
+  // if applicable, and the ending timestamp of a scan.
   Status HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
                               const rpc::RpcContext* rpc_context,
                               const Schema& projection,
                               tablet::Tablet* tablet,
                               consensus::TimeManager* time_manager,
-                              gscoped_ptr<RowwiseIterator>* iter,
-                              Timestamp* snap_timestamp);
+                              std::unique_ptr<RowwiseIterator>* iter,
+                              boost::optional<Timestamp>* snap_start_timestamp,
+                              Timestamp* snap_timestamp,
+                              TabletServerErrorPB::Code* error_code);
 
   // Validates the given timestamp is not so far in the future that
   // it exceeds the maximum allowed clock synchronization error time,

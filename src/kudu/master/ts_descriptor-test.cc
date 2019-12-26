@@ -19,27 +19,19 @@
 
 #include <memory>
 #include <string>
-#include <vector>
 
 #include <boost/optional/optional.hpp>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/common/common.pb.h"
 #include "kudu/common/wire_protocol.pb.h"
-#include "kudu/gutil/strings/substitute.h"
-#include "kudu/util/path_util.h"
-#include "kudu/util/status.h"
+#include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/test_macros.h"
-#include "kudu/util/test_util.h"
-
-DECLARE_string(location_mapping_cmd);
 
 using std::shared_ptr;
 using std::string;
-using std::vector;
-using strings::Substitute;
+using std::unique_ptr;
 
 namespace kudu {
 namespace master {
@@ -67,6 +59,7 @@ void SetupBasicRegistrationInfo(const string& uuid,
   http_hostport->set_port(54321);
   registration->set_software_version("1.0.0");
   registration->set_https_enabled(false);
+  registration->set_start_time(10000);
 }
 
 TEST(TSDescriptorTest, TestRegistration) {
@@ -74,8 +67,10 @@ TEST(TSDescriptorTest, TestRegistration) {
   NodeInstancePB instance;
   ServerRegistrationPB registration;
   SetupBasicRegistrationInfo(uuid, &instance, &registration);
+  unique_ptr<DnsResolver> dns_resolver(new DnsResolver);
   shared_ptr<TSDescriptor> desc;
-  ASSERT_OK(TSDescriptor::RegisterNew(instance, registration, &desc));
+  ASSERT_OK(TSDescriptor::RegisterNew(
+      instance, registration, {}, dns_resolver.get(), &desc));
 
   // Spot check some fields and the ToString value.
   ASSERT_EQ(uuid, desc->permanent_uuid());
@@ -86,50 +81,17 @@ TEST(TSDescriptorTest, TestRegistration) {
 }
 
 TEST(TSDescriptorTest, TestLocationCmd) {
-  const string kLocationCmdPath = JoinPathSegments(GetTestExecutableDirectory(),
-                                                   "testdata/first_argument.sh");
   // A happy case, using all allowed special characters.
   const string location = "/foo-bar0/BAAZ._9-quux";
-  FLAGS_location_mapping_cmd = Substitute("$0 $1", kLocationCmdPath, location);
-
   const string uuid = "test";
   NodeInstancePB instance;
   ServerRegistrationPB registration;
   SetupBasicRegistrationInfo(uuid, &instance, &registration);
+  unique_ptr<DnsResolver> dns_resolver(new DnsResolver);
   shared_ptr<TSDescriptor> desc;
-  ASSERT_OK(TSDescriptor::RegisterNew(instance, registration, &desc));
-
+  ASSERT_OK(TSDescriptor::RegisterNew(
+      instance, registration, location, dns_resolver.get(), &desc));
   ASSERT_EQ(location, desc->location());
-
-  // Bad cases where the script returns locations with disallowed characters or
-  // in the wrong format.
-  const vector<string> bad_locations = {
-    "\"\"",      // Empty (doesn't begin with /).
-    "foo",       // Doesn't begin with /.
-    "/foo$",     // Contains the illegal character '$'.
-  };
-  for (const auto& bad_location : bad_locations) {
-    FLAGS_location_mapping_cmd = Substitute("$0 $1", kLocationCmdPath, bad_location);
-    ASSERT_TRUE(desc->Register(instance, registration).IsRuntimeError());
-  }
-
-  // Bad cases where the script is invalid.
-  const vector<string> bad_cmds = {
-    // No command provided.
-    " ",
-    // Command not found.
-    "notfound.sh",
-    // Command returns no output.
-    "true",
-    // Command fails.
-    "false",
-    // Command returns too many locations (i.e. contains illegal ' ' character).
-    Substitute("echo $0 $1", "/foo", "/bar"),
-  };
-  for (const auto& bad_cmd : bad_cmds) {
-    FLAGS_location_mapping_cmd = bad_cmd;
-    ASSERT_TRUE(desc->Register(instance, registration).IsRuntimeError());
-  }
 }
 } // namespace master
 } // namespace kudu

@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
 import static org.junit.Assert.assertEquals;
@@ -23,6 +24,7 @@ import java.util.ArrayList;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.primitives.Longs;
+import org.junit.Rule;
 import org.junit.Test;
 import org.mockito.Mockito;
 
@@ -31,6 +33,7 @@ import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.WireProtocol.RowOperationsPB;
 import org.apache.kudu.client.Operation.ChangeType;
+import org.apache.kudu.test.junit.RetryRule;
 import org.apache.kudu.tserver.Tserver.WriteRequestPBOrBuilder;
 
 /**
@@ -38,8 +41,11 @@ import org.apache.kudu.tserver.Tserver.WriteRequestPBOrBuilder;
  */
 public class TestOperation {
 
+  @Rule
+  public RetryRule retryRule = new RetryRule();
+
   private Schema createManyStringsSchema() {
-    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>(4);
+    ArrayList<ColumnSchema> columns = new ArrayList<>(4);
     columns.add(new ColumnSchema.ColumnSchemaBuilder("c0", Type.STRING).key(true).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.STRING).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("c2", Type.STRING).build());
@@ -62,7 +68,7 @@ public class TestOperation {
 
     {
       WriteRequestPBOrBuilder pb =
-          Operation.createAndFillWriteRequestPB(ImmutableList.<Operation>of(insert));
+          Operation.createAndFillWriteRequestPB(ImmutableList.of(insert));
       RowOperationsPB rowOps = pb.getRowOperations();
       assertEquals(6 * 5, rowOps.getIndirectData().size());
       assertEquals("c0_valc1_valc2_valc3_valc4_val", rowOps.getIndirectData().toStringUtf8());
@@ -75,12 +81,12 @@ public class TestOperation {
 
       // Check the strings.
       int offset = 3;
-      for (int i = 0; i <= 4; i++) {
+      for (long i = 0; i <= 4; i++) {
         // The offset into the indirect buffer
-        assertEquals(6 * i, Bytes.getLong(rows, offset));
+        assertEquals(6L * i, Bytes.getLong(rows, offset));
         offset += Longs.BYTES;
         // The length of the pointed-to string.
-        assertEquals(6, Bytes.getLong(rows, offset));
+        assertEquals(6L, Bytes.getLong(rows, offset));
         offset += Longs.BYTES;
       }
 
@@ -93,7 +99,7 @@ public class TestOperation {
     row.setNull("c3");
     {
       WriteRequestPBOrBuilder pb =
-          Operation.createAndFillWriteRequestPB(ImmutableList.<Operation>of(insert));
+          Operation.createAndFillWriteRequestPB(ImmutableList.of(insert));
       RowOperationsPB rowOps = pb.getRowOperations();
       assertEquals(6 * 4, rowOps.getIndirectData().size());
       assertEquals("c0_valc1_valc2_valc4_val", rowOps.getIndirectData().toStringUtf8());
@@ -108,7 +114,9 @@ public class TestOperation {
       int offset = 3;
       int indirOffset = 0;
       for (int i = 0; i <= 4; i++) {
-        if (i == 3) continue;
+        if (i == 3) {
+          continue;
+        }
         // The offset into the indirect buffer
         assertEquals(indirOffset, Bytes.getLong(rows, offset));
         indirOffset += 6;
@@ -123,7 +131,7 @@ public class TestOperation {
   }
 
   private Schema createAllTypesKeySchema() {
-    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>(7);
+    ArrayList<ColumnSchema> columns = new ArrayList<>(7);
     columns.add(new ColumnSchema.ColumnSchemaBuilder("c0", Type.INT8).key(true).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.INT16).key(true).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("c2", Type.INT32).key(true).build());

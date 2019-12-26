@@ -14,23 +14,25 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
-import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
-import static org.apache.kudu.test.junit.AssertHelpers.assertEventuallyTrue;
 import static org.apache.kudu.test.ClientTestUtil.countRowsInScan;
 import static org.apache.kudu.test.ClientTestUtil.createBasicSchemaInsert;
 import static org.apache.kudu.test.ClientTestUtil.getBasicCreateTableOptions;
 import static org.apache.kudu.test.ClientTestUtil.getBasicSchema;
+import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
+import static org.apache.kudu.test.junit.AssertHelpers.assertEventuallyTrue;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
 import java.util.List;
 
-import org.apache.kudu.test.KuduTestHarness;
-import org.apache.kudu.test.junit.AssertHelpers.BooleanExpression;
 import org.junit.Rule;
 import org.junit.Test;
+
+import org.apache.kudu.test.KuduTestHarness;
+import org.apache.kudu.test.junit.AssertHelpers.BooleanExpression;
 
 public class TestMultipleLeaderFailover {
 
@@ -44,8 +46,8 @@ public class TestMultipleLeaderFailover {
           @Override
           public boolean get() throws Exception {
             AsyncKuduScanner scanner = harness.getAsyncClient().newScannerBuilder(table).build();
-            int read_count = countRowsInScan(scanner);
-            return read_count == rowCount;
+            int readCount = countRowsInScan(scanner);
+            return readCount == rowCount;
           }
         }, timeoutMs);
   }
@@ -56,6 +58,7 @@ public class TestMultipleLeaderFailover {
    * Finally it counts to make sure we have total_rows_to_insert of them.
    */
   @Test(timeout = 100000)
+  @SuppressWarnings("deprecation")
   public void testMultipleFailover() throws Exception {
     KuduTable table;
     CreateTableOptions builder = getBasicCreateTableOptions();

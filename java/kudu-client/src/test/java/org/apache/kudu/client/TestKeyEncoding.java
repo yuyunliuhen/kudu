@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -25,7 +26,6 @@ import java.util.ArrayList;
 import java.util.List;
 
 import com.google.common.collect.ImmutableList;
-import org.apache.kudu.test.KuduTestHarness;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -37,6 +37,8 @@ import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.client.PartitionSchema.HashBucketSchema;
 import org.apache.kudu.client.PartitionSchema.RangeSchema;
+import org.apache.kudu.test.KuduTestHarness;
+import org.apache.kudu.util.CharUtil;
 import org.apache.kudu.util.DecimalUtil;
 
 public class TestKeyEncoding {
@@ -55,9 +57,10 @@ public class TestKeyEncoding {
     int i = 0;
     Common.SchemaPB.Builder pb = Common.SchemaPB.newBuilder();
     for (ColumnSchemaBuilder column : columns) {
-      Common.ColumnSchemaPB.Builder columnPb =
-          ProtobufHelper.columnToPb(column.build()).toBuilder();
-      columnPb.setId(i++);
+      Common.ColumnSchemaPB columnPb =
+          ProtobufHelper.columnToPb(Common.ColumnSchemaPB.newBuilder(),
+                                    i++,
+                                    column.build());
       pb.addColumns(columnPb);
     }
     return ProtobufHelper.pbToSchema(pb.build());
@@ -90,7 +93,7 @@ public class TestKeyEncoding {
     }
     return new PartitionSchema(
         new PartitionSchema.RangeSchema(columnIds),
-        ImmutableList.<PartitionSchema.HashBucketSchema>of(), schema);
+        ImmutableList.of(), schema);
   }
 
   /**
@@ -113,7 +116,7 @@ public class TestKeyEncoding {
     Schema schemaOneString =
         buildSchema(new ColumnSchema.ColumnSchemaBuilder("key", Type.STRING).key(true));
     KuduTable table = new KuduTable(null, "one", "one", schemaOneString,
-                                    defaultPartitionSchema(schemaOneString), 3);
+                                    defaultPartitionSchema(schemaOneString), 3, null);
     Insert oneKeyInsert = new Insert(table);
     PartialRow row = oneKeyInsert.getRow();
     row.addString("key", "foo");
@@ -123,7 +126,7 @@ public class TestKeyEncoding {
         new ColumnSchema.ColumnSchemaBuilder("key", Type.STRING).key(true),
         new ColumnSchema.ColumnSchemaBuilder("key2", Type.STRING).key(true));
     KuduTable table2 = new KuduTable(null, "two", "two", schemaTwoString,
-                                     defaultPartitionSchema(schemaTwoString), 3);
+                                     defaultPartitionSchema(schemaTwoString), 3, null);
     Insert twoKeyInsert = new Insert(table2);
     row = twoKeyInsert.getRow();
     row.addString("key", "foo");
@@ -142,7 +145,7 @@ public class TestKeyEncoding {
         new ColumnSchema.ColumnSchemaBuilder("key2", Type.STRING).key(true));
     PartitionSchema partitionSchemaIntString = defaultPartitionSchema(schemaIntString);
     KuduTable table3 = new KuduTable(null, "three", "three",
-        schemaIntString, partitionSchemaIntString, 3);
+        schemaIntString, partitionSchemaIntString, 3, null);
     Insert small = new Insert(table3);
     row = small.getRow();
     row.addInt("key", 20);
@@ -185,6 +188,8 @@ public class TestKeyEncoding {
             .typeAttributes(DecimalUtil.typeAttributes(DecimalUtil.MAX_DECIMAL64_PRECISION, 0)),
         new ColumnSchemaBuilder("decimal128", Type.DECIMAL).key(true)
             .typeAttributes(DecimalUtil.typeAttributes(DecimalUtil.MAX_DECIMAL128_PRECISION, 0)),
+        new ColumnSchemaBuilder("varchar", Type.VARCHAR).key(true)
+            .typeAttributes(CharUtil.typeAttributes(10)),
         new ColumnSchemaBuilder("string", Type.STRING).key(true),
         new ColumnSchemaBuilder("binary", Type.BINARY).key(true));
 
@@ -198,6 +203,7 @@ public class TestKeyEncoding {
     rowA.addDecimal("decimal32", BigDecimal.valueOf(5));
     rowA.addDecimal("decimal64", BigDecimal.valueOf(6));
     rowA.addDecimal("decimal128", BigDecimal.valueOf(7));
+    rowA.addVarchar("varchar", "");
     rowA.addString("string", "");
     rowA.addBinary("binary", "".getBytes(UTF_8));
 
@@ -211,6 +217,7 @@ public class TestKeyEncoding {
                           (byte) 0x80, 0, 0, 5,
                           (byte) 0x80, 0, 0, 0, 0, 0, 0, 6,
                           (byte) 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7,
+                          0, 0,
                           0, 0
                       });
     assertEquals(rowA.stringifyRowKey(),
@@ -226,6 +233,7 @@ public class TestKeyEncoding {
     rowB.addDecimal("decimal32", BigDecimal.valueOf(5));
     rowB.addDecimal("decimal64", BigDecimal.valueOf(6));
     rowB.addDecimal("decimal128", BigDecimal.valueOf(7));
+    rowB.addVarchar("varchar", "abc\1\0defghij");
     rowB.addString("string", "abc\1\0def");
     rowB.addBinary("binary", "\0\1binary".getBytes(UTF_8));
 
@@ -239,6 +247,7 @@ public class TestKeyEncoding {
                           (byte) 0x80, 0, 0, 5,
                           (byte) 0x80, 0, 0, 0, 0, 0, 0, 6,
                           (byte) 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7,
+                          'a', 'b', 'c', 1, 0, 1, 'd', 'e', 'f', 'g', 'h', 0, 0,
                           'a', 'b', 'c', 1, 0, 1, 'd', 'e', 'f', 0, 0,
                           0, 1, 'b', 'i', 'n', 'a', 'r', 'y',
                       });
@@ -253,6 +262,7 @@ public class TestKeyEncoding {
     rowC.addDecimal("decimal32", BigDecimal.valueOf(5));
     rowC.addDecimal("decimal64", BigDecimal.valueOf(6));
     rowC.addDecimal("decimal128", BigDecimal.valueOf(7));
+    rowC.addVarchar("varchar", "abc\n12345678");
     rowC.addString("string", "abc\n123");
     rowC.addBinary("binary", "\0\1\2\3\4\5".getBytes(UTF_8));
 
@@ -266,6 +276,7 @@ public class TestKeyEncoding {
                           (byte) 0x80, 0, 0, 5,
                           (byte) 0x80, 0, 0, 0, 0, 0, 0, 6,
                           (byte) 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7,
+                          'a', 'b', 'c', '\n', '1', '2', '3', '4', '5', '6', 0, 0,
                           'a', 'b', 'c', '\n', '1', '2', '3', 0, 0,
                           0, 1, 2, 3, 4, 5,
                       });
@@ -280,6 +291,7 @@ public class TestKeyEncoding {
     rowD.addDecimal("decimal32", BigDecimal.valueOf(-5));
     rowD.addDecimal("decimal64", BigDecimal.valueOf(-6));
     rowD.addDecimal("decimal128", BigDecimal.valueOf(-7));
+    rowD.addVarchar("varchar", "\0abc\n\1\1\0 123\1\0");
     rowD.addString("string", "\0abc\n\1\1\0 123\1\0");
     rowD.addBinary("binary", "\0\1\2\3\4\5\0".getBytes(UTF_8));
 
@@ -293,6 +305,7 @@ public class TestKeyEncoding {
                           (byte) 127, -1, -1, -5,
                           (byte) 127, -1, -1, -1, -1, -1, -1, -6,
                           (byte) 127, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -7,
+                          0, 1, 'a', 'b', 'c', '\n', 1, 1, 0, 1, ' ', '1', 0, 0,
                           0, 1, 'a', 'b', 'c', '\n', 1, 1, 0, 1, ' ', '1', '2', '3', 1, 0, 1, 0, 0,
                           0, 1, 2, 3, 4, 5, 0,
                       });
@@ -307,7 +320,7 @@ public class TestKeyEncoding {
         new ColumnSchemaBuilder("b", Type.STRING).key(true),
         new ColumnSchemaBuilder("c", Type.STRING).key(true));
 
-    PartitionSchema partitionSchema =
+    final PartitionSchema partitionSchema =
         new PartitionSchema(new RangeSchema(ImmutableList.of(0, 1, 2)),
                             ImmutableList.of(
                                 new HashBucketSchema(ImmutableList.of(0, 1), 32, 0),
@@ -381,29 +394,32 @@ public class TestKeyEncoding {
           .typeAttributes(DecimalUtil.typeAttributes(DecimalUtil.MAX_DECIMAL64_PRECISION, 0)),
         new ColumnSchemaBuilder("decimal128", Type.DECIMAL).key(true)
           .typeAttributes(DecimalUtil.typeAttributes(DecimalUtil.MAX_DECIMAL128_PRECISION, 0)),
+        new ColumnSchemaBuilder("varchar", Type.VARCHAR).key(true)
+          .typeAttributes(CharUtil.typeAttributes(10)),
         new ColumnSchemaBuilder("bool", Type.BOOL),       // not primary key type
         new ColumnSchemaBuilder("float", Type.FLOAT),     // not primary key type
         new ColumnSchemaBuilder("double", Type.DOUBLE));  // not primary key type
 
     KuduTable table = client.createTable("testAllPrimaryKeyTypes-" + System.currentTimeMillis(),
         schema, defaultCreateTableOptions(schema));
-    KuduSession session = client.newSession();
+    final KuduSession session = client.newSession();
 
     Insert insert = table.newInsert();
     PartialRow row = insert.getRow();
     row.addByte(0, (byte) 1);
     row.addShort(1, (short) 2);
     row.addInt(2, 3);
-    row.addLong(3, 4l);
+    row.addLong(3, 4L);
     row.addString(4, "foo");
     row.addBinary(5, "bar".getBytes(UTF_8));
-    row.addLong(6, 6l);
+    row.addLong(6, 6L);
     row.addDecimal(7, BigDecimal.valueOf(DecimalUtil.MAX_UNSCALED_DECIMAL32));
     row.addDecimal(8, BigDecimal.valueOf(DecimalUtil.MAX_UNSCALED_DECIMAL64));
     row.addDecimal(9, new BigDecimal(DecimalUtil.MAX_UNSCALED_DECIMAL128));
-    row.addBoolean(10, true);
-    row.addFloat(11, 8.8f);
-    row.addDouble(12, 9.9);
+    row.addVarchar(10, "varchar bar");
+    row.addBoolean(11, true);
+    row.addFloat(12, 7.8f);
+    row.addDouble(13, 9.9);
     session.apply(insert);
     session.close();
 
@@ -415,19 +431,20 @@ public class TestKeyEncoding {
       assertEquals((byte) 0x01, rr.getByte(0));
       assertEquals((short) 2, rr.getShort(1));
       assertEquals(3, rr.getInt(2));
-      assertEquals(4l, rr.getLong(3));
+      assertEquals(4L, rr.getLong(3));
       assertBytesEquals(rr.getBinaryCopy(4), "foo");
       assertBytesEquals(rr.getBinaryCopy(5), "bar");
-      assertEquals(6l, rr.getLong(6));
+      assertEquals(6L, rr.getLong(6));
       assertTrue(BigDecimal.valueOf(DecimalUtil.MAX_UNSCALED_DECIMAL32)
           .compareTo(rr.getDecimal(7)) == 0);
       assertTrue(BigDecimal.valueOf(DecimalUtil.MAX_UNSCALED_DECIMAL64)
           .compareTo(rr.getDecimal(8)) == 0);
       assertTrue(new BigDecimal(DecimalUtil.MAX_UNSCALED_DECIMAL128)
           .compareTo(rr.getDecimal(9)) == 0);
-      assertTrue(rr.getBoolean(10));
-      assertEquals(8.8f, rr.getFloat(11), .001f);
-      assertEquals(9.9, rr.getDouble(12), .001);
+      assertEquals("varchar ba", rr.getVarchar(10));
+      assertTrue(rr.getBoolean(11));
+      assertEquals(7.8f, rr.getFloat(12), .001f);
+      assertEquals(9.9, rr.getDouble(13), .001);
     }
   }
 }

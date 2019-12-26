@@ -17,6 +17,8 @@
 
 package org.apache.kudu;
 
+import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 
 import org.apache.yetus.audience.InterfaceAudience;
@@ -24,6 +26,7 @@ import org.apache.yetus.audience.InterfaceStability;
 
 import org.apache.kudu.Common.EncodingType;
 import org.apache.kudu.Compression.CompressionType;
+import org.apache.kudu.util.CharUtil;
 
 /**
  * Represents a Kudu Table column. Use {@link ColumnSchema.ColumnSchemaBuilder} in order to
@@ -43,6 +46,8 @@ public class ColumnSchema {
   private final CompressionAlgorithm compressionAlgorithm;
   private final ColumnTypeAttributes typeAttributes;
   private final int typeSize;
+  private final Common.DataType wireType;
+  private final String comment;
 
   /**
    * Specifies the encoding of data for a column on disk.
@@ -100,7 +105,9 @@ public class ColumnSchema {
 
   private ColumnSchema(String name, Type type, boolean key, boolean nullable,
                        Object defaultValue, int desiredBlockSize, Encoding encoding,
-                       CompressionAlgorithm compressionAlgorithm, ColumnTypeAttributes typeAttributes) {
+                       CompressionAlgorithm compressionAlgorithm,
+                       ColumnTypeAttributes typeAttributes, Common.DataType wireType,
+                       String comment) {
     this.name = name;
     this.type = type;
     this.key = key;
@@ -111,6 +118,8 @@ public class ColumnSchema {
     this.compressionAlgorithm = compressionAlgorithm;
     this.typeAttributes = typeAttributes;
     this.typeSize = type.getSize(typeAttributes);
+    this.wireType = wireType;
+    this.comment = comment;
   }
 
   /**
@@ -186,6 +195,14 @@ public class ColumnSchema {
   }
 
   /**
+   * Get the column's underlying DataType.
+   */
+  @InterfaceAudience.Private
+  public Common.DataType getWireType() {
+    return wireType;
+  }
+
+  /**
    * The size of this type in bytes on the wire.
    * @return A size
    */
@@ -193,20 +210,32 @@ public class ColumnSchema {
     return typeSize;
   }
 
+  /**
+   * Return the comment for the column. An empty string means there is no comment.
+   */
+  public String getComment() {
+    return comment;
+  }
+
   @Override
   public boolean equals(Object o) {
-    if (this == o) return true;
-    if (o == null || getClass() != o.getClass()) return false;
+    if (this == o) {
+      return true;
+    }
+    if (!(o instanceof ColumnSchema)) {
+      return false;
+    }
     ColumnSchema that = (ColumnSchema) o;
     return Objects.equals(name, that.name) &&
         Objects.equals(type, that.type) &&
         Objects.equals(key, that.key) &&
-        Objects.equals(typeAttributes, that.typeAttributes);
+        Objects.equals(typeAttributes, that.typeAttributes) &&
+        Objects.equals(comment, that.comment);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(name, type, key, typeAttributes);
+    return Objects.hash(name, type, key, typeAttributes, comment);
   }
 
   @Override
@@ -219,6 +248,10 @@ public class ColumnSchema {
     if (typeAttributes != null) {
       sb.append(typeAttributes.toStringForType(type));
     }
+    if (!comment.isEmpty()) {
+      sb.append(", comment: ");
+      sb.append(comment);
+    }
     return sb.toString();
   }
 
@@ -228,15 +261,19 @@ public class ColumnSchema {
   @InterfaceAudience.Public
   @InterfaceStability.Evolving
   public static class ColumnSchemaBuilder {
+    private static final List<Type> TYPES_WITH_ATTRIBUTES = Arrays.asList(Type.DECIMAL,
+                                                                         Type.VARCHAR);
     private final String name;
     private final Type type;
     private boolean key = false;
     private boolean nullable = false;
     private Object defaultValue = null;
-    private int blockSize = 0;
+    private int desiredBlockSize = 0;
     private Encoding encoding = null;
     private CompressionAlgorithm compressionAlgorithm = null;
     private ColumnTypeAttributes typeAttributes = null;
+    private Common.DataType wireType = null;
+    private String comment = "";
 
     /**
      * Constructor for the required parameters.
@@ -246,6 +283,24 @@ public class ColumnSchema {
     public ColumnSchemaBuilder(String name, Type type) {
       this.name = name;
       this.type = type;
+    }
+
+    /**
+     * Constructor to copy an existing columnSchema
+     * @param that the columnSchema to copy
+     */
+    public ColumnSchemaBuilder(ColumnSchema that) {
+      this.name = that.name;
+      this.type = that.type;
+      this.key = that.key;
+      this.nullable = that.nullable;
+      this.defaultValue = that.defaultValue;
+      this.desiredBlockSize = that.desiredBlockSize;
+      this.encoding = that.encoding;
+      this.compressionAlgorithm = that.compressionAlgorithm;
+      this.typeAttributes = that.typeAttributes;
+      this.wireType = that.wireType;
+      this.comment = that.comment;
     }
 
     /**
@@ -300,12 +355,12 @@ public class ColumnSchema {
      *
      * It's recommended that this not be set any lower than 4096 (4KB) or higher
      * than 1048576 (1MB).
-     * @param blockSize the desired block size, in bytes
+     * @param desiredBlockSize the desired block size, in bytes
      * @return this instance
      * <!-- TODO(KUDU-1107): move the above info to docs -->
      */
-    public ColumnSchemaBuilder desiredBlockSize(int blockSize) {
-      this.blockSize = blockSize;
+    public ColumnSchemaBuilder desiredBlockSize(int desiredBlockSize) {
+      this.desiredBlockSize = desiredBlockSize;
       return this;
     }
 
@@ -331,7 +386,7 @@ public class ColumnSchema {
      * Set the column type attributes for this column.
      */
     public ColumnSchemaBuilder typeAttributes(ColumnTypeAttributes typeAttributes) {
-      if (type != Type.DECIMAL && typeAttributes != null) {
+      if (typeAttributes != null && !TYPES_WITH_ATTRIBUTES.contains(type)) {
         throw new IllegalArgumentException(
             "ColumnTypeAttributes are not used on " + type + " columns");
       }
@@ -340,13 +395,47 @@ public class ColumnSchema {
     }
 
     /**
+     * Allows an alternate {@link Common.DataType} to override the {@link Type}
+     * when serializing the ColumnSchema on the wire.
+     * This is useful for virtual columns specified by their type such as
+     * {@link Common.DataType#IS_DELETED}.
+     */
+    @InterfaceAudience.Private
+    public ColumnSchemaBuilder wireType(Common.DataType wireType) {
+      this.wireType = wireType;
+      return this;
+    }
+
+    /**
+     * Set the comment for this column.
+     */
+    public ColumnSchemaBuilder comment(String comment) {
+      this.comment = comment;
+      return this;
+    }
+
+    /**
      * Builds a {@link ColumnSchema} using the passed parameters.
      * @return a new {@link ColumnSchema}
      */
     public ColumnSchema build() {
+      // Set the wire type if it wasn't explicitly set.
+      if (wireType == null) {
+        this.wireType = type.getDataType(typeAttributes);
+      }
+      if (type == Type.VARCHAR) {
+        if (typeAttributes == null || !typeAttributes.hasLength() ||
+            typeAttributes.getLength() < CharUtil.MIN_VARCHAR_LENGTH ||
+            typeAttributes.getLength() > CharUtil.MAX_VARCHAR_LENGTH) {
+          throw new IllegalArgumentException(
+            String.format("VARCHAR's length must be set and between %d and %d",
+                          CharUtil.MIN_VARCHAR_LENGTH, CharUtil.MAX_VARCHAR_LENGTH));
+        }
+      }
       return new ColumnSchema(name, type,
                               key, nullable, defaultValue,
-                              blockSize, encoding, compressionAlgorithm, typeAttributes);
+                              desiredBlockSize, encoding, compressionAlgorithm,
+                              typeAttributes, wireType, comment);
     }
   }
 }

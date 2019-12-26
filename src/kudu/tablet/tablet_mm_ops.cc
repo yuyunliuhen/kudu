@@ -21,12 +21,16 @@
 #include <ostream>
 #include <utility>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "kudu/common/common.pb.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/rowset.h"
 #include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
@@ -85,6 +89,15 @@ TabletOpBase::TabletOpBase(string name, IOUsage io_usage, Tablet* tablet)
 
 string TabletOpBase::LogPrefix() const {
   return tablet_->LogPrefix();
+}
+
+int32_t TabletOpBase::priority() const {
+  int32_t priority = 0;
+  const auto& extra_config = tablet_->metadata()->extra_config();
+  if (extra_config && extra_config->has_maintenance_priority()) {
+    priority = extra_config->maintenance_priority();
+  }
+  return priority;
 }
 
 ////////////////////////////////////////////////////////////
@@ -262,12 +275,12 @@ void MajorDeltaCompactionOp::UpdateStats(MaintenanceOpStats* stats) {
   // cached stats.
   TabletMetrics* metrics = tablet_->metrics();
   if (metrics) {
-    int64_t new_num_mrs_flushed = metrics->flush_mrs_duration->TotalCount();
-    int64_t new_num_dms_flushed = metrics->flush_dms_duration->TotalCount();
-    int64_t new_num_rs_compacted = metrics->compact_rs_duration->TotalCount();
-    int64_t new_num_rs_minor_delta_compacted =
+    uint64_t new_num_mrs_flushed = metrics->flush_mrs_duration->TotalCount();
+    uint64_t new_num_dms_flushed = metrics->flush_dms_duration->TotalCount();
+    uint64_t new_num_rs_compacted = metrics->compact_rs_duration->TotalCount();
+    uint64_t new_num_rs_minor_delta_compacted =
         metrics->delta_minor_compact_rs_duration->TotalCount();
-    int64_t new_num_rs_major_delta_compacted =
+    uint64_t new_num_rs_major_delta_compacted =
         metrics->delta_major_compact_rs_duration->TotalCount();
     if (prev_stats_.valid() &&
         new_num_mrs_flushed == last_num_mrs_flushed_ &&

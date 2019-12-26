@@ -18,6 +18,7 @@
 #include "kudu/tablet/transactions/transaction_tracker.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <limits>
 #include <mutex>
 #include <ostream>
@@ -52,21 +53,25 @@ TAG_FLAG(tablet_transaction_memory_limit_mb, advanced);
 METRIC_DEFINE_gauge_uint64(tablet, all_transactions_inflight,
                            "Transactions In Flight",
                            kudu::MetricUnit::kTransactions,
-                           "Number of transactions currently in-flight, including any type.");
+                           "Number of transactions currently in-flight, including any type.",
+                           kudu::MetricLevel::kDebug);
 METRIC_DEFINE_gauge_uint64(tablet, write_transactions_inflight,
                            "Write Transactions In Flight",
                            kudu::MetricUnit::kTransactions,
-                           "Number of write transactions currently in-flight");
+                           "Number of write transactions currently in-flight",
+                           kudu::MetricLevel::kDebug);
 METRIC_DEFINE_gauge_uint64(tablet, alter_schema_transactions_inflight,
                            "Alter Schema Transactions In Flight",
                            kudu::MetricUnit::kTransactions,
-                           "Number of alter schema transactions currently in-flight");
+                           "Number of alter schema transactions currently in-flight",
+                           kudu::MetricLevel::kDebug);
 
 METRIC_DEFINE_counter(tablet, transaction_memory_pressure_rejections,
                       "Transaction Memory Pressure Rejections",
                       kudu::MetricUnit::kTransactions,
                       "Number of transactions rejected because the tablet's "
-                      "transaction memory limit was reached.");
+                      "transaction memory limit was reached.",
+                      kudu::MetricLevel::kWarn);
 
 using std::shared_ptr;
 using std::string;
@@ -205,6 +210,7 @@ void TransactionTracker::WaitForAllToFinish() const {
 }
 
 Status TransactionTracker::WaitForAllToFinish(const MonoDelta& timeout) const {
+  static constexpr size_t kMaxTxnsToPrint = 50;
   int wait_time_us = 250;
   int num_complaints = 0;
   MonoTime start_time = MonoTime::Now();
@@ -228,9 +234,11 @@ Status TransactionTracker::WaitForAllToFinish(const MonoDelta& timeout) const {
     if (now > next_log_time) {
       LOG(WARNING) << Substitute("TransactionTracker waiting for $0 outstanding transactions to"
                                  " complete now for $1", txns.size(), diff.ToString());
-      LOG(INFO) << "Dumping currently running transactions: ";
-      for (const auto& driver : txns) {
-        LOG(INFO) << driver->ToString();
+      LOG(INFO) << Substitute("Dumping up to $0 currently running transactions: ",
+                              kMaxTxnsToPrint);
+      const auto num_txn_limit = std::min(txns.size(), kMaxTxnsToPrint);
+      for (auto i = 0; i < num_txn_limit; i++) {
+        LOG(INFO) << txns[i]->ToString();
       }
 
       num_complaints++;

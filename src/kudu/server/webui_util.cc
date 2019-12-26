@@ -50,6 +50,7 @@ void SchemaToJson(const Schema& schema, EasyJson* output) {
                                    col.Stringify(col.read_default_value()) : "-";
     col_json["write_default"] = col.has_write_default() ?
                                     col.Stringify(col.write_default_value()) : "-";
+    col_json["comment"] = col.comment();
   }
 }
 

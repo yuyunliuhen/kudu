@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/clock/hybrid_clock.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <string>
@@ -25,18 +27,17 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/clock/hybrid_clock.h"
 #include "kudu/clock/mock_ntp.h"
 #include "kudu/clock/time_service.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/gutil/casts.h"
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/random.h"
 #include "kudu/util/random_util.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -58,7 +59,7 @@ class HybridClockTest : public KuduTest {
       : clock_(new HybridClock) {
   }
 
-  virtual void SetUp() OVERRIDE {
+  void SetUp() override {
     KuduTest::SetUp();
     ASSERT_OK(clock_->Init());
   }
@@ -67,15 +68,15 @@ class HybridClockTest : public KuduTest {
   scoped_refptr<HybridClock> clock_;
 };
 
-clock::MockNtp* mock_ntp(const scoped_refptr<HybridClock>& clock) {
+clock::MockNtp* mock_ntp(HybridClock* clock) {
   return down_cast<clock::MockNtp*>(clock->time_service());
 }
 
 TEST(MockHybridClockTest, TestMockedSystemClock) {
   google::FlagSaver saver;
   FLAGS_time_source = "mock";
-  scoped_refptr<HybridClock> clock(new HybridClock());
-  clock->Init();
+  scoped_refptr<HybridClock> clock(new HybridClock);
+  ASSERT_OK(clock->Init());
   Timestamp timestamp;
   uint64_t max_error_usec;
   clock->NowWithError(&timestamp, &max_error_usec);
@@ -87,8 +88,8 @@ TEST(MockHybridClockTest, TestMockedSystemClock) {
   // Now set an arbitrary time and check that is the time returned by the clock.
   uint64_t time = 1234 * 1000;
   uint64_t error = 100 * 1000;
-  mock_ntp(clock)->SetMockClockWallTimeForTests(time);
-  mock_ntp(clock)->SetMockMaxClockErrorForTests(error);
+  mock_ntp(clock.get())->SetMockClockWallTimeForTests(time);
+  mock_ntp(clock.get())->SetMockMaxClockErrorForTests(error);
   clock->NowWithError(&timestamp, &max_error_usec);
   ASSERT_EQ(timestamp.ToUint64(),
             HybridClock::TimestampFromMicrosecondsAndLogicalValue(time, 0).ToUint64());
@@ -108,14 +109,14 @@ TEST(MockHybridClockTest, TestMockedSystemClock) {
 TEST(MockHybridClockTest, TestClockDealsWithWrapping) {
   google::FlagSaver saver;
   FLAGS_time_source = "mock";
-  scoped_refptr<HybridClock> clock(new HybridClock());
-  clock->Init();
-  mock_ntp(clock)->SetMockClockWallTimeForTests(1000);
+  scoped_refptr<HybridClock> clock(new HybridClock);
+  ASSERT_OK(clock->Init());
+  mock_ntp(clock.get())->SetMockClockWallTimeForTests(1000);
 
   Timestamp prev = clock->Now();
 
   // Update the clock from 10us in the future
-  clock->Update(HybridClock::TimestampFromMicroseconds(1010));
+  ASSERT_OK(clock->Update(HybridClock::TimestampFromMicroseconds(1010)));
 
   // Now read the clock value enough times so that the logical value wraps
   // over, and should increment the _physical_ portion of the clock.
@@ -129,7 +130,7 @@ TEST(MockHybridClockTest, TestClockDealsWithWrapping) {
   // Advance the time microsecond by microsecond, and ensure the clock never
   // goes backwards.
   for (int time = 1001; time < 1020; time++) {
-    mock_ntp(clock)->SetMockClockWallTimeForTests(time);
+    mock_ntp(clock.get())->SetMockClockWallTimeForTests(time);
     Timestamp now = clock->Now();
 
     // Clock should run strictly forwards.
@@ -192,10 +193,7 @@ TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase1) {
   Timestamp past_ts_changed = HybridClock::AddPhysicalTimeToTimestamp(
       past_ts,
       MonoDelta::FromMicroseconds(-3 * static_cast<int64_t>(max_error)));
-
-  Status s = clock_->WaitUntilAfter(past_ts_changed, no_deadline);
-
-  ASSERT_OK(s);
+  ASSERT_OK(clock_->WaitUntilAfter(past_ts_changed, no_deadline));
 
   MonoTime after = MonoTime::Now();
   MonoDelta delta = after - before;
@@ -207,7 +205,7 @@ TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase1) {
 // The normal case for transactions. Obtain a timestamp and then wait until
 // we're sure that tx_latest < now_earliest.
 TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase2) {
-  MonoTime before = MonoTime::Now();
+  const MonoTime before = MonoTime::Now();
 
   // we do no time adjustment, this event should fall right within the possible
   // error interval
@@ -216,7 +214,7 @@ TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase2) {
   clock_->NowWithError(&past_ts, &past_max_error);
   // Make sure the error is at least a small number of microseconds, to ensure
   // that we always have to wait.
-  past_max_error = std::max(past_max_error, static_cast<uint64_t>(20));
+  past_max_error = std::max(past_max_error, static_cast<uint64_t>(2000));
   Timestamp wait_until = HybridClock::AddPhysicalTimeToTimestamp(
       past_ts,
       MonoDelta::FromMicroseconds(past_max_error));
@@ -229,7 +227,7 @@ TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase2) {
   {
     MonoTime deadline = before;
     Status s = clock_->WaitUntilAfter(wait_until, deadline);
-    ASSERT_TRUE(s.IsTimedOut());
+    ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
   }
 
   // Wait with a deadline well in the future. This should succeed.
@@ -271,7 +269,7 @@ TEST_F(HybridClockTest, TestIsAfter) {
 // into the future.
 void StresserThread(HybridClock* clock, AtomicBool* stop) {
   Random rng(GetRandomSeed32());
-  Timestamp prev(0);;
+  Timestamp prev(0);
   while (!stop->Load()) {
     Timestamp t = clock->Now();
     CHECK_GT(t.value(), prev.value());
@@ -280,16 +278,23 @@ void StresserThread(HybridClock* clock, AtomicBool* stop) {
     // Add a random bit of offset to the clock, and perform an update.
     Timestamp new_ts = HybridClock::AddPhysicalTimeToTimestamp(
         t, MonoDelta::FromMicroseconds(rng.Uniform(10000)));
-    clock->Update(new_ts);
+    CHECK_OK(clock->Update(new_ts));
   }
 }
 
 // Regression test for KUDU-953: if threads are updating and polling the
 // clock concurrently, the clock should still never run backwards.
 TEST_F(HybridClockTest, TestClockDoesntGoBackwardsWithUpdates) {
-  vector<scoped_refptr<kudu::Thread> > threads;
-
+  vector<scoped_refptr<kudu::Thread>> threads;
   AtomicBool stop(false);
+
+  SCOPED_CLEANUP({
+    stop.Store(true);
+    for (const auto& t : threads) {
+      t->Join();
+    }
+  });
+
   for (int i = 0; i < 4; i++) {
     scoped_refptr<Thread> thread;
     ASSERT_OK(Thread::Create("test", "stresser",
@@ -299,10 +304,6 @@ TEST_F(HybridClockTest, TestClockDoesntGoBackwardsWithUpdates) {
   }
 
   SleepFor(MonoDelta::FromSeconds(1));
-  stop.Store(true);
-  for (const scoped_refptr<Thread> t : threads) {
-    t->Join();
-  }
 }
 
 TEST_F(HybridClockTest, TestGetPhysicalComponentDifference) {
@@ -352,12 +353,16 @@ TEST_F(HybridClockTest, TestRideOverNtpInterruption) {
 
 #ifndef __APPLE__
 TEST_F(HybridClockTest, TestNtpDiagnostics) {
+  FLAGS_time_source = "system";
+  clock_.reset(new HybridClock);
+  ASSERT_OK(clock_->Init());
+
   vector<string> log;
   clock_->time_service()->DumpDiagnostics(&log);
   string s = JoinStrings(log, "\n");
   SCOPED_TRACE(s);
-  ASSERT_STR_CONTAINS(s, "ntpq");
-  ASSERT_STR_CONTAINS(s, "ntp_gettime");
+  ASSERT_STR_MATCHES(s, "(ntp_gettime\\(\\) returns code |chronyc -n tracking)");
+  ASSERT_STR_MATCHES(s, "(ntpq -n |chronyc -n sources)");
 }
 #endif
 

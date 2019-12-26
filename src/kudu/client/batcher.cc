@@ -41,6 +41,7 @@
 #include "kudu/client/write_op-internal.h"
 #include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
+#include "kudu/common/partial_row.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/row_operations.h"
 #include "kudu/common/wire_protocol.h"
@@ -50,14 +51,16 @@
 #include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
-#include "kudu/gutil/stl_util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/connection.h"
+#include "kudu/rpc/request_tracker.h"
 #include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/retriable_rpc.h"
 #include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/security/token.pb.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/logging.h"
@@ -74,12 +77,10 @@ using strings::Substitute;
 
 namespace kudu {
 
-class KuduPartialRow;
 class Schema;
 
 namespace rpc {
 class Messenger;
-class RequestTracker;
 }
 
 using pb_util::SecureDebugString;
@@ -91,9 +92,7 @@ using rpc::RequestTracker;
 using rpc::ResponseCallback;
 using rpc::RetriableRpc;
 using rpc::RetriableRpcStatus;
-using rpc::Rpc;
-using rpc::RpcController;
-using rpc::ServerPicker;
+using security::SignedTokenPB;
 using tserver::WriteRequestPB;
 using tserver::WriteResponsePB;
 using tserver::WriteResponsePB_PerRowErrorPB;
@@ -242,7 +241,24 @@ class WriteRpc : public RetriableRpc<RemoteTabletServer, WriteRequestPB, WriteRe
   void Finish(const Status& status) override;
   bool GetNewAuthnTokenAndRetry() override;
 
+  // Asynchonously attempts to retrieve a new authz token from the master, and
+  // runs GotNewAuthzTokenRetryCb on success.
+  bool GetNewAuthzTokenAndRetry() override;
+
+  // Callback to run after going through the steps to get a new authz token.
+  void GotNewAuthzTokenRetryCb(const Status& status) override;
+
  private:
+  // Fetches the appropriate authz token for this request from the client
+  // cache. Note that this doesn't get a new token from the master, but rather,
+  // it updates 'req_' with one from the cache in case the client has recently
+  // received one.
+  //
+  // If an appropriate authz token is not in the cache, e.g. because the client
+  // has been communicating with an older-versioned master that doesn't support
+  // authz tokens, this is a no-op.
+  void FetchCachedAuthzToken();
+
   // Pointer back to the batcher. Processes the write response when it
   // completes, regardless of success or failure.
   scoped_refptr<Batcher> batcher_;
@@ -288,8 +304,12 @@ WriteRpc::WriteRpc(const scoped_refptr<Batcher>& batcher,
 
   // Set up schema
   CHECK_OK(SchemaToPB(*schema, req_.mutable_schema(),
-                      SCHEMA_PB_WITHOUT_STORAGE_ATTRIBUTES | SCHEMA_PB_WITHOUT_IDS));
+                      SCHEMA_PB_WITHOUT_STORAGE_ATTRIBUTES |
+                      SCHEMA_PB_WITHOUT_IDS |
+                      SCHEMA_PB_WITHOUT_COMMENT));
 
+  // Pick up the authz token for the table.
+  FetchCachedAuthzToken();
   RowOperationsPB* requested = req_.mutable_row_operations();
 
   // Add the rows
@@ -317,13 +337,85 @@ WriteRpc::WriteRpc(const scoped_refptr<Batcher>& batcher,
     VLOG(4) << ++ctr << ". Encoded row " << op->ToString();
   }
 
-  if (VLOG_IS_ON(3)) {
-    VLOG(3) << "Created batch for " << tablet_id << ":\n" << SecureShortDebugString(req_);
-  }
+  VLOG(3) << Substitute("Created batch for $0:\n$1",
+                        tablet_id, SecureShortDebugString(req_));
 }
 
 WriteRpc::~WriteRpc() {
-  STLDeleteElements(&ops_);
+  // Since the WriteRpc is destructed a while after all of the
+  // InFlightOps and other associated objects were last touched,
+  // and because those operations were not all allocated together,
+  // they're likely to be strewn all around in RAM. This function
+  // then ends up cache-miss-bound.
+  //
+  // Ideally, we could change the allocation pattern to make them
+  // more contiguous, but it's a bit tricky -- this is client code,
+  // so we don't really have great control over how the write ops
+  // themselves are allocated.
+  //
+  // So, instead, we do some prefetching. The pointer graph looks like:
+  //
+  // vector<InFlightOp*>
+  //    [i] InFlightOp* pointer
+  //         \----> InFlightOp instance
+  //                | WriteOp* pointer
+  //                |   \-----> WriteOp instance
+  //                            | KuduPartialRow (embedded)
+  //                            | | isset_bitmap_
+  //                                   \-----> heap allocated memory
+  //
+  //
+  // So, we need to do three "layers" of prefetch. First, prefetch the
+  // InFlightOp instance. Then, prefetch the KuduPartialRow contained by
+  // the WriteOp that it points to. Then, prefetch the isset bitmap that
+  // the PartialRow points to.
+  //
+  // In order to get parallelism here, we need to stagger the prefetches:
+  // the "root" of the tree needs to look farthest in the future, then
+  // prefetch the next level, then prefetch the closest level, before
+  // eventually calling the destructor.
+  //
+  // Experimentally, it seems we get enough benefit from only prefetching
+  // one entry "ahead" in between each.
+  constexpr static int kPrefetchDistance = 1;
+  const int size = ops_.size();
+
+  auto iter = [this, size](int i) {
+    int ifo_prefetch = i + kPrefetchDistance * 3;
+    int op_prefetch = i + kPrefetchDistance * 2;
+    int row_prefetch = i + kPrefetchDistance;
+    if (ifo_prefetch >= 0 && ifo_prefetch < size) {
+      __builtin_prefetch(ops_[ifo_prefetch], 0, PREFETCH_HINT_T0);
+    }
+    if (op_prefetch >= 0 && op_prefetch < size) {
+      const auto* op = ops_[op_prefetch]->write_op.get();
+      if (op) {
+        __builtin_prefetch(&op->row().isset_bitmap_, 0, PREFETCH_HINT_T0);
+      }
+    }
+    if (row_prefetch >= 0 && row_prefetch < size) {
+      const auto* op = ops_[row_prefetch]->write_op.get();
+      if (op) {
+        __builtin_prefetch(op->row().isset_bitmap_, 0, PREFETCH_HINT_T0);
+      }
+    }
+    if (i >= 0) {
+      delete ops_[i];
+    }
+  };
+
+  // Explicitly perform "loop splitting" to avoid the branches in the main
+  // body of the loop.
+  int i = -kPrefetchDistance * 3;
+  while (i < 0) {
+    iter(i++);
+  }
+  while (i < size - kPrefetchDistance * 3) {
+    iter(i++);
+  }
+  while (i < size) {
+    iter(i++);
+  }
 }
 
 string WriteRpc::ToString() const {
@@ -363,11 +455,18 @@ RetriableRpcStatus WriteRpc::AnalyzeResponse(const Status& rpc_cb_status) {
   // Check for specific RPC errors.
   if (result.status.IsRemoteError()) {
     const ErrorStatusPB* err = mutable_retrier()->controller().error_response();
-    if (err && err->has_code() &&
-        (err->code() == ErrorStatusPB::ERROR_SERVER_TOO_BUSY ||
-         err->code() == ErrorStatusPB::ERROR_UNAVAILABLE)) {
-      result.result = RetriableRpcStatus::SERVICE_UNAVAILABLE;
-      return result;
+    if (err && err->has_code()) {
+      switch (err->code()) {
+        case ErrorStatusPB::ERROR_SERVER_TOO_BUSY:
+        case ErrorStatusPB::ERROR_UNAVAILABLE:
+          result.result = RetriableRpcStatus::SERVICE_UNAVAILABLE;
+          return result;
+        case ErrorStatusPB::ERROR_INVALID_AUTHORIZATION_TOKEN:
+          result.result = RetriableRpcStatus::INVALID_AUTHORIZATION_TOKEN;
+          return result;
+        default:
+          break;
+      }
     }
   }
 
@@ -443,13 +542,45 @@ RetriableRpcStatus WriteRpc::AnalyzeResponse(const Status& rpc_cb_status) {
 }
 
 bool WriteRpc::GetNewAuthnTokenAndRetry() {
+  // Since we know we may retry, clear the existing response.
+  resp_.Clear();
   // To get a new authn token it's necessary to authenticate with the master
   // using any other credentials but already existing authn token.
   KuduClient* c = batcher_->client_;
+  VLOG(1) << "Retrieving new authn token from master";
   c->data_->ConnectToClusterAsync(c, retrier().deadline(),
-      Bind(&RetriableRpc::GetNewAuthnTokenAndRetryCb, Unretained(this)),
+      Bind(&WriteRpc::GotNewAuthnTokenRetryCb, Unretained(this)),
       CredentialsPolicy::PRIMARY_CREDENTIALS);
   return true;
+}
+
+bool WriteRpc::GetNewAuthzTokenAndRetry() {
+  // Since we know we may retry, clear the existing response.
+  resp_.Clear();
+  KuduClient* c = batcher_->client_;
+  VLOG(1) << "Retrieving new authz token from master";
+  c->data_->RetrieveAuthzTokenAsync(table(),
+      Bind(&WriteRpc::GotNewAuthzTokenRetryCb, Unretained(this)),
+      retrier().deadline());
+  return true;
+}
+
+void WriteRpc::FetchCachedAuthzToken() {
+  SignedTokenPB signed_token;
+  if (batcher_->client_->data_->FetchCachedAuthzToken(table()->id(), &signed_token)) {
+    *req_.mutable_authz_token() = std::move(signed_token);
+  } else {
+    // Note: this is the expected path if communicating with an older-versioned
+    // master that does not support authz tokens.
+    VLOG(1) << "no authz token for table " << table()->id();
+  }
+}
+
+void WriteRpc::GotNewAuthzTokenRetryCb(const Status& status) {
+  if (status.ok()) {
+    FetchCachedAuthzToken();
+  }
+  RetriableRpc::GotNewAuthzTokenRetryCb(status);
 }
 
 Batcher::Batcher(KuduClient* client,

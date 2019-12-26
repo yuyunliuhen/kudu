@@ -19,6 +19,7 @@
 
 #include <cstdio>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -33,16 +34,16 @@
 #include "kudu/client/shared_ptr.h"
 #include "kudu/client/write_op.h"
 #include "kudu/common/partial_row.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/consensus.proxy.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/sys_catalog.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
-#include "kudu/mini-cluster/mini_cluster.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/security/test/mini_kdc.h"
@@ -50,10 +51,16 @@
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
 #include "kudu/tablet/key_value_test_schema.h"
+#include "kudu/tablet/tablet.pb.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/tserver/tserver_service.pb.h"
+#include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/env.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/path_util.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/subprocess.h"
 #include "kudu/util/test_macros.h"
@@ -77,6 +84,10 @@ using std::vector;
 using strings::Substitute;
 
 namespace kudu {
+
+static const char* kTableName = "test-table";
+static const Schema kTestSchema = CreateKeyValueTestSchema();
+static const KuduSchema kTestKuduSchema = client::KuduSchema::FromSchema(kTestSchema);
 
 class SecurityITest : public KuduTest {
  public:
@@ -107,6 +118,15 @@ class SecurityITest : public KuduTest {
     return proxy.SetFlag(req, &resp, &controller);
   }
 
+  Status CreateTestTable(const client::sp::shared_ptr<KuduClient>& client) {
+    unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
+    return table_creator->table_name(kTableName)
+        .set_range_partition_columns({ "key" })
+        .schema(&kTestKuduSchema)
+        .num_replicas(3)
+        .Create();
+  }
+
   // Create a table, insert a row, scan it back, and delete the table.
   void SmokeTestCluster();
 
@@ -125,6 +145,38 @@ class SecurityITest : public KuduTest {
     return proxy.TSHeartbeat(req, &resp, &rpc);
   }
 
+  Status TryListTablets(vector<string>* tablet_ids = nullptr) {
+    auto messenger = NewMessengerOrDie();
+    const auto& addr = cluster_->tablet_server(0)->bound_rpc_addr();
+    tserver::TabletServerServiceProxy proxy(messenger, addr, addr.host());
+
+    rpc::RpcController rpc;
+    tserver::ListTabletsRequestPB req;
+    tserver::ListTabletsResponsePB resp;
+    RETURN_NOT_OK(proxy.ListTablets(req, &resp, &rpc));
+    if (tablet_ids) {
+      for (int i = 0; i < resp.status_and_schema_size(); i++) {
+        tablet_ids->emplace_back(resp.status_and_schema(i).tablet_status().tablet_id());
+      }
+    }
+    return Status::OK();
+  }
+
+  // Sends a request to checksum the given tablet without an authz token.
+  Status TryChecksumWithoutAuthzToken(const string& tablet_id) {
+    auto messenger = NewMessengerOrDie();
+    const auto& addr = cluster_->tablet_server(0)->bound_rpc_addr();
+    tserver::TabletServerServiceProxy proxy(messenger, addr, addr.host());
+
+    rpc::RpcController rpc;
+    tserver::ChecksumRequestPB req;
+    tserver::NewScanRequestPB* scan = req.mutable_new_request();
+    scan->set_tablet_id(tablet_id);
+    RETURN_NOT_OK(SchemaToColumnPBs(kTestSchema, scan->mutable_projected_columns()));
+    tserver::ChecksumResponsePB resp;
+    return proxy.Checksum(req, &resp, &rpc);
+  }
+
  private:
   std::shared_ptr<Messenger> NewMessengerOrDie() {
     std::shared_ptr<Messenger> messenger;
@@ -141,18 +193,11 @@ class SecurityITest : public KuduTest {
 };
 
 void SecurityITest::SmokeTestCluster() {
-  const char* kTableName = "test-table";
   client::sp::shared_ptr<KuduClient> client;
   ASSERT_OK(cluster_->CreateClient(nullptr, &client));
 
   // Create a table.
-  KuduSchema schema = client::KuduSchema::FromSchema(CreateKeyValueTestSchema());
-  gscoped_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
-  ASSERT_OK(table_creator->table_name(kTableName)
-            .set_range_partition_columns({ "key" })
-            .schema(&schema)
-            .num_replicas(3)
-            .Create());
+  ASSERT_OK(CreateTestTable(client));
 
   // Insert a row.
   client::sp::shared_ptr<KuduTable> table;
@@ -170,6 +215,44 @@ void SecurityITest::SmokeTestCluster() {
 
   // Delete the table.
   ASSERT_OK(client->DeleteTable(kTableName));
+}
+
+// Test authorizing list tablets.
+TEST_F(SecurityITest, TestAuthorizationOnListTablets) {
+  // When enforcing access control, an operator of ListTablets must be
+  // superuser.
+  cluster_opts_.extra_tserver_flags.emplace_back("--tserver_enforce_access_control");
+  ASSERT_OK(StartCluster());
+  ASSERT_OK(cluster_->kdc()->Kinit("test-user"));
+  Status s = TryListTablets();
+  ASSERT_EQ("Remote error: Not authorized: unauthorized access to method: ListTablets",
+            s.ToString());
+  ASSERT_OK(cluster_->kdc()->Kinit("test-admin"));
+  ASSERT_OK(TryListTablets());
+}
+
+TEST_F(SecurityITest, TestAuthorizationOnChecksum) {
+  cluster_opts_.extra_tserver_flags.emplace_back("--tserver_enforce_access_control");
+  ASSERT_OK(StartCluster());
+  client::sp::shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+  ASSERT_OK(CreateTestTable(client));
+  vector<string> tablet_ids;
+  ASSERT_OK(TryListTablets(&tablet_ids));
+
+  // As a regular user, we shouldn't be authorized if we didn't send an authz
+  // token.
+  ASSERT_OK(cluster_->kdc()->Kinit("test-user"));
+  for (const auto& tablet_id : tablet_ids) {
+    Status s = TryChecksumWithoutAuthzToken(tablet_id);
+    ASSERT_STR_CONTAINS(s.ToString(), "Not authorized: no authorization token presented");
+  }
+  // As a super-user (e.g. if running the CLI as an admin), this should be
+  // allowed.
+  ASSERT_OK(cluster_->kdc()->Kinit("test-admin"));
+  for (const auto& tablet_id : tablet_ids) {
+    ASSERT_OK(TryChecksumWithoutAuthzToken(tablet_id));
+  }
 }
 
 // Test creating a table, writing some data, reading data, and dropping
@@ -314,36 +397,124 @@ TEST_F(SecurityITest, TestWorldReadablePrivateKey) {
       credentials_name));
 }
 
+Status AssignIPToClient(bool external) {
+  // If the test does not require an external IP address
+  // assign loopback IP to FLAGS_local_ip_for_outbound_sockets.
+  if (!external) {
+    FLAGS_local_ip_for_outbound_sockets = "127.0.0.1";
+    return Status::OK();
+  }
+
+  // Try finding an external IP address to assign to
+  // FLAGS_local_ip_for_outbound_sockets.
+  vector<Network> local_networks;
+  RETURN_NOT_OK(GetLocalNetworks(&local_networks));
+
+  for (const auto& network : local_networks) {
+    if (!network.IsLoopback()) {
+      FLAGS_local_ip_for_outbound_sockets = network.GetAddrAsString();
+      // Found and assigned an external IP.
+      return Status::OK();
+    }
+  }
+
+  // Could not find an external IP.
+  return Status::NotFound("Could not find an external IP.");
+}
+
+// Descriptive constants for test parameters.
+const bool LOOPBACK_ENCRYPTED = true;
+const bool LOOPBACK_PLAIN = false;
+const bool TOKEN_PRESENT = true;
+const bool TOKEN_MISSING = false;
+const bool LOOPBACK_CLIENT_IP = false;
+const bool EXTERNAL_CLIENT_IP = true;
+const char* const AUTH_REQUIRED = "required";
+const char* const AUTH_DISABLED = "disabled";
+const char* const ENCRYPTION_REQUIRED = "required";
+const char* const ENCRYPTION_DISABLED = "disabled";
+
 struct AuthTokenIssuingTestParams {
-  const ExternalMiniCluster::BindMode bind_mode;
+  const BindMode bind_mode;
   const string rpc_authentication;
   const string rpc_encryption;
   const bool rpc_encrypt_loopback_connections;
+  const bool force_external_client_ip;
   const bool authn_token_present;
 };
+
 class AuthTokenIssuingTest :
     public SecurityITest,
     public ::testing::WithParamInterface<AuthTokenIssuingTestParams> {
 };
+
 INSTANTIATE_TEST_CASE_P(, AuthTokenIssuingTest, ::testing::ValuesIn(
     vector<AuthTokenIssuingTestParams>{
-      { ExternalMiniCluster::BindMode::LOOPBACK, "required", "required", true,  true,  },
-      { ExternalMiniCluster::BindMode::LOOPBACK, "required", "required", false, true,  },
-      //ExternalMiniCluster::BindMode::LOOPBACK, "required", "disabled": non-acceptable
-      //ExternalMiniCluster::BindMode::LOOPBACK, "required", "disabled": non-acceptable
-      { ExternalMiniCluster::BindMode::LOOPBACK, "disabled", "required", true,  true,  },
-      { ExternalMiniCluster::BindMode::LOOPBACK, "disabled", "required", false, true,  },
-      { ExternalMiniCluster::BindMode::LOOPBACK, "disabled", "disabled", true,  false, },
-      { ExternalMiniCluster::BindMode::LOOPBACK, "disabled", "disabled", false, true,  },
+      // The following 3 test cases cover passing authn token over an
+      // encrypted loopback connection.
+      // Note: AUTH_REQUIRED with ENCRYPTION_DISABLED is not
+      // an acceptable configuration.
+      { BindMode::LOOPBACK, AUTH_REQUIRED, ENCRYPTION_REQUIRED,
+        LOOPBACK_ENCRYPTED, LOOPBACK_CLIENT_IP, TOKEN_PRESENT, },
+
+      { BindMode::LOOPBACK, AUTH_DISABLED, ENCRYPTION_REQUIRED,
+        LOOPBACK_ENCRYPTED, LOOPBACK_CLIENT_IP, TOKEN_PRESENT, },
+
+      { BindMode::LOOPBACK, AUTH_DISABLED, ENCRYPTION_DISABLED,
+        LOOPBACK_ENCRYPTED, LOOPBACK_CLIENT_IP, TOKEN_MISSING, },
+
+      // The following 3 test cases cover passing authn token over an
+      // unencrypted loopback connection.
+      { BindMode::LOOPBACK, AUTH_REQUIRED, ENCRYPTION_REQUIRED,
+        LOOPBACK_PLAIN, LOOPBACK_CLIENT_IP, TOKEN_PRESENT, },
+
+      { BindMode::LOOPBACK, AUTH_DISABLED, ENCRYPTION_REQUIRED,
+        LOOPBACK_PLAIN, LOOPBACK_CLIENT_IP, TOKEN_PRESENT, },
+
+      { BindMode::LOOPBACK, AUTH_DISABLED, ENCRYPTION_DISABLED,
+        LOOPBACK_PLAIN, LOOPBACK_CLIENT_IP, TOKEN_PRESENT, },
+
+      // The following 3 test cases cover passing authn token over an
+      // external connection.
+      { BindMode::LOOPBACK, AUTH_REQUIRED, ENCRYPTION_REQUIRED,
+        LOOPBACK_PLAIN, EXTERNAL_CLIENT_IP, TOKEN_PRESENT, },
+
+      { BindMode::LOOPBACK, AUTH_DISABLED, ENCRYPTION_REQUIRED,
+        LOOPBACK_PLAIN, EXTERNAL_CLIENT_IP, TOKEN_PRESENT, },
+
+      { BindMode::LOOPBACK, AUTH_DISABLED, ENCRYPTION_DISABLED,
+        LOOPBACK_PLAIN, EXTERNAL_CLIENT_IP, TOKEN_MISSING, },
+
+      // The following 3 test cases verify that enforcement of encryption
+      // for loopback connections does not affect external connections.
+      { BindMode::LOOPBACK, AUTH_REQUIRED, ENCRYPTION_REQUIRED,
+        LOOPBACK_ENCRYPTED, EXTERNAL_CLIENT_IP, TOKEN_PRESENT, },
+
+      { BindMode::LOOPBACK, AUTH_DISABLED, ENCRYPTION_REQUIRED,
+        LOOPBACK_ENCRYPTED, EXTERNAL_CLIENT_IP, TOKEN_PRESENT, },
+
+      { BindMode::LOOPBACK, AUTH_DISABLED, ENCRYPTION_DISABLED,
+        LOOPBACK_ENCRYPTED, EXTERNAL_CLIENT_IP, TOKEN_MISSING, },
 #if defined(__linux__)
-      { ExternalMiniCluster::BindMode::UNIQUE_LOOPBACK, "required", "required", true,  true,  },
-      { ExternalMiniCluster::BindMode::UNIQUE_LOOPBACK, "required", "required", false, true,  },
-      //ExternalMiniCluster::BindMode::UNIQUE_LOOPBACK, "required", "disabled": non-acceptable
-      //ExternalMiniCluster::BindMode::UNIQUE_LOOPBACK, "required", "disabled": non-acceptable
-      { ExternalMiniCluster::BindMode::UNIQUE_LOOPBACK, "disabled", "required", true,  true,  },
-      { ExternalMiniCluster::BindMode::UNIQUE_LOOPBACK, "disabled", "required", false, true,  },
-      { ExternalMiniCluster::BindMode::UNIQUE_LOOPBACK, "disabled", "disabled", true,  false, },
-      { ExternalMiniCluster::BindMode::UNIQUE_LOOPBACK, "disabled", "disabled", false, false, },
+      // The following 6 test cases verify that a connection from 127.0.0.1
+      // to another loopback address is treated as a loopback connection.
+      { BindMode::UNIQUE_LOOPBACK, AUTH_REQUIRED, ENCRYPTION_REQUIRED,
+        LOOPBACK_ENCRYPTED, LOOPBACK_CLIENT_IP, TOKEN_PRESENT, },
+
+      { BindMode::UNIQUE_LOOPBACK, AUTH_DISABLED, ENCRYPTION_REQUIRED,
+        LOOPBACK_ENCRYPTED, LOOPBACK_CLIENT_IP, TOKEN_PRESENT, },
+
+      { BindMode::UNIQUE_LOOPBACK, AUTH_DISABLED, ENCRYPTION_DISABLED,
+        LOOPBACK_ENCRYPTED, LOOPBACK_CLIENT_IP, TOKEN_MISSING, },
+
+      { BindMode::UNIQUE_LOOPBACK, AUTH_REQUIRED, ENCRYPTION_REQUIRED,
+        LOOPBACK_PLAIN, LOOPBACK_CLIENT_IP, TOKEN_PRESENT, },
+
+      { BindMode::UNIQUE_LOOPBACK, AUTH_DISABLED, ENCRYPTION_REQUIRED,
+        LOOPBACK_PLAIN, LOOPBACK_CLIENT_IP, TOKEN_PRESENT, },
+
+      { BindMode::UNIQUE_LOOPBACK, AUTH_DISABLED, ENCRYPTION_DISABLED,
+        LOOPBACK_PLAIN, LOOPBACK_CLIENT_IP, TOKEN_PRESENT, },
 #endif
     }
 ));
@@ -355,24 +526,34 @@ TEST_P(AuthTokenIssuingTest, ChannelConfidentiality) {
   cluster_opts_.num_masters = 1;
   cluster_opts_.num_tablet_servers = 0;
   // --user-acl: just restoring back the default setting.
-  cluster_opts_.extra_master_flags.emplace_back("--user-acl=*");
+  cluster_opts_.extra_master_flags.emplace_back("--user_acl=*");
 
   const auto& params = GetParam();
+
+  // When testing external connections, make sure the client connects from
+  // an external IP, so that the connection is not considered to be local.
+  // When testing local connections, make sure that the client
+  // connects from standard loopback IP.
+  // Skip tests that require an external connection
+  // if the host does not have a non-loopback interface.
+  Status s = AssignIPToClient(params.force_external_client_ip);
+  if (s.IsNotFound()) {
+    LOG(WARNING) << s.message().ToString() << "\nSkipping external connection test.";
+    return;
+  }
+  // Fail if GetLocalNetworks failed to determine network interfaces.
+  ASSERT_OK(s);
+
+  // Set flags and start cluster.
   cluster_opts_.bind_mode = params.bind_mode;
   cluster_opts_.extra_master_flags.emplace_back(
-      Substitute("--rpc-authentication=$0", params.rpc_authentication));
+      Substitute("--rpc_authentication=$0", params.rpc_authentication));
   cluster_opts_.extra_master_flags.emplace_back(
-      Substitute("--rpc-encryption=$0", params.rpc_encryption));
+      Substitute("--rpc_encryption=$0", params.rpc_encryption));
   cluster_opts_.extra_master_flags.emplace_back(
       Substitute("--rpc_encrypt_loopback_connections=$0",
                  params.rpc_encrypt_loopback_connections));
   ASSERT_OK(StartCluster());
-
-  // Make sure the client always connects from the standard loopback address.
-  // This is crucial when the master is running with UNIQUE_LOOPBACK mode: the
-  // test scenario expects the client connects from other than 127.0.0.1 address
-  // so the connection is not considered a 'loopback' one.
-  FLAGS_local_ip_for_outbound_sockets = "127.0.0.1";
 
   // In current implementation, KuduClientBuilder calls ConnectToCluster() on
   // the newly created instance of the KuduClient.

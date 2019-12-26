@@ -31,6 +31,9 @@ under the License.
     <tbody>
     <tr><td>Version:</td><td>{{version}}</td></tr>
     <tr><td>State:</td><td>{{state}} {{#state_msg}}({{.}}){{/state_msg}}</td></tr>
+    <tr><td>Column Count:</td><td>{{column_count}}</td></tr>
+    <tr><td>Live Row Count:</td><td>{{table_live_row_count}}</td></tr>
+    <tr><td>On-Disk Size (leaders only):</td><td>{{table_disk_size}}</td></tr>
     </tbody>
   </table>
 
@@ -44,19 +47,21 @@ under the License.
       <th>Compression</th>
       <th>Read default</th>
       <th>Write default</th>
+      <th>Comment</th>
     </tr></thead>
     <tbody>
     {{#columns}}
       <tr>
-        <th>{{#is_key}}<u>{{/is_key}}
-          {{name}}
-          {{#is_key}}</u>{{/is_key}}</th>
+        <th>
+          {{#is_key}}<img src="{{base_url}}/key.png" width=12 height=6 />&nbsp;&nbsp;{{/is_key}}{{name}}
+        </th>
         <td>{{id}}</a></td>
         <td>{{type}}</td>
         <td>{{encoding}}</td>
         <td>{{compression}}</td>
         <td>{{read_default}}</td>
         <td>{{write_default}}</td>
+        <td>{{comment}}</td>
       </tr>
     {{/columns}}
     </tbody>
@@ -64,6 +69,9 @@ under the License.
 
   <h3>Partition Schema</h3>
   <pre>{{partition_schema}}</pre>
+
+  <h3>Extra Config</h3>
+  <pre>{{extra_config}}</pre>
 
   <h3>Tablets</h3>
   <h4>Summary</h4>
@@ -88,12 +96,13 @@ under the License.
   <h4>Detail</h4>
   <a href='#detail' data-toggle='collapse'>(toggle)</a>
   <div id='detail' class='collapse'>
-    <table class='table table-striped table-hover'>
+    <table data-toggle="table" class='table table-striped table-hover'>
       <thead><tr>
         <th>Tablet ID</th>
         {{{detail_partition_schema_header}}}
         <th>State</th>
         <th>Message</th>
+        <th data-sorter="bytesSorter" data-sortable="true">On-Disk Size (leaders only)</th>
         <th>Peers</th>
       </tr></thead>
       <tbody>
@@ -103,6 +112,7 @@ under the License.
           {{{partition_cols}}}
           <td>{{state}}</td>
           <td>{{state_msg}}</td>
+          <td>{{on_disk_size}}</td>
           <td>
             <ul>
               {{#peers}}

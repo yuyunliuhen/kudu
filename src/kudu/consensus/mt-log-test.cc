@@ -206,7 +206,7 @@ class MultiThreadedLogTest : public LogTestBase {
     shared_ptr<LogReader> reader;
     ASSERT_OK(LogReader::Open(fs_manager_.get(), nullptr, kTestTablet, nullptr, &reader));
     SegmentSequence segments;
-    ASSERT_OK(reader->GetSegmentsSnapshot(&segments));
+    reader->GetSegmentsSnapshot(&segments);
 
     for (const SegmentSequence::value_type& entry : segments) {
       ASSERT_OK(entry->ReadEntries(&entries_));
@@ -236,11 +236,11 @@ TEST_F(MultiThreadedLogTest, TestAppends) {
                                        FLAGS_num_writer_threads * FLAGS_num_batches_per_thread,
                                        FLAGS_num_writer_threads,
                                        FLAGS_num_batches_per_thread)) {
-    ASSERT_NO_FATAL_FAILURE(Run());
+    NO_FATALS(Run());
   }
   ASSERT_OK(log_->Close());
   if (FLAGS_verify_log) {
-    ASSERT_NO_FATAL_FAILURE(VerifyLog());
+    NO_FATALS(VerifyLog());
   }
 }
 
@@ -255,7 +255,7 @@ TEST_F(MultiThreadedLogTest, TestAppendThreadStartStopRaces) {
   ASSERT_OK(BuildLog());
   LogWriterThread(1);
   ASSERT_OK(log_->Close());
-  ASSERT_NO_FATAL_FAILURE(VerifyLog());
+  NO_FATALS(VerifyLog());
 }
 
 } // namespace log

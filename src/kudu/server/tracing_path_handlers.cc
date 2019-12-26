@@ -114,7 +114,7 @@ Status GetTracingOptions(const std::string& json_base64,
 Status BeginRecording(const Webserver::WebRequest& req,
                       TraceLog::Mode mode) {
   string filter_str;
-  int options;
+  int options = 0;
   RETURN_NOT_OK(GetTracingOptions(req.query_string, &filter_str, &options));
 
   kudu::debug::TraceLog::GetInstance()->SetEnabled(
@@ -245,14 +245,14 @@ Status DoHandleRequest(Handler handler,
 void HandleRequest(Handler handler,
                    const Webserver::WebRequest& req,
                    Webserver::PrerenderedWebResponse* resp) {
-  Status s = DoHandleRequest(handler, req, resp->output);
+  Status s = DoHandleRequest(handler, req, &resp->output);
   if (!s.ok()) {
     LOG(WARNING) << "Tracing error for handler " << handler << ": "
                  << s.ToString();
     // The trace-viewer JS expects '##ERROR##' to indicate that an error
     // occurred. TODO: change the JS to bubble up the actual error message
     // to the user.
-    *resp->output << "##ERROR##";
+    resp->output << "##ERROR##";
   }
 }
 } // anonymous namespace

@@ -36,13 +36,16 @@
 #include <sys/param.h> // for MAXPATHLEN
 #endif
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest-spi.h>
 
 #include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/strcat.h"
+#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/strip.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
@@ -63,6 +66,9 @@ DEFINE_string(test_leave_files, "on_failure",
 
 DEFINE_int32(test_random_seed, 0, "Random seed to use for randomized tests");
 
+DECLARE_string(time_source);
+
+using boost::optional;
 using std::string;
 using std::vector;
 using strings::Substitute;
@@ -70,7 +76,7 @@ using strings::Substitute;
 namespace kudu {
 
 const char* kInvalidPath = "/dev/invalid-path-for-kudu-tests";
-static const char* const kSlowTestsEnvVariable = "KUDU_ALLOW_SLOW_TESTS";
+static const char* const kSlowTestsEnvVar = "KUDU_ALLOW_SLOW_TESTS";
 
 static const uint64_t kTestBeganAtMicros = Env::Default()->NowMicros();
 
@@ -86,9 +92,9 @@ bool g_is_gtest = true;
 ///////////////////////////////////////////////////
 
 KuduTest::KuduTest()
-  : env_(Env::Default()),
-    flag_saver_(new google::FlagSaver()),
-    test_dir_(GetTestDataDirectory()) {
+    : env_(Env::Default()),
+      flag_saver_(new google::FlagSaver()),
+      test_dir_(GetTestDataDirectory()) {
   std::map<const char*, const char*> flags_for_tests = {
     // Disabling fsync() speeds up tests dramatically, and it's safe to do as no
     // tests rely on cutting power to a machine or equivalent.
@@ -105,10 +111,16 @@ KuduTest::KuduTest()
     {"ipki_server_key_size", "1024"},
     {"ipki_ca_key_size", "1024"},
     {"tsk_num_rsa_bits", "512"},
+    // For a generic Kudu test, the local wall-clock time is good enough even
+    // if it's not synchronized by NTP. All test components are run at the same
+    // node, so there aren't multiple time sources to synchronize.
+    {"time_source", "system_unsync"},
   };
   for (const auto& e : flags_for_tests) {
     // We don't check for errors here, because we have some default flags that
-    // only apply to certain tests.
+    // only apply to certain tests. If a flag is defined in a library which
+    // the test binary isn't linked with, then SetCommandLineOptionWithMode()
+    // reports an error since the flag is unknown to the gflags runtime.
     google::SetCommandLineOptionWithMode(e.first, e.second, google::SET_FLAGS_DEFAULT);
   }
   // If the TEST_TMPDIR variable has been set, then glog will automatically use that
@@ -166,8 +178,10 @@ void KuduTest::OverrideKrb5Environment() {
 // Test utility functions
 ///////////////////////////////////////////////////
 
-bool AllowSlowTests() {
-  char *e = getenv(kSlowTestsEnvVariable);
+namespace {
+// Get the value of an environment variable that has boolean semantics.
+bool GetBooleanEnvironmentVariable(const char* env_var_name) {
+  const char* const e = getenv(env_var_name);
   if ((e == nullptr) ||
       (strlen(e) == 0) ||
       (strcasecmp(e, "false") == 0) ||
@@ -180,8 +194,14 @@ bool AllowSlowTests() {
       (strcasecmp(e, "yes") == 0)) {
     return true;
   }
-  LOG(FATAL) << "Unrecognized value for " << kSlowTestsEnvVariable << ": " << e;
-  return false;
+  LOG(FATAL) << Substitute("$0: invalid value for environment variable $0",
+                           e, env_var_name);
+  return false;  // unreachable
+}
+} // anonymous namespace
+
+bool AllowSlowTests() {
+  return GetBooleanEnvironmentVariable(kSlowTestsEnvVar);
 }
 
 void OverrideFlagForSlowTests(const std::string& flag_name,
@@ -379,7 +399,9 @@ int CountOpenFds(Env* env, const string& path_pattern) {
 }
 
 namespace {
-Status WaitForBind(pid_t pid, uint16_t* port, const char* kind, MonoDelta timeout) {
+Status WaitForBind(pid_t pid, uint16_t* port,
+                   const optional<const string&>& addr,
+                   const char* kind, MonoDelta timeout) {
   // In general, processes do not expose the port they bind to, and
   // reimplementing lsof involves parsing a lot of files in /proc/. So,
   // requiring lsof for tests and parsing its output seems more
@@ -395,15 +417,52 @@ Status WaitForBind(pid_t pid, uint16_t* port, const char* kind, MonoDelta timeou
     "-a", "-i", kind
   };
 
+  // The '-Ffn' flag gets lsof to output something like:
+  //   p5801
+  //   f548
+  //   n127.0.0.1:43954->127.0.0.1:43617
+  //   f549
+  //   n*:8038
+  //
+  // The first line is the pid. We ignore it.
+  // Subsequent lines come in pairs. In each pair, the first half of the pair
+  // is file descriptor number, we ignore it.
+  // The second half has the bind address and port.
+  //
+  // In this example, the first pair is an outbound TCP socket. We ignore it.
+  // The second pair is the listening TCP socket bind address and port.
+  //
+  // We use the first encountered listening TCP socket, since that's most likely
+  // to be the primary service port. When searching, we use the provided bind
+  // address if there is any, otherwise we use '*' (same as '0.0.0.0') which
+  // matches all addresses on the local machine.
+  string addr_pattern = Substitute("n$0:", (!addr || *addr == "0.0.0.0") ? "*" : *addr);
   MonoTime deadline = MonoTime::Now() + timeout;
   string lsof_out;
+  int32_t p = -1;
 
   for (int64_t i = 1; ; i++) {
     lsof_out.clear();
-    Status s = Subprocess::Call(cmd, "", &lsof_out);
+    Status s = Subprocess::Call(cmd, "", &lsof_out).AndThen([&] () {
+      StripTrailingNewline(&lsof_out);
+      vector<string> lines = strings::Split(lsof_out, "\n");
+      for (int index = 2; index < lines.size(); index += 2) {
+        StringPiece cur_line(lines[index]);
+        if (HasPrefixString(cur_line.ToString(), addr_pattern) &&
+            !cur_line.contains("->")) {
+          cur_line.remove_prefix(addr_pattern.size());
+          if (!safe_strto32(cur_line.data(), cur_line.size(), &p)) {
+            return Status::RuntimeError("unexpected lsof output", lsof_out);
+          }
+
+          return Status::OK();
+        }
+      }
+
+      return Status::RuntimeError("unexpected lsof output", lsof_out);
+    });
 
     if (s.ok()) {
-      StripTrailingNewline(&lsof_out);
       break;
     }
     if (deadline < MonoTime::Now()) {
@@ -413,22 +472,6 @@ Status WaitForBind(pid_t pid, uint16_t* port, const char* kind, MonoDelta timeou
     SleepFor(MonoDelta::FromMilliseconds(i * 10));
   }
 
-  // The '-Ffn' flag gets lsof to output something like:
-  //   p19730
-  //   f123
-  //   n*:41254
-  // The first line is the pid. We ignore it.
-  // The second line is the file descriptor number. We ignore it.
-  // The third line has the bind address and port.
-  // Subsequent lines show active connections.
-  vector<string> lines = strings::Split(lsof_out, "\n");
-  int32_t p = -1;
-  if (lines.size() < 3 ||
-      lines[2].substr(0, 3) != "n*:" ||
-      !safe_strto32(lines[2].substr(3), &p) ||
-      p <= 0) {
-    return Status::RuntimeError("unexpected lsof output", lsof_out);
-  }
   CHECK(p > 0 && p < std::numeric_limits<uint16_t>::max()) << "parsed invalid port: " << p;
   VLOG(1) << "Determined bound port: " << p;
   *port = p;
@@ -436,12 +479,16 @@ Status WaitForBind(pid_t pid, uint16_t* port, const char* kind, MonoDelta timeou
 }
 } // anonymous namespace
 
-Status WaitForTcpBind(pid_t pid, uint16_t* port, MonoDelta timeout) {
-  return WaitForBind(pid, port, "4TCP", timeout);
+Status WaitForTcpBind(pid_t pid, uint16_t* port,
+                      const optional<const string&>& addr,
+                      MonoDelta timeout) {
+  return WaitForBind(pid, port, addr, "4TCP", timeout);
 }
 
-Status WaitForUdpBind(pid_t pid, uint16_t* port, MonoDelta timeout) {
-  return WaitForBind(pid, port, "4UDP", timeout);
+Status WaitForUdpBind(pid_t pid, uint16_t* port,
+                      const optional<const string&>& addr,
+                      MonoDelta timeout) {
+  return WaitForBind(pid, port, addr, "4UDP", timeout);
 }
 
 Status FindHomeDir(const string& name, const string& bin_dir, string* home_dir) {

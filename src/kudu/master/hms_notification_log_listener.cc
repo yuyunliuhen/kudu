@@ -28,6 +28,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <rapidjson/document.h>
+#include <rapidjson/error/en.h>
 
 #include "kudu/gutil/callback.h"
 #include "kudu/gutil/macros.h"
@@ -49,18 +50,17 @@ DEFINE_uint32(hive_metastore_notification_log_poll_period_seconds, 15,
               "the Hive Metastore for catalog updates.");
 TAG_FLAG(hive_metastore_notification_log_poll_period_seconds, advanced);
 TAG_FLAG(hive_metastore_notification_log_poll_period_seconds, runtime);
-TAG_FLAG(hive_metastore_notification_log_poll_period_seconds, experimental);
 
 DEFINE_int32(hive_metastore_notification_log_batch_size, 100,
              "Number of notification log entries which are retrieved from the Hive Metastore "
              "per batch when polling.");
 TAG_FLAG(hive_metastore_notification_log_batch_size, advanced);
 TAG_FLAG(hive_metastore_notification_log_batch_size, runtime);
-TAG_FLAG(hive_metastore_notification_log_batch_size, experimental);
 
 DEFINE_uint32(hive_metastore_notification_log_poll_inject_latency_ms, 0,
               "Inject latency into the inner polling loop of the Hive Metastore"
               "notification log listener. Only takes effect during unit tests.");
+TAG_FLAG(hive_metastore_notification_log_poll_inject_latency_ms, hidden);
 TAG_FLAG(hive_metastore_notification_log_poll_inject_latency_ms, unsafe);
 TAG_FLAG(hive_metastore_notification_log_poll_inject_latency_ms, runtime);
 
@@ -118,7 +118,7 @@ Status HmsNotificationLogListenerTask::WaitForCatchUp(const MonoTime& deadline) 
     wake_up_cv_.Signal();
   }
 
-  RETURN_NOT_OK_PREPEND(synchronizer.WaitFor(deadline - MonoTime::Now()),
+  RETURN_NOT_OK_PREPEND(synchronizer.WaitUntil(deadline),
                         "failed to wait for Hive Metastore notification log listener to catch up");
   return Status::OK();
 }
@@ -189,7 +189,8 @@ Status ParseMessage(const hive::NotificationEvent& event, Document* message) {
     return Status::NotSupported("unknown message format", event.messageFormat);
   }
   if (message->Parse<0>(event.message.c_str()).HasParseError()) {
-    return Status::Corruption("failed to parse message", message->GetParseError());
+    return Status::Corruption("failed to parse message",
+                              rapidjson::GetParseError_En(message->GetParseError()));
   }
   return Status::OK();
 }
@@ -332,10 +333,20 @@ Status HmsNotificationLogListenerTask::HandleAlterTableEvent(const hive::Notific
   hive::Table before_table;
   RETURN_NOT_OK(DeserializeTable(event, message, "tableObjBeforeJson", &before_table));
 
+  if (!hms::HmsClient::IsSynchronized(before_table)) {
+    // Not a synchronized table; skip it.
+    VLOG(2) << Substitute("Ignoring alter event for table $0 of type $1",
+                          before_table.tableName, before_table.tableType);
+    return Status::OK();
+  }
+
   const string* storage_handler =
       FindOrNull(before_table.parameters, hms::HmsClient::kStorageHandlerKey);
-  if (!storage_handler || *storage_handler != hms::HmsClient::kKuduStorageHandler) {
+
+  if (!hms::HmsClient::IsKuduTable(before_table)) {
     // Not a Kudu table; skip it.
+    VLOG(2) << Substitute("Ignoring alter event for non-Kudu table $0",
+                          before_table.tableName);
     return Status::OK();
   }
 
@@ -383,9 +394,16 @@ Status HmsNotificationLogListenerTask::HandleDropTableEvent(const hive::Notifica
   hive::Table table;
   RETURN_NOT_OK(DeserializeTable(event, message, "tableObjJson", &table));
 
-  const string* storage_handler = FindOrNull(table.parameters, hms::HmsClient::kStorageHandlerKey);
-  if (!storage_handler || *storage_handler != hms::HmsClient::kKuduStorageHandler) {
+  if (!hms::HmsClient::IsSynchronized(table)) {
+    // Not a synchronized table; skip it.
+    VLOG(2) << Substitute("Ignoring drop event for table $0 of type $1",
+                          table.tableName, table.tableType);
+    return Status::OK();
+  }
+
+  if (!hms::HmsClient::IsKuduTable(table)) {
     // Not a Kudu table; skip it.
+    VLOG(2) << Substitute("Ignoring drop event for non-Kudu table $0", table.tableName);
     return Status::OK();
   }
 

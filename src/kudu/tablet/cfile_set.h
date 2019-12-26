@@ -33,7 +33,6 @@
 #include "kudu/common/iterator.h"
 #include "kudu/common/rowid.h"
 #include "kudu/common/schema.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
@@ -75,20 +74,21 @@ class CFileSet : public std::enable_shared_from_this<CFileSet> {
   class Iterator;
 
   static Status Open(std::shared_ptr<RowSetMetadata> rowset_metadata,
-                     std::shared_ptr<MemTracker> parent_mem_tracker,
+                     std::shared_ptr<MemTracker> bloomfile_tracker,
+                     std::shared_ptr<MemTracker> cfile_reader_tracker,
                      const fs::IOContext* io_context,
                      std::shared_ptr<CFileSet>* cfile_set);
 
   // Create an iterator with the given projection. 'projection' must remain valid
   // for the lifetime of the returned iterator.
-  virtual Iterator* NewIterator(const Schema* projection,
-                                const fs::IOContext* io_context) const;
+  std::unique_ptr<Iterator> NewIterator(const Schema* projection,
+                                        const fs::IOContext* io_context) const;
 
   Status CountRows(const fs::IOContext* io_context, rowid_t *count) const;
 
   // See RowSet::GetBounds
-  virtual Status GetBounds(std::string* min_encoded_key,
-                           std::string* max_encoded_key) const;
+  Status GetBounds(std::string* min_encoded_key,
+                   std::string* max_encoded_key) const;
 
   // The on-disk size, in bytes, of this cfile set's ad hoc index.
   // Returns 0 if there is no ad hoc index.
@@ -134,7 +134,8 @@ class CFileSet : public std::enable_shared_from_this<CFileSet> {
   DISALLOW_COPY_AND_ASSIGN(CFileSet);
 
   CFileSet(std::shared_ptr<RowSetMetadata> rowset_metadata,
-           std::shared_ptr<MemTracker> parent_mem_tracker);
+           std::shared_ptr<MemTracker> bloomfile_tracker,
+           std::shared_ptr<MemTracker> cfile_reader_tracker);
 
   Status DoOpen(const fs::IOContext* io_context);
   Status OpenBloomReader(const fs::IOContext* io_context);
@@ -143,8 +144,9 @@ class CFileSet : public std::enable_shared_from_this<CFileSet> {
   Status NewColumnIterator(ColumnId col_id,
                            cfile::CFileReader::CacheControl cache_blocks,
                            const fs::IOContext* io_context,
-                           cfile::CFileIterator **iter) const;
-  Status NewKeyIterator(const fs::IOContext* io_context, cfile::CFileIterator** key_iter) const;
+                           std::unique_ptr<cfile::CFileIterator>* iter) const;
+  Status NewKeyIterator(const fs::IOContext* io_context,
+                        std::unique_ptr<cfile::CFileIterator>* key_iter) const;
 
   // Return the CFileReader responsible for reading the key index.
   // (the ad-hoc reader for composite keys, otherwise the key column reader)
@@ -153,7 +155,8 @@ class CFileSet : public std::enable_shared_from_this<CFileSet> {
   const Schema &tablet_schema() const { return rowset_metadata_->tablet_schema(); }
 
   std::shared_ptr<RowSetMetadata> rowset_metadata_;
-  std::shared_ptr<MemTracker> parent_mem_tracker_;
+  std::shared_ptr<MemTracker> bloomfile_tracker_;
+  std::shared_ptr<MemTracker> cfile_reader_tracker_;
 
   std::string min_encoded_key_;
   std::string max_encoded_key_;
@@ -239,14 +242,14 @@ class CFileSet::Iterator : public ColumnwiseIterator {
 
   void Unprepare();
 
-  // Prepare the given column if not already prepared.
+  // Prepare the given column. The column must not have been prepared yet.
   Status PrepareColumn(ColumnMaterializationContext *ctx);
 
   const std::shared_ptr<CFileSet const> base_data_;
   const Schema* projection_;
 
   // Iterator for the key column in the underlying data.
-  gscoped_ptr<cfile::CFileIterator> key_iter_;
+  std::unique_ptr<cfile::CFileIterator> key_iter_;
   std::vector<std::unique_ptr<cfile::ColumnIterator>> col_iters_;
 
   bool initted_;
@@ -268,7 +271,11 @@ class CFileSet::Iterator : public ColumnwiseIterator {
 
   // The underlying columns are prepared lazily, so that if a column is never
   // materialized, it doesn't need to be read off disk.
-  std::vector<bool> cols_prepared_;
+  //
+  // The list of columns which have been prepared (and thus must be 'finished'
+  // at the end of the current batch). These are pointers into the same iterators
+  // stored in 'col_iters_'.
+  std::vector<cfile::ColumnIterator*> prepared_iters_;
 
 };
 

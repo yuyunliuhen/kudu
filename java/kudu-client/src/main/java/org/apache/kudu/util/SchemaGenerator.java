@@ -17,7 +17,19 @@
 
 package org.apache.kudu.util;
 
+import static org.apache.kudu.util.DataGenerator.randomBinary;
+import static org.apache.kudu.util.DataGenerator.randomDecimal;
+import static org.apache.kudu.util.DataGenerator.randomString;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Random;
+
 import com.google.common.base.Preconditions;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
+
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.ColumnSchema.ColumnSchemaBuilder;
 import org.apache.kudu.ColumnSchema.CompressionAlgorithm;
@@ -27,17 +39,6 @@ import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.client.CreateTableOptions;
 import org.apache.kudu.client.PartialRow;
-import org.apache.yetus.audience.InterfaceAudience;
-import org.apache.yetus.audience.InterfaceStability;
-
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Random;
-
-import static org.apache.kudu.util.DataGenerator.randomBinary;
-import static org.apache.kudu.util.DataGenerator.randomDecimal;
-import static org.apache.kudu.util.DataGenerator.randomString;
 
 /**
  * A utility class to generate random schemas and schema components.
@@ -59,6 +60,8 @@ public class SchemaGenerator {
   private final List<CompressionAlgorithm> compressions;
   private final List<Integer> blockSizes;
   private final Float defaultRate;
+  private final int minPrecision;
+  private final int maxPrecision;
 
   private SchemaGenerator(final Random random,
                           final int columnCount,
@@ -68,7 +71,9 @@ public class SchemaGenerator {
                           final List<Encoding> encodings,
                           final List<CompressionAlgorithm> compressions,
                           final List<Integer> blockSizes,
-                          final Float defaultRate) {
+                          final Float defaultRate,
+                          final int minPrecision,
+                          final int maxPrecision) {
     this.random = random;
     this.columnCount = columnCount;
     this.keyColumnCount = keyColumnCount;
@@ -78,6 +83,8 @@ public class SchemaGenerator {
     this.compressions = compressions;
     this.blockSizes = blockSizes;
     this.defaultRate = defaultRate;
+    this.minPrecision = minPrecision;
+    this.maxPrecision = maxPrecision;
   }
 
   /**
@@ -107,14 +114,23 @@ public class SchemaGenerator {
         .nullable(random.nextBoolean() && !key)
         .compressionAlgorithm(randomCompression())
         .desiredBlockSize(randomBlockSize())
-        .encoding(randomEncoding(type));
+        .encoding(randomEncoding(type))
+        .comment("A " + type.getName() + " column for " + name);
 
     ColumnTypeAttributes typeAttributes = null;
     if (type == Type.DECIMAL) {
-      // TODO(ghenke): Make precision and scale configurable.
-      int precision = random.nextInt(DecimalUtil.MAX_DECIMAL_PRECISION) + 1;
+      int precision = random.nextInt((maxPrecision - minPrecision) + 1) + minPrecision;
+      // TODO(ghenke): Make scale configurable.
       int scale = random.nextInt(precision);
       typeAttributes = DecimalUtil.typeAttributes(precision, scale);
+      builder.typeAttributes(typeAttributes);
+    }
+
+    if (type == Type.VARCHAR) {
+      int length = random.nextInt(
+          (CharUtil.MAX_VARCHAR_LENGTH - CharUtil.MIN_VARCHAR_LENGTH) + 1) +
+          CharUtil.MIN_VARCHAR_LENGTH;
+      typeAttributes = CharUtil.typeAttributes(length);
       builder.typeAttributes(typeAttributes);
     }
 
@@ -145,6 +161,11 @@ public class SchemaGenerator {
           break;
         case DECIMAL:
           builder.defaultValue(randomDecimal(typeAttributes, random));
+          break;
+        case VARCHAR:
+          builder.defaultValue(randomString(Math.min(DEFAULT_BINARY_LENGTH,
+                                                     typeAttributes.getLength()),
+                                            random));
           break;
         case STRING:
           builder.defaultValue(randomString(DEFAULT_BINARY_LENGTH, random));
@@ -198,6 +219,7 @@ public class SchemaGenerator {
             Encoding.PLAIN_ENCODING,
             Encoding.BIT_SHUFFLE));
         break;
+      case VARCHAR:
       case STRING:
       case BINARY:
         validEncodings.retainAll(Arrays.asList(
@@ -227,11 +249,11 @@ public class SchemaGenerator {
     final List<ColumnSchema> keyColumns = schema.getPrimaryKeyColumns();
 
     // Add hash partitioning (Max out at 3 levels to avoid being excessive).
-    int hashPartitionLevels = random.nextInt(Math.min(keyColumns.size(), 3)) + 1;
+    int hashPartitionLevels = random.nextInt(Math.min(keyColumns.size(), 2)) + 1;
     for (int i = 0; i < hashPartitionLevels; i++) {
       final ColumnSchema hashColumn = keyColumns.get(i);
       // TODO(ghenke): Make buckets configurable.
-      final int hashBuckets = random.nextInt(8) + MIN_HASH_BUCKETS;
+      final int hashBuckets = random.nextInt(2) + MIN_HASH_BUCKETS;
       final int hashSeed = random.nextInt();
       options.addHashPartitions(Arrays.asList(hashColumn.getName()), hashBuckets, hashSeed);
     }
@@ -278,6 +300,8 @@ public class SchemaGenerator {
     // Default, min, middle, max.
     private List<Integer> blockSizes = Arrays.asList(0, 4096, 524288, 1048576);
     private float defaultRate = 0.25f;
+    private int minPrecision = DecimalUtil.MIN_DECIMAL_PRECISION;
+    private int maxPrecision = DecimalUtil.MAX_DECIMAL_PRECISION;
 
     public SchemaGeneratorBuilder() {
       // Add all encoding options and remove any invalid ones.
@@ -329,6 +353,22 @@ public class SchemaGenerator {
     }
 
     /**
+     * Define the types that can *not* be used when randomly generating a column schema.
+     * @return this instance
+     */
+    public SchemaGeneratorBuilder excludeTypes(Type... types) {
+      List<Type> includedTypes = new ArrayList<>();
+      // Add all possible types.
+      includedTypes.addAll(Arrays.asList(Type.values()));
+      // Remove the excluded types.
+      for (Type type : types) {
+        includedTypes.remove(type);
+      }
+      this.types = includedTypes;
+      return this;
+    }
+
+    /**
      * Define the encoding options that can be used when randomly generating
      * a column schema.
      * @return this instance
@@ -360,6 +400,34 @@ public class SchemaGenerator {
       return this;
     }
 
+    /**
+     * Define the precision value to use when when randomly generating
+     * a column schema with a Decimal type.
+     * @return this instance
+     */
+    public SchemaGeneratorBuilder precision(int precision) {
+      return precisionRange(precision, precision);
+    }
+
+    /**
+     * Define the range of precision values to use when when randomly generating
+     * a column schema with a Decimal type.
+     * @return this instance
+     */
+    public SchemaGeneratorBuilder precisionRange(int minPrecision, int maxPrecision) {
+      Preconditions.checkArgument(minPrecision >= DecimalUtil.MIN_DECIMAL_PRECISION,
+          "minPrecision must be greater than or equal to " +
+              DecimalUtil.MIN_DECIMAL_PRECISION);
+      Preconditions.checkArgument(maxPrecision <= DecimalUtil.MAX_DECIMAL_PRECISION,
+          "maxPrecision must be less than or equal to " +
+              DecimalUtil.MAX_DECIMAL_PRECISION);
+      Preconditions.checkArgument(minPrecision <= maxPrecision,
+          "minPrecision must be less than or equal to " + maxPrecision);
+      this.minPrecision = minPrecision;
+      this.maxPrecision = maxPrecision;
+      return this;
+    }
+
     public SchemaGenerator build() {
       Preconditions.checkArgument(keyColumnCount <= columnCount,
           "keyColumnCount must be less than or equal to the columnCount");
@@ -379,7 +447,9 @@ public class SchemaGenerator {
           encodings,
           compressions,
           blockSizes,
-          defaultRate
+          defaultRate,
+          minPrecision,
+          maxPrecision
       );
     }
   }

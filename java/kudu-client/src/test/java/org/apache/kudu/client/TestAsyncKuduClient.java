@@ -14,13 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
 import static org.apache.kudu.test.ClientTestUtil.countRowsInScan;
 import static org.apache.kudu.test.ClientTestUtil.createBasicSchemaInsert;
 import static org.apache.kudu.test.ClientTestUtil.getBasicCreateTableOptions;
+import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
@@ -33,9 +34,6 @@ import java.util.concurrent.TimeUnit;
 import com.google.common.base.Stopwatch;
 import com.google.protobuf.ByteString;
 import com.stumbleupon.async.Deferred;
-import org.apache.kudu.test.KuduTestHarness;
-import org.apache.kudu.test.ClientTestUtil;
-import org.apache.kudu.test.ProtobufUtils;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -46,6 +44,9 @@ import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.consensus.Metadata;
 import org.apache.kudu.master.Master;
+import org.apache.kudu.test.ClientTestUtil;
+import org.apache.kudu.test.KuduTestHarness;
+import org.apache.kudu.test.ProtobufUtils;
 
 public class TestAsyncKuduClient {
 
@@ -143,16 +144,19 @@ public class TestAsyncKuduClient {
     final int requestBatchSize = 10;
 
     // Test that a bad hostname for the master makes us error out quickly.
-    AsyncKuduClient invalidClient = new AsyncKuduClient.AsyncKuduClientBuilder(badHostname).build();
-    try {
-      invalidClient.listTabletServers().join(1000);
-      fail("This should have failed quickly");
-    } catch (Exception ex) {
-      assertTrue(ex instanceof NonRecoverableException);
-      assertTrue(ex.getMessage().contains(badHostname));
+    try (AsyncKuduClient invalidClient =
+           new AsyncKuduClient.AsyncKuduClientBuilder(badHostname).build()) {
+      try {
+        invalidClient.listTabletServers().join(1000);
+        fail("This should have failed quickly");
+      } catch (Exception ex) {
+        assertTrue(ex instanceof NonRecoverableException);
+        assertTrue(ex.getMessage().contains(badHostname));
+      }
     }
 
     List<Master.TabletLocationsPB> tabletLocations = new ArrayList<>();
+    List<Master.TSInfoPB> tsInfos = new ArrayList<>();
 
     // Builder three bad locations.
     Master.TabletLocationsPB.Builder tabletPb = Master.TabletLocationsPB.newBuilder();
@@ -162,16 +166,18 @@ public class TestAsyncKuduClient {
       partition.setPartitionKeyEnd(ByteString.copyFrom("b" + i, UTF_8.name()));
       tabletPb.setPartition(partition);
       tabletPb.setTabletId(ByteString.copyFromUtf8("some id " + i));
-      tabletPb.addReplicas(ProtobufUtils.getFakeTabletReplicaPB(
-          "uuid", badHostname + i, i, Metadata.RaftPeerPB.Role.FOLLOWER));
+      tabletPb.addInternedReplicas(ProtobufUtils.getFakeTabletInternedReplicaPB(
+          i, Metadata.RaftPeerPB.Role.FOLLOWER));
       tabletLocations.add(tabletPb.build());
+      tsInfos.add(ProtobufUtils.getFakeTSInfoPB("uuid",badHostname + i, i).build());
     }
 
     // Test that a tablet full of unreachable replicas won't make us retry.
     try {
       KuduTable badTable = new KuduTable(asyncClient, "Invalid table name",
-          "Invalid table ID", null, null, 3);
-      asyncClient.discoverTablets(badTable, null, requestBatchSize, tabletLocations, 1000);
+          "Invalid table ID", null, null, 3, null);
+      asyncClient.discoverTablets(badTable, null, requestBatchSize,
+                                  tabletLocations, tsInfos, 1000);
       fail("This should have failed quickly");
     } catch (NonRecoverableException ex) {
       assertTrue(ex.getMessage().contains(badHostname));
@@ -181,29 +187,33 @@ public class TestAsyncKuduClient {
   @Test
   public void testNoLeader() throws Exception {
     final int requestBatchSize = 10;
-    CreateTableOptions options = getBasicCreateTableOptions();
-    KuduTable table = client.createTable(
+    final CreateTableOptions options = getBasicCreateTableOptions();
+    final KuduTable table = client.createTable(
         "testNoLeader-" + System.currentTimeMillis(),
         basicSchema,
         options);
 
     // Lookup the current locations so that we can pass some valid information to discoverTablets.
-    List<LocatedTablet> tablets = asyncClient
+    final List<LocatedTablet> tablets = asyncClient
         .locateTable(table, null, null, requestBatchSize, DEFAULT_SLEEP)
         .join(DEFAULT_SLEEP);
-    LocatedTablet tablet = tablets.get(0);
-    LocatedTablet.Replica leader = tablet.getLeaderReplica();
+    final LocatedTablet tablet = tablets.get(0);
+    final LocatedTablet.Replica leader = tablet.getLeaderReplica();
 
     // Fake a master lookup that only returns one follower for the tablet.
-    List<Master.TabletLocationsPB> tabletLocations = new ArrayList<>();
+    final List<Master.TabletLocationsPB> tabletLocations = new ArrayList<>();
+    final List<Master.TSInfoPB> tsInfos = new ArrayList<>();
     Master.TabletLocationsPB.Builder tabletPb = Master.TabletLocationsPB.newBuilder();
     tabletPb.setPartition(ProtobufUtils.getFakePartitionPB());
     tabletPb.setTabletId(ByteString.copyFrom(tablet.getTabletId()));
-    tabletPb.addReplicas(ProtobufUtils.getFakeTabletReplicaPB(
-        "master", leader.getRpcHost(), leader.getRpcPort(), Metadata.RaftPeerPB.Role.FOLLOWER));
+    tabletPb.addInternedReplicas(ProtobufUtils.getFakeTabletInternedReplicaPB(
+        0, Metadata.RaftPeerPB.Role.FOLLOWER));
     tabletLocations.add(tabletPb.build());
+    tsInfos.add(ProtobufUtils.getFakeTSInfoPB(
+        "master", leader.getRpcHost(), leader.getRpcPort()).build());
     try {
-      asyncClient.discoverTablets(table, new byte[0], requestBatchSize, tabletLocations, 1000);
+      asyncClient.discoverTablets(table, new byte[0], requestBatchSize,
+                                  tabletLocations, tsInfos, 1000);
       fail("discoverTablets should throw an exception if there's no leader");
     } catch (NoLeaderFoundException ex) {
       // Expected.

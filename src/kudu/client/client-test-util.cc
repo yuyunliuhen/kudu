@@ -17,19 +17,17 @@
 
 #include "kudu/client/client-test-util.h"
 
+#include <algorithm>
 #include <ostream>
 #include <string>
 #include <vector>
 
 #include <glog/logging.h>
-#include <gtest/gtest.h>
 
-#include "kudu/client/row_result.h"
 #include "kudu/client/scan_batch.h"
 #include "kudu/client/write_op.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/util/status.h"
-#include "kudu/util/test_macros.h"
 
 using std::string;
 using std::vector;
@@ -60,19 +58,25 @@ void LogSessionErrorsAndDie(const sp::shared_ptr<KuduSession>& session,
   CHECK_OK(s); // will fail
 }
 
-void ScanTableToStrings(KuduTable* table, vector<string>* row_strings) {
+Status ScanTableToStrings(KuduTable* table,
+                          vector<string>* row_strings,
+                          ScannedRowsOrder rows_order) {
   row_strings->clear();
   KuduScanner scanner(table);
   // TODO(dralves) Change this to READ_AT_SNAPSHOT, fault tolerant scan and get rid
   // of the retry code below.
-  ASSERT_OK(scanner.SetSelection(KuduClient::LEADER_ONLY));
-  ASSERT_OK(scanner.SetTimeoutMillis(15000));
-  ASSERT_OK(ScanToStrings(&scanner, row_strings));
+  RETURN_NOT_OK(scanner.SetSelection(KuduClient::LEADER_ONLY));
+  RETURN_NOT_OK(scanner.SetTimeoutMillis(15000));
+  RETURN_NOT_OK(ScanToStrings(&scanner, row_strings));
+  if (rows_order == ScannedRowsOrder::kSorted) {
+    std::sort(row_strings->begin(), row_strings->end());
+  }
+  return Status::OK();
 }
 
 int64_t CountTableRows(KuduTable* table) {
   vector<string> rows;
-  client::ScanTableToStrings(table, &rows);
+  CHECK_OK(client::ScanTableToStrings(table, &rows));
   return rows.size();
 }
 
@@ -121,10 +125,10 @@ Status CountRowsWithRetries(KuduScanner* scanner, size_t* row_count) {
 
 Status ScanToStrings(KuduScanner* scanner, vector<string>* row_strings) {
   RETURN_NOT_OK(scanner->Open());
-  vector<KuduRowResult> rows;
+  KuduScanBatch batch;
   while (scanner->HasMoreRows()) {
-    RETURN_NOT_OK(scanner->NextBatch(&rows));
-    for (const KuduRowResult& row : rows) {
+    RETURN_NOT_OK(scanner->NextBatch(&batch));
+    for (const KuduScanBatch::RowPtr row : batch) {
       row_strings->push_back(row.ToString());
     }
   }

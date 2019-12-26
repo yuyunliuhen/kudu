@@ -36,6 +36,7 @@
 #include "kudu/client/client-test-util.h"
 #include "kudu/client/client.h"
 #include "kudu/client/row_result.h"
+#include "kudu/client/scan_batch.h"
 #include "kudu/client/schema.h"
 #include "kudu/client/shared_ptr.h"
 #include "kudu/client/value.h"
@@ -63,6 +64,7 @@
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/ts_tablet_manager.h"
+#include "kudu/util/maintenance_manager.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/random.h"
 #include "kudu/util/scoped_cleanup.h"
@@ -77,37 +79,39 @@ DECLARE_int32(flush_threshold_mb);
 DECLARE_bool(use_hybrid_clock);
 DECLARE_bool(scanner_allow_snapshot_scans_with_logical_timestamps);
 
-namespace kudu {
-
-using client::CountTableRows;
-using client::KuduClient;
-using client::KuduClientBuilder;
-using client::KuduColumnSchema;
-using client::KuduDelete;
-using client::KuduError;
-using client::KuduInsert;
-using client::KuduRowResult;
-using client::KuduScanner;
-using client::KuduSchema;
-using client::KuduSchemaBuilder;
-using client::KuduSession;
-using client::KuduTable;
-using client::KuduTableAlterer;
-using client::KuduTableCreator;
-using client::KuduUpdate;
-using client::KuduValue;
-using client::sp::shared_ptr;
-using cluster::InternalMiniCluster;
-using cluster::InternalMiniClusterOptions;
-using master::AlterTableRequestPB;
-using master::AlterTableResponsePB;
+using kudu::client::CountTableRows;
+using kudu::client::KuduClient;
+using kudu::client::KuduClientBuilder;
+using kudu::client::KuduColumnSchema;
+using kudu::client::KuduDelete;
+using kudu::client::KuduError;
+using kudu::client::KuduInsert;
+using kudu::client::KuduRowResult;
+using kudu::client::KuduScanBatch;
+using kudu::client::KuduScanner;
+using kudu::client::KuduSchema;
+using kudu::client::KuduSchemaBuilder;
+using kudu::client::KuduSession;
+using kudu::client::KuduTable;
+using kudu::client::KuduTableAlterer;
+using kudu::client::KuduTableCreator;
+using kudu::client::KuduUpdate;
+using kudu::client::KuduValue;
+using kudu::client::sp::shared_ptr;
+using kudu::cluster::InternalMiniCluster;
+using kudu::cluster::InternalMiniClusterOptions;
+using kudu::master::AlterTableRequestPB;
+using kudu::master::AlterTableResponsePB;
+using kudu::tablet::TabletReplica;
+using kudu::tablet::Tablet;
 using std::atomic;
 using std::map;
 using std::pair;
 using std::string;
 using std::unique_ptr;
 using std::vector;
-using tablet::TabletReplica;
+
+namespace kudu {
 
 class AlterTableTest : public KuduTest {
  public:
@@ -256,12 +260,15 @@ class AlterTableTest : public KuduTest {
       split_rows.push_back(row);
     }
     gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     return table_creator->table_name(table_name)
         .schema(&schema_)
         .set_range_partition_columns({ "c0" })
         .num_replicas(num_replicas())
         .split_rows(split_rows)
         .Create();
+#pragma GCC diagnostic pop
   }
 
   Status CreateTable(const string& table_name,
@@ -269,6 +276,15 @@ class AlterTableTest : public KuduTest {
                      const vector<string>& range_partition_columns,
                      vector<unique_ptr<KuduPartialRow>> split_rows,
                      vector<pair<unique_ptr<KuduPartialRow>, unique_ptr<KuduPartialRow>>> bounds);
+
+  void CheckMaintenancePriority(int32_t expect_priority) {
+    for (auto op : tablet_replica_->maintenance_ops_) {
+      ASSERT_EQ(op->priority(), expect_priority);
+    }
+    for (auto op : tablet_replica_->tablet()->maintenance_ops_) {
+      ASSERT_EQ(op->priority(), expect_priority);
+    }
+  }
 
  protected:
   virtual int num_replicas() const { return 1; }
@@ -344,7 +360,7 @@ TEST_F(AlterTableTest, TestAddNotNullableColumnWithoutDefaults) {
         cluster_->mini_master()->master()->catalog_manager();
     master::CatalogManager::ScopedLeaderSharedLock l(catalog);
     ASSERT_OK(l.first_failed_status());
-    Status s = catalog->AlterTableRpc(req, &resp, nullptr);
+    Status s = catalog->AlterTableRpc(req, &resp, /*rpc=*/nullptr);
     ASSERT_TRUE(s.IsInvalidArgument());
     ASSERT_STR_CONTAINS(s.ToString(), "column `c2`: NOT NULL columns must have a default");
   }
@@ -539,7 +555,7 @@ TEST_F(AlterTableTest, TestAlterOnTSRestart) {
   bool alter_in_progress = false;
   ASSERT_OK(client_->GetTableSchema(kTableName, &schema));
   ASSERT_TRUE(schema_.Equals(schema));
-  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, &alter_in_progress))
+  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, &alter_in_progress));
   ASSERT_TRUE(alter_in_progress);
 
   // Restart the TS and wait for the new schema
@@ -690,7 +706,7 @@ void AlterTableTest::UpdateRow(int32_t row_key,
 void AlterTableTest::ScanToStrings(vector<string>* rows) {
   shared_ptr<KuduTable> table;
   CHECK_OK(client_->OpenTable(kTableName, &table));
-  ScanTableToStrings(table.get(), rows);
+  CHECK_OK(ScanTableToStrings(table.get(), rows));
   std::sort(rows->begin(), rows->end());
 }
 
@@ -707,11 +723,11 @@ void AlterTableTest::VerifyRows(int start_row, int num_rows, VerifyPattern patte
   ASSERT_OK(scanner.Open());
 
   int verified = 0;
-  vector<KuduRowResult> results;
+  KuduScanBatch batch;
   while (scanner.HasMoreRows()) {
-    ASSERT_OK(scanner.NextBatch(&results));
+    ASSERT_OK(scanner.NextBatch(&batch));
 
-    for (const KuduRowResult& row : results) {
+    for (const KuduScanBatch::RowPtr row : batch) {
       int32_t key = 0;
       ASSERT_OK(row.GetInt32(0, &key));
       int32_t row_idx = bswap_32(key);
@@ -840,7 +856,7 @@ TEST_F(AlterTableTest, TestBootstrapAfterAlters) {
 
   // Test that restart doesn't fail when trying to replay updates or inserts
   // with the dropped column.
-  ASSERT_NO_FATAL_FAILURE(RestartTabletServer());
+  NO_FATALS(RestartTabletServer());
 
   NO_FATALS(ScanToStrings(&rows));
   ASSERT_EQ(2, rows.size());
@@ -854,7 +870,7 @@ TEST_F(AlterTableTest, TestBootstrapAfterAlters) {
   ASSERT_EQ("(int32 c0=0, int32 c2=12345, int32 c1=20000)", rows[0]);
   ASSERT_EQ("(int32 c0=16777216, int32 c2=12345, int32 c1=20000)", rows[1]);
 
-  ASSERT_NO_FATAL_FAILURE(RestartTabletServer());
+  NO_FATALS(RestartTabletServer());
   NO_FATALS(ScanToStrings(&rows));
   ASSERT_EQ(2, rows.size());
   ASSERT_EQ("(int32 c0=0, int32 c2=12345, int32 c1=20000)", rows[0]);
@@ -1157,10 +1173,10 @@ void AlterTableTest::ScannerThread() {
     uint32_t inserted_at_scanner_start = next_idx_;
     CHECK_OK(scanner.Open());
     int count = 0;
-    vector<KuduRowResult> results;
+    KuduScanBatch batch;
     while (scanner.HasMoreRows()) {
-      CHECK_OK(scanner.NextBatch(&results));
-      count += results.size();
+      CHECK_OK(scanner.NextBatch(&batch));
+      count += batch.NumRows();
     }
 
     LOG(INFO) << "Scanner saw " << count << " rows";
@@ -2065,7 +2081,7 @@ TEST_F(ReplicatedAlterTableTest, TestReplicatedAlter) {
   ASSERT_OK(AddNewI32Column(kTableName, "c1", 0xdeadbeef));
 
   bool alter_in_progress;
-  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, &alter_in_progress))
+  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, &alter_in_progress));
   ASSERT_FALSE(alter_in_progress);
 
   LOG(INFO) << "Verifying that the new default shows up";
@@ -2118,5 +2134,24 @@ TEST_F(AlterTableTest, TestKUDU2132) {
   table_alterer->DropColumn("c0");
   ASSERT_OK(table_alterer->Alter());
 }
+
+TEST_F(AlterTableTest, TestMaintenancePriorityAlter) {
+  // Default priority level.
+  NO_FATALS(CheckMaintenancePriority(0));
+
+  // Set to some priority level.
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+  ASSERT_OK(table_alterer->AlterExtraConfig({{"kudu.table.maintenance_priority", "3"}})->Alter());
+  NO_FATALS(CheckMaintenancePriority(3));
+
+  // Set to another priority level.
+  ASSERT_OK(table_alterer->AlterExtraConfig({{"kudu.table.maintenance_priority", "-1"}})->Alter());
+  NO_FATALS(CheckMaintenancePriority(-1));
+
+  // Reset to default priority level.
+  ASSERT_OK(table_alterer->AlterExtraConfig({{"kudu.table.maintenance_priority", "0"}})->Alter());
+  NO_FATALS(CheckMaintenancePriority(0));
+}
+
 
 } // namespace kudu

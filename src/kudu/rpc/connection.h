@@ -50,12 +50,13 @@ namespace kudu {
 
 namespace rpc {
 
-class DumpRunningRpcsRequestPB;
+class DumpConnectionsRequestPB;
 class InboundCall;
 class OutboundCall;
 class RpcConnectionPB;
 class ReactorThread;
 class RpczStore;
+class SocketStatsPB;
 enum class CredentialsPolicy;
 
 //
@@ -97,6 +98,13 @@ class Connection : public RefCountedThreadSafe<Connection> {
 
   // Set underlying socket to non-blocking (or blocking) mode.
   Status SetNonBlocking(bool enabled);
+
+  // Enable TCP keepalive for the underlying socket. A TCP keepalive probe will be sent
+  // to the remote end after the connection has been idle for 'idle_time_s' seconds.
+  // It will retry sending probes up to 'num_retries' number of times until an ACK is
+  // heard from peer. 'retry_time_s' is the sleep time in seconds between successive
+  // keepalive probes.
+  Status SetTcpKeepAlive(int idle_time_s, int retry_time_s, int num_retries);
 
   // Register our socket with an epoll loop.  We will only ever be registered in
   // one epoll loop at a time.
@@ -193,7 +201,7 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // Indicate that negotiation is complete and that the Reactor is now in control of the socket.
   void MarkNegotiationComplete();
 
-  Status DumpPB(const DumpRunningRpcsRequestPB& req,
+  Status DumpPB(const DumpConnectionsRequestPB& req,
                 RpcConnectionPB* resp);
 
   ReactorThread* reactor_thread() const { return reactor_thread_; }
@@ -297,6 +305,8 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // Internal test function for injecting cancellation request when 'call'
   // reaches state specified in 'FLAGS_rpc_inject_cancellation_state'.
   void MaybeInjectCancellation(const std::shared_ptr<OutboundCall> &call);
+
+  Status GetSocketStatsPB(SocketStatsPB* pb) const;
 
   // The reactor thread that created this connection.
   ReactorThread* const reactor_thread_;

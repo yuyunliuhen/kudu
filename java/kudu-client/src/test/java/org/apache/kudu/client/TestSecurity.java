@@ -11,12 +11,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. See accompanying LICENSE file.
  */
+
 package org.apache.kudu.client;
 
-import static org.apache.kudu.test.junit.AssertHelpers.assertEventuallyTrue;
 import static org.apache.kudu.test.ClientTestUtil.createBasicSchemaInsert;
 import static org.apache.kudu.test.ClientTestUtil.getBasicCreateTableOptions;
 import static org.apache.kudu.test.ClientTestUtil.getBasicSchema;
+import static org.apache.kudu.test.junit.AssertHelpers.assertEventuallyTrue;
 import static org.junit.Assert.assertNotNull;
 
 import java.io.Closeable;
@@ -26,19 +27,12 @@ import java.security.PrivilegedExceptionAction;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
-
 import javax.security.auth.Subject;
 
-import org.apache.kudu.client.Client.AuthenticationCredentialsPB;
-import org.apache.kudu.test.cluster.MiniKuduCluster;
-import org.apache.kudu.test.cluster.MiniKuduCluster.MiniKuduClusterBuilder;
-import org.apache.kudu.test.junit.RetryRule;
-import org.apache.kudu.master.Master.ConnectToMasterResponsePB;
-import org.apache.kudu.test.cluster.FakeDNS;
-import org.apache.kudu.test.junit.AssertHelpers;
-import org.apache.kudu.test.junit.AssertHelpers.BooleanExpression;
-import org.apache.kudu.test.CapturingLogAppender;
-import org.apache.kudu.util.SecurityUtil;
+import com.google.common.base.Stopwatch;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import com.stumbleupon.async.Deferred;
 import org.hamcrest.CoreMatchers;
 import org.junit.After;
 import org.junit.Assert;
@@ -46,24 +40,43 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 
-import com.google.common.base.Stopwatch;
-import com.google.common.collect.ImmutableSet;
-import com.stumbleupon.async.Deferred;
+import org.apache.kudu.client.Client.AuthenticationCredentialsPB;
+import org.apache.kudu.master.Master.ConnectToMasterResponsePB;
+import org.apache.kudu.test.CapturingLogAppender;
+import org.apache.kudu.test.cluster.FakeDNS;
+import org.apache.kudu.test.cluster.MiniKuduCluster;
+import org.apache.kudu.test.cluster.MiniKuduCluster.MiniKuduClusterBuilder;
+import org.apache.kudu.test.junit.AssertHelpers;
+import org.apache.kudu.test.junit.AssertHelpers.BooleanExpression;
+import org.apache.kudu.test.junit.RetryRule;
+import org.apache.kudu.util.SecurityUtil;
 
 public class TestSecurity {
   private static final String TABLE_NAME = "TestSecurity-table";
   private static final int TICKET_LIFETIME_SECS = 10;
   private static final int RENEWABLE_LIFETIME_SECS = 20;
 
-  private final CapturingLogAppender cla = new CapturingLogAppender();
+  private CapturingLogAppender cla;
   private MiniKuduCluster miniCluster;
   private KuduClient client;
 
   private enum Option {
     LONG_LEADER_ELECTION,
     SHORT_TOKENS_AND_TICKETS,
-    START_TSERVERS
-  };
+    START_TSERVERS,
+  }
+
+  private static class KeyValueMessage {
+    final String key;
+    final String val;
+    final String msg;
+
+    KeyValueMessage(String k, String v, String m) {
+      key = k;
+      val = v;
+      msg = m;
+    }
+  }
 
   private void startCluster(Set<Option> opts) throws IOException {
     MiniKuduClusterBuilder mcb = new MiniKuduClusterBuilder();
@@ -81,12 +94,6 @@ public class TestSecurity {
         .build();
     miniCluster.kinit("test-admin");
     client = new KuduClient.KuduClientBuilder(miniCluster.getMasterAddressesAsString()).build();
-
-    // TODO(todd): it seems that exportAuthenticationCredentials() doesn't properly retry
-    // in the case that there is no leader, even though NoLeaderFoundException is a RecoverableException.
-    // So, we have to use a hack of calling listTabletServers, which _does_ properly retry,
-    // in order to wait for the masters to elect a leader.
-    client.listTabletServers();
   }
 
   // Add a rule to rerun tests. We use this with Gradle because it doesn't support
@@ -97,15 +104,19 @@ public class TestSecurity {
   @Before
   public void setUp() {
     FakeDNS.getInstance().install();
+    cla = new CapturingLogAppender();
   }
 
   @After
   public void tearDown() throws IOException {
-    if (client != null) {
-      client.close();
-    }
-    if (miniCluster != null) {
-      miniCluster.shutdown();
+    try {
+      if (client != null) {
+        client.close();
+      }
+    } finally {
+      if (miniCluster != null) {
+        miniCluster.shutdown();
+      }
     }
   }
 
@@ -145,15 +156,13 @@ public class TestSecurity {
    */
   @Test
   public void testImportExportAuthenticationCredentials() throws Exception {
-    startCluster(ImmutableSet.of(Option.SHORT_TOKENS_AND_TICKETS,
-        Option.START_TSERVERS));
+    startCluster(ImmutableSet.of(Option.START_TSERVERS));
     byte[] authnData = client.exportAuthenticationCredentials();
     assertNotNull(authnData);
     String oldTicketCache = System.getProperty(SecurityUtil.KUDU_TICKETCACHE_PROPERTY);
     System.clearProperty(SecurityUtil.KUDU_TICKETCACHE_PROPERTY);
-    try {
-      KuduClient newClient = new KuduClient.KuduClientBuilder(
-          miniCluster.getMasterAddressesAsString()).build();
+    try (KuduClient newClient = new KuduClient.KuduClientBuilder(
+        miniCluster.getMasterAddressesAsString()).build()) {
 
       // Test that a client with no credentials cannot list servers.
       try {
@@ -186,9 +195,9 @@ public class TestSecurity {
    * is to export credentials, that should trigger a connection to the
    * cluster rather than returning empty credentials.
    */
-  @Test(timeout=60000)
+  @Test(timeout = 60000)
   public void testExportCredentialsBeforeAnyOtherAccess() throws IOException {
-    startCluster(ImmutableSet.<Option>of());
+    startCluster(ImmutableSet.of());
     try (KuduClient c = createClient()) {
       AuthenticationCredentialsPB pb = AuthenticationCredentialsPB.parseFrom(
           c.exportAuthenticationCredentials());
@@ -212,8 +221,7 @@ public class TestSecurity {
 
     String oldTicketCache = System.getProperty(SecurityUtil.KUDU_TICKETCACHE_PROPERTY);
     System.clearProperty(SecurityUtil.KUDU_TICKETCACHE_PROPERTY);
-    try {
-      KuduClient newClient = createClient();
+    try (KuduClient newClient = createClient()) {
       newClient.importAuthenticationCredentials(authnData);
 
       // We shouldn't be able to connect because we have no appropriate CA cert.
@@ -246,8 +254,7 @@ public class TestSecurity {
     assertNotNull(authnData);
     String oldTicketCache = System.getProperty(SecurityUtil.KUDU_TICKETCACHE_PROPERTY);
     System.clearProperty(SecurityUtil.KUDU_TICKETCACHE_PROPERTY);
-    try {
-      final KuduClient newClient = createClient();
+    try (final KuduClient newClient = createClient()) {
       newClient.importAuthenticationCredentials(authnData);
 
       // Try to connect to all the masters and assert there is no
@@ -258,7 +265,7 @@ public class TestSecurity {
             public boolean get() throws Exception {
               ConnectToCluster connector = new ConnectToCluster(miniCluster.getMasterServers());
               List<Deferred<ConnectToMasterResponsePB>> deferreds =
-                      connector.connectToMasters(newClient.asyncClient.getMasterTable(), null,
+                  connector.connectToMasters(newClient.asyncClient.getMasterTable(), null,
                       /* timeout = */50000,
                       Connection.CredentialsPolicy.ANY_CREDENTIALS);
               // Wait for all Deferreds are called back.
@@ -268,7 +275,7 @@ public class TestSecurity {
               List<Exception> s = connector.getExceptionsReceived();
               return s.size() == 0;
             }
-      }, /* timeoutMillis = */50000);
+          }, /* timeoutMillis = */50000);
     } finally {
       System.setProperty(SecurityUtil.KUDU_TICKETCACHE_PROPERTY, oldTicketCache);
     }
@@ -289,8 +296,7 @@ public class TestSecurity {
     assertNotNull(authnData);
     String oldTicketCache = System.getProperty(SecurityUtil.KUDU_TICKETCACHE_PROPERTY);
     System.clearProperty(SecurityUtil.KUDU_TICKETCACHE_PROPERTY);
-    try {
-      KuduClient newClient = createClient();
+    try (KuduClient newClient = createClient()) {
       newClient.importAuthenticationCredentials(authnData);
       System.err.println("=> imported auth");
 
@@ -307,7 +313,7 @@ public class TestSecurity {
    * Test that, if our Kerberos credentials expire, that we will automatically
    * re-login from an available ticket cache.
    */
-  @Test(timeout=300000)
+  @Test(timeout = 300000)
   public void testRenewAndReacquireKeberosCredentials() throws Exception {
     startCluster(ImmutableSet.of(Option.SHORT_TOKENS_AND_TICKETS));
     Stopwatch timeSinceKinit = Stopwatch.createStarted();
@@ -339,7 +345,7 @@ public class TestSecurity {
    * Test that, if the ticket cache is refreshed but contains a different principal
    * from the original one, we will not accept it.
    */
-  @Test(timeout=300000)
+  @Test(timeout = 300000)
   public void testDoNotSwitchPrincipalsInExistingClient() throws Exception {
     startCluster(ImmutableSet.of(Option.SHORT_TOKENS_AND_TICKETS));
     // Switch the ticket cache to a different user.
@@ -377,7 +383,7 @@ public class TestSecurity {
             }
             return false;
           }
-    }, 60000);
+      }, 60000);
   }
 
   /**
@@ -385,23 +391,20 @@ public class TestSecurity {
    * is created, the client will not attempt to refresh anything, and will
    * eventually fail with appropriate warnings in the log.
    */
-  @Test(timeout=300000)
+  @Test(timeout = 300000)
   public void testExternallyProvidedSubjectExpires() throws Exception {
     startCluster(ImmutableSet.of(Option.SHORT_TOKENS_AND_TICKETS));
     Subject subject = SecurityUtil.getSubjectFromTicketCacheOrNull();
     Assert.assertNotNull(subject);
-    try (Closeable c = cla.attach()) {
-      // Create a client attached to our own subject.
-      KuduClient newClient = createClientFromSubject(subject);
+    try (Closeable c = cla.attach();
+         // Create a client attached to our own subject.
+         KuduClient newClient = createClientFromSubject(subject)) {
       // It should not get auto-refreshed.
-      try {
-        assertEventualAuthenticationFailure(newClient,
-            "server requires authentication, but " +
-            "client Kerberos credentials (TGT) have expired");
-      } finally {
-        newClient.close();
-      }
+      assertEventualAuthenticationFailure(newClient,
+          "server requires authentication, but " +
+          "client Kerberos credentials (TGT) have expired");
     }
+    // Note: this depends on DEBUG-level org.apache.kudu.client logging.
     Assert.assertThat(cla.getAppendedText(), CoreMatchers.containsString(
         "Using caller-provided subject with Kerberos principal test-admin@KRBTEST.COM."));
     Assert.assertThat(cla.getAppendedText(), CoreMatchers.containsString(
@@ -416,20 +419,20 @@ public class TestSecurity {
    * the UserGroupInformation class from Hadoop, which spawns a thread to
    * renew credentials from a keytab.
    */
-  @Test(timeout=300000)
+  @Test(timeout = 300000)
   public void testExternallyProvidedSubjectRefreshedExternally() throws Exception {
     startCluster(ImmutableSet.of(Option.SHORT_TOKENS_AND_TICKETS));
 
     Subject subject = SecurityUtil.getSubjectFromTicketCacheOrNull();
     Assert.assertNotNull(subject);
-    try (Closeable c = cla.attach()) {
-      // Create a client attached to our own subject.
-      KuduClient newClient = createClientFromSubject(subject);
+    try (Closeable c = cla.attach();
+         // Create a client attached to our own subject.
+         KuduClient newClient = createClientFromSubject(subject)) {
       // Run for longer than the renewable lifetime - this ensures that we
       // are indeed picking up the new credentials.
       for (Stopwatch sw = Stopwatch.createStarted();
-          sw.elapsed(TimeUnit.SECONDS) < RENEWABLE_LIFETIME_SECS + 5;
-          Thread.sleep(1000)) {
+           sw.elapsed(TimeUnit.SECONDS) < RENEWABLE_LIFETIME_SECS + 5;
+           Thread.sleep(1000)) {
         miniCluster.kinit("test-admin");
 
         // Update the existing subject in-place by copying over the credentials from
@@ -442,7 +445,50 @@ public class TestSecurity {
         checkClientCanReconnect(newClient);
       }
     }
+    // Note: this depends on DEBUG-level org.apache.kudu.client logging.
     Assert.assertThat(cla.getAppendedText(), CoreMatchers.containsString(
         "Using caller-provided subject with Kerberos principal test-admin@KRBTEST.COM."));
+  }
+
+  /**
+   * Test that if a Kudu server (in this case master) doesn't provide valid
+   * connection binding information, Java client fails to connect to the server.
+   */
+  @Test(timeout = 60000)
+  public void testNegotiationChannelBindings() throws Exception {
+    startCluster(ImmutableSet.of(Option.START_TSERVERS));
+    // Test precondition: all is well with masters -- the client is able
+    // to connect to the cluster and create a table.
+    client.createTable("TestSecurity-channel-bindings-0",
+        getBasicSchema(), getBasicCreateTableOptions());
+
+    List<KeyValueMessage> variants = ImmutableList.of(
+        new KeyValueMessage("rpc_inject_invalid_channel_bindings_ratio", "1.0",
+            "invalid channel bindings provided by remote peer"),
+        new KeyValueMessage("rpc_send_channel_bindings", "false",
+            "no channel bindings provided by remote peer"));
+
+    // Make all masters sending invalid channel binding info during connection
+    // negotiation.
+    for (KeyValueMessage kvm : variants) {
+      for (HostAndPort hp : miniCluster.getMasterServers()) {
+        miniCluster.setMasterFlag(hp, kvm.key, kvm.val);
+      }
+
+      // Now, a client should not be able to connect to any master: negotiation
+      // fails because client cannot authenticate the servers since it fails
+      // to verify the connection binding.
+      try {
+        KuduClient c = new KuduClient.KuduClientBuilder(
+            miniCluster.getMasterAddressesAsString()).build();
+        c.createTable("TestSecurity-channel-bindings-1",
+            getBasicSchema(), getBasicCreateTableOptions());
+        Assert.fail("client should not be able to connect to any master");
+      } catch (NonRecoverableException e) {
+        Assert.assertThat(e.getMessage(), CoreMatchers.containsString(
+            "unable to verify identity of peer"));
+        Assert.assertThat(e.getMessage(), CoreMatchers.containsString(kvm.msg));
+      }
+    }
   }
 }

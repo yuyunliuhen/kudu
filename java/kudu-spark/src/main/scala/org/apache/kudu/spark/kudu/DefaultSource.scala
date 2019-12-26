@@ -1,25 +1,24 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 package org.apache.kudu.spark.kudu
 
-import java.math.BigDecimal
 import java.net.InetAddress
-import java.sql.Timestamp
+import java.util.Locale
 
 import scala.collection.JavaConverters._
 import scala.util.Try
@@ -32,12 +31,15 @@ import org.apache.spark.sql.SQLContext
 import org.apache.spark.sql.SaveMode
 import org.apache.yetus.audience.InterfaceAudience
 import org.apache.yetus.audience.InterfaceStability
-
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
 import org.apache.kudu.client.KuduPredicate.ComparisonOp
 import org.apache.kudu.client._
 import org.apache.kudu.spark.kudu.KuduReadOptions._
 import org.apache.kudu.spark.kudu.KuduWriteOptions._
 import org.apache.kudu.spark.kudu.SparkUtil._
+import org.apache.spark.sql.execution.streaming.Sink
+import org.apache.spark.sql.streaming.OutputMode
 
 /**
  * Data source for integration with Spark's [[DataFrame]] API.
@@ -50,7 +52,8 @@ import org.apache.kudu.spark.kudu.SparkUtil._
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
 class DefaultSource
-    extends RelationProvider with CreatableRelationProvider with SchemaRelationProvider {
+    extends DataSourceRegister with RelationProvider with CreatableRelationProvider
+    with SchemaRelationProvider with StreamSinkProvider {
 
   val TABLE_KEY = "kudu.table"
   val KUDU_MASTER = "kudu.master"
@@ -59,10 +62,21 @@ class DefaultSource
   val SCAN_LOCALITY = "kudu.scanLocality"
   val IGNORE_NULL = "kudu.ignoreNull"
   val IGNORE_DUPLICATE_ROW_ERRORS = "kudu.ignoreDuplicateRowErrors"
+  val REPARTITION = "kudu.repartition"
+  val REPARTITION_SORT = "kudu.repartition.sort"
   val SCAN_REQUEST_TIMEOUT_MS = "kudu.scanRequestTimeoutMs"
   val SOCKET_READ_TIMEOUT_MS = "kudu.socketReadTimeoutMs"
   val BATCH_SIZE = "kudu.batchSize"
   val KEEP_ALIVE_PERIOD_MS = "kudu.keepAlivePeriodMs"
+  val SPLIT_SIZE_BYTES = "kudu.splitSizeBytes"
+
+  /**
+   * A nice alias for the data source so that when specifying the format
+   * "kudu" can be used in place of "org.apache.kudu.spark.kudu".
+   * Note: This class is discovered by Spark via the entry in
+   * `META-INF/services/org.apache.spark.sql.sources.DataSourceRegister`
+   */
+  override def shortName(): String = "kudu"
 
   /**
    * Construct a BaseRelation using the provided context and parameters.
@@ -89,12 +103,9 @@ class DefaultSource
       sqlContext: SQLContext,
       parameters: Map[String, String],
       schema: StructType): BaseRelation = {
-    val tableName = parameters.getOrElse(
-      TABLE_KEY,
-      throw new IllegalArgumentException(
-        s"Kudu table name must be specified in create options using key '$TABLE_KEY'"))
-    val kuduMaster = parameters.getOrElse(KUDU_MASTER, defaultMasterAddrs)
-    val operationType = getOperationType(parameters.getOrElse(OPERATION, "upsert"))
+    val tableName = getTableName(parameters)
+    val kuduMaster = getMasterAddrs(parameters)
+    val operationType = getOperationType(parameters)
     val schemaOption = Option(schema)
     val readOptions = getReadOptions(parameters)
     val writeOptions = getWriteOptions(parameters)
@@ -115,7 +126,7 @@ class DefaultSource
    * @param sqlContext
    * @param mode Only Append mode is supported. It will upsert or insert data
    *             to an existing table, depending on the upsert parameter
-   * @param parameters Necessary parameters for kudu.table, kudu.master, etc..
+   * @param parameters Necessary parameters for kudu.table, kudu.master, etc...
    * @param data Dataframe to save into kudu
    * @return returns populated base relation
    */
@@ -134,6 +145,33 @@ class DefaultSource
     kuduRelation
   }
 
+  override def createSink(
+      sqlContext: SQLContext,
+      parameters: Map[String, String],
+      partitionColumns: Seq[String],
+      outputMode: OutputMode): Sink = {
+
+    val tableName = getTableName(parameters)
+    val masterAddrs = getMasterAddrs(parameters)
+    val operationType = getOperationType(parameters)
+    val readOptions = getReadOptions(parameters)
+    val writeOptions = getWriteOptions(parameters)
+
+    new KuduSink(
+      tableName,
+      masterAddrs,
+      operationType,
+      readOptions,
+      writeOptions
+    )(sqlContext)
+  }
+
+  private def getTableName(parameters: Map[String, String]): String = {
+    parameters.getOrElse(
+      TABLE_KEY,
+      throw new IllegalArgumentException(
+        s"Kudu table name must be specified in create options using key '$TABLE_KEY'"))
+  }
   private def getReadOptions(parameters: Map[String, String]): KuduReadOptions = {
     val batchSize = parameters.get(BATCH_SIZE).map(_.toInt).getOrElse(defaultBatchSize)
     val faultTolerantScanner =
@@ -141,9 +179,9 @@ class DefaultSource
     val scanLocality =
       parameters.get(SCAN_LOCALITY).map(getScanLocalityType).getOrElse(defaultScanLocality)
     val scanRequestTimeoutMs = parameters.get(SCAN_REQUEST_TIMEOUT_MS).map(_.toLong)
-    val socketReadTimeoutMs = parameters.get(SOCKET_READ_TIMEOUT_MS).map(_.toLong)
     val keepAlivePeriodMs =
       parameters.get(KEEP_ALIVE_PERIOD_MS).map(_.toLong).getOrElse(defaultKeepAlivePeriodMs)
+    val splitSizeBytes = parameters.get(SPLIT_SIZE_BYTES).map(_.toLong)
 
     KuduReadOptions(
       batchSize,
@@ -151,7 +189,8 @@ class DefaultSource
       faultTolerantScanner,
       keepAlivePeriodMs,
       scanRequestTimeoutMs,
-      socketReadTimeoutMs)
+      /* socketReadTimeoutMs= */ None,
+      splitSizeBytes)
   }
 
   private def getWriteOptions(parameters: Map[String, String]): KuduWriteOptions = {
@@ -160,16 +199,19 @@ class DefaultSource
     Try(parameters(OPERATION) == "insert-ignore").getOrElse(false)
     val ignoreNull =
       parameters.get(IGNORE_NULL).map(_.toBoolean).getOrElse(defaultIgnoreNull)
-
-    Try(parameters.getOrElse(IGNORE_NULL, "false").toBoolean).getOrElse(false)
-
-    KuduWriteOptions(ignoreDuplicateRowErrors, ignoreNull)
+    val repartition =
+      parameters.get(REPARTITION).map(_.toBoolean).getOrElse(defaultRepartition)
+    val repartitionSort =
+      parameters.get(REPARTITION_SORT).map(_.toBoolean).getOrElse(defaultRepartitionSort)
+    KuduWriteOptions(ignoreDuplicateRowErrors, ignoreNull, repartition, repartitionSort)
   }
 
-  private def defaultMasterAddrs: String = InetAddress.getLocalHost.getCanonicalHostName
+  private def getMasterAddrs(parameters: Map[String, String]): String = {
+    parameters.getOrElse(KUDU_MASTER, InetAddress.getLocalHost.getCanonicalHostName)
+  }
 
   private def getScanLocalityType(opParam: String): ReplicaSelection = {
-    opParam.toLowerCase match {
+    opParam.toLowerCase(Locale.ENGLISH) match {
       case "leader_only" => ReplicaSelection.LEADER_ONLY
       case "closest_replica" => ReplicaSelection.CLOSEST_REPLICA
       case _ =>
@@ -177,8 +219,12 @@ class DefaultSource
     }
   }
 
-  private def getOperationType(opParam: String): OperationType = {
-    opParam.toLowerCase match {
+  private def getOperationType(parameters: Map[String, String]): OperationType = {
+    parameters.get(OPERATION).map(stringToOperationType).getOrElse(Upsert)
+  }
+
+  private def stringToOperationType(opParam: String): OperationType = {
+    opParam.toLowerCase(Locale.ENGLISH) match {
       case "insert" => Insert
       case "insert-ignore" => Insert
       case "upsert" => Upsert
@@ -211,11 +257,37 @@ class KuduRelation(
     val readOptions: KuduReadOptions = new KuduReadOptions,
     val writeOptions: KuduWriteOptions = new KuduWriteOptions)(val sqlContext: SQLContext)
     extends BaseRelation with PrunedFilteredScan with InsertableRelation {
+  val log: Logger = LoggerFactory.getLogger(getClass)
 
   private val context: KuduContext =
-    new KuduContext(masterAddrs, sqlContext.sparkContext, readOptions.socketReadTimeoutMs)
+    new KuduContext(masterAddrs, sqlContext.sparkContext)
 
   private val table: KuduTable = context.syncClient.openTable(tableName)
+
+  private val estimatedSize: Long = {
+    try {
+      table.getTableStatistics().getOnDiskSize
+    } catch {
+      case e: Exception =>
+        log.warn(
+          "Error while getting table statistic from master, maybe the current" +
+            " master doesn't support the rpc, please check the version.",
+          e)
+        super.sizeInBytes
+    }
+  }
+
+  /**
+   * Estimated size of this relation in bytes, this information is used by spark to
+   * decide whether it is safe to broadcast a relation such as in join selection. It
+   * is always better to overestimate this size than underestimate, because underestimation
+   * may lead to expensive execution plan such as broadcasting a very large table which
+   * will cause great network bandwidth consumption.
+   * TODO(KUDU-2933): Consider projection and predicates in size estimation.
+   *
+   * @return size of this relation in bytes
+   */
+  override def sizeInBytes: Long = estimatedSize
 
   override def unhandledFilters(filters: Array[Filter]): Array[Filter] =
     filters.filterNot(KuduRelation.supportsFilter)
@@ -312,31 +384,7 @@ class KuduRelation(
       column: String,
       operator: ComparisonOp,
       value: Any): KuduPredicate = {
-    val columnSchema = table.getSchema.getColumn(column)
-    value match {
-      case value: Boolean =>
-        KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
-      case value: Byte =>
-        KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
-      case value: Short =>
-        KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
-      case value: Int =>
-        KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
-      case value: Long =>
-        KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
-      case value: Timestamp =>
-        KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
-      case value: Float =>
-        KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
-      case value: Double =>
-        KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
-      case value: String =>
-        KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
-      case value: Array[Byte] =>
-        KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
-      case value: BigDecimal =>
-        KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
-    }
+    KuduPredicate.newComparisonPredicate(table.getSchema.getColumn(column), operator, value)
   }
 
   /**
@@ -361,10 +409,10 @@ class KuduRelation(
   }
 
   /**
-   * Creates a new `IS NULL` predicate for the column.
+   * Creates a new `IS NOT NULL` predicate for the column.
    *
    * @param column the column name
-   * @return the `IS NULL` predicate
+   * @return the `IS NOT NULL` predicate
    */
   private def isNotNullPredicate(column: String): KuduPredicate = {
     KuduPredicate.newIsNotNullPredicate(table.getSchema.getColumn(column))
@@ -385,6 +433,14 @@ class KuduRelation(
     }
     context.writeRows(data, tableName, operationType, writeOptions)
   }
+
+  /**
+   * Returns the string representation of this KuduRelation
+   * @return Kudu + tableName of the relation
+   */
+  override def toString(): String = {
+    "Kudu " + this.tableName
+  }
 }
 
 private[spark] object KuduRelation {
@@ -403,4 +459,32 @@ private[spark] object KuduRelation {
     case _ => false
   }
   // formatter: on
+}
+
+/**
+ * Sinks provide at-least-once semantics by retrying failed batches,
+ * and provide a `batchId` interface to implement exactly-once-semantics.
+ * Since Kudu does not internally track batch IDs, this is ignored,
+ * and it is up to the user to specify an appropriate `operationType` to achieve
+ * the desired semantics when adding batches.
+ *
+ * The default `Upsert` allows for KuduSink to handle duplicate data and such retries.
+ *
+ * Insert ignore support (KUDU-1563) would be useful, but while that doesn't exist,
+ * using Upsert will work. Delete ignore would also be useful.
+ */
+class KuduSink(
+    val tableName: String,
+    val masterAddrs: String,
+    val operationType: OperationType,
+    val readOptions: KuduReadOptions = new KuduReadOptions,
+    val writeOptions: KuduWriteOptions)(val sqlContext: SQLContext)
+    extends Sink {
+
+  private val context: KuduContext =
+    new KuduContext(masterAddrs, sqlContext.sparkContext)
+
+  override def addBatch(batchId: Long, data: DataFrame): Unit = {
+    context.writeRows(data, tableName, operationType, writeOptions)
+  }
 }

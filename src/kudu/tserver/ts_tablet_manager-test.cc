@@ -23,10 +23,13 @@
 #include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/common/common.pb.h"
+#include "kudu/common/partial_row.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/schema.h"
 #include "kudu/consensus/metadata.pb.h"
@@ -36,8 +39,11 @@
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/master/master.pb.h"
-#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/local_tablet_writer.h"
+#include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet-harness.h"
+#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/heartbeater.h"
 #include "kudu/tserver/mini_tablet_server.h"
@@ -49,11 +55,13 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+DECLARE_int32(update_tablet_metrics_interval_ms);
+
 #define ASSERT_REPORT_HAS_UPDATED_TABLET(report, tablet_id) \
-  ASSERT_NO_FATAL_FAILURE(AssertReportHasUpdatedTablet(report, tablet_id))
+  NO_FATALS(AssertReportHasUpdatedTablet(report, tablet_id))
 
 #define ASSERT_MONOTONIC_REPORT_SEQNO(report_seqno, tablet_report) \
-  ASSERT_NO_FATAL_FAILURE(AssertMonotonicReportSeqno(report_seqno, tablet_report))
+  NO_FATALS(AssertMonotonicReportSeqno(report_seqno, tablet_report))
 
 using std::string;
 using std::vector;
@@ -69,15 +77,14 @@ using consensus::RaftConfigPB;
 using master::ReportedTabletPB;
 using master::TabletReportPB;
 using pb_util::SecureShortDebugString;
+using tablet::LocalTabletWriter;
+using tablet::Tablet;
 using tablet::TabletReplica;
-
-static const char* const kTabletId = "ffffffffffffffffffffffffffffffff";
-
 
 class TsTabletManagerTest : public KuduTest {
  public:
   TsTabletManagerTest()
-    : schema_({ ColumnSchema("key", UINT32) }, 1) {
+    : schema_({ ColumnSchema("key", INT32) }, 1) {
   }
 
   virtual void SetUp() OVERRIDE {
@@ -100,6 +107,8 @@ class TsTabletManagerTest : public KuduTest {
 
   Status CreateNewTablet(const std::string& tablet_id,
                          const Schema& schema,
+                         boost::optional<TableExtraConfigPB> extra_config,
+                         boost::optional<std::string> dimension_label,
                          scoped_refptr<tablet::TabletReplica>* out_tablet_replica) {
     Schema full_schema = SchemaBuilder(schema).Build();
     std::pair<PartitionSchema, Partition> partition = tablet::CreateDefaultPartition(full_schema);
@@ -109,6 +118,8 @@ class TsTabletManagerTest : public KuduTest {
                                                    tablet_id,
                                                    full_schema, partition.first,
                                                    config_,
+                                                   std::move(extra_config),
+                                                   std::move(dimension_label),
                                                    &tablet_replica));
     if (out_tablet_replica) {
       (*out_tablet_replica) = tablet_replica;
@@ -136,6 +147,15 @@ class TsTabletManagerTest : public KuduTest {
     heartbeater_->MarkTabletReportsAcknowledgedForTests({ report });
   }
 
+  void InsertTestRows(Tablet* tablet, int64_t count) {
+    LocalTabletWriter writer(tablet, &schema_);
+    KuduPartialRow row(&schema_);
+    for (int64_t i = 0; i < count; i++) {
+      ASSERT_OK(row.SetInt32(0, i));
+      ASSERT_OK(writer.Insert(row));
+    }
+  }
+
  protected:
   gscoped_ptr<MiniTabletServer> mini_server_;
   FsManager* fs_manager_;
@@ -147,11 +167,24 @@ class TsTabletManagerTest : public KuduTest {
 };
 
 TEST_F(TsTabletManagerTest, TestCreateTablet) {
+  string tablet1 = "0fffffffffffffffffffffffffffffff";
+  string tablet2 = "1fffffffffffffffffffffffffffffff";
+  scoped_refptr<TabletReplica> replica1;
+  scoped_refptr<TabletReplica> replica2;
+  TableExtraConfigPB extra_config;
+  extra_config.set_history_max_age_sec(7200);
+
   // Create a new tablet.
-  scoped_refptr<TabletReplica> replica;
-  ASSERT_OK(CreateNewTablet(kTabletId, schema_, &replica));
-  ASSERT_EQ(kTabletId, replica->tablet()->tablet_id());
-  replica.reset();
+  ASSERT_OK(CreateNewTablet(tablet1, schema_, boost::none, boost::none, &replica1));
+  // Create a new tablet with extra config.
+  ASSERT_OK(CreateNewTablet(tablet2, schema_, extra_config, boost::none, &replica2));
+  ASSERT_EQ(tablet1, replica1->tablet()->tablet_id());
+  ASSERT_EQ(tablet2, replica2->tablet()->tablet_id());
+  ASSERT_EQ(boost::none, replica1->tablet()->metadata()->extra_config());
+  ASSERT_NE(boost::none, replica2->tablet()->metadata()->extra_config());
+  ASSERT_EQ(7200, replica2->tablet()->metadata()->extra_config()->history_max_age_sec());
+  replica1.reset();
+  replica2.reset();
 
   // Re-load the tablet manager from the filesystem.
   LOG(INFO) << "Shutting down tablet manager";
@@ -164,8 +197,13 @@ TEST_F(TsTabletManagerTest, TestCreateTablet) {
   tablet_manager_ = mini_server_->server()->tablet_manager();
 
   // Ensure that the tablet got re-loaded and re-opened off disk.
-  ASSERT_TRUE(tablet_manager_->LookupTablet(kTabletId, &replica));
-  ASSERT_EQ(kTabletId, replica->tablet()->tablet_id());
+  ASSERT_TRUE(tablet_manager_->LookupTablet(tablet1, &replica1));
+  ASSERT_TRUE(tablet_manager_->LookupTablet(tablet2, &replica2));
+  ASSERT_EQ(tablet1, replica1->tablet()->tablet_id());
+  ASSERT_EQ(tablet2, replica2->tablet()->tablet_id());
+  ASSERT_EQ(boost::none, replica1->tablet()->metadata()->extra_config());
+  ASSERT_NE(boost::none, replica2->tablet()->metadata()->extra_config());
+  ASSERT_EQ(7200, replica2->tablet()->metadata()->extra_config()->history_max_age_sec());
 }
 
 static void AssertMonotonicReportSeqno(int64_t* report_seqno,
@@ -219,7 +257,7 @@ TEST_F(TsTabletManagerTest, TestTabletReports) {
   MarkTabletReportAcknowledged(report);
 
   // Create a tablet and do another incremental report - should include the tablet.
-  ASSERT_OK(CreateNewTablet("tablet-1", schema_, nullptr));
+  ASSERT_OK(CreateNewTablet("tablet-1", schema_, boost::none, boost::none, nullptr));
   int updated_tablets = 0;
   while (updated_tablets != 1) {
     GenerateIncrementalTabletReport(&report);
@@ -227,7 +265,6 @@ TEST_F(TsTabletManagerTest, TestTabletReports) {
     ASSERT_TRUE(report.is_incremental());
     ASSERT_MONOTONIC_REPORT_SEQNO(&seqno, report);
   }
-
   ASSERT_REPORT_HAS_UPDATED_TABLET(report, "tablet-1");
 
   // If we don't acknowledge the report, and ask for another incremental report,
@@ -247,7 +284,7 @@ TEST_F(TsTabletManagerTest, TestTabletReports) {
   MarkTabletReportAcknowledged(report);
 
   // Create a second tablet, and ensure the incremental report shows it.
-  ASSERT_OK(CreateNewTablet("tablet-2", schema_, nullptr));
+  ASSERT_OK(CreateNewTablet("tablet-2", schema_, boost::none, boost::none, nullptr));
 
   // Wait up to 10 seconds to get a tablet report from tablet-2.
   // TabletReplica does not mark tablets dirty until after it commits the
@@ -285,6 +322,74 @@ TEST_F(TsTabletManagerTest, TestTabletReports) {
   ASSERT_REPORT_HAS_UPDATED_TABLET(report, "tablet-1");
   ASSERT_REPORT_HAS_UPDATED_TABLET(report, "tablet-2");
   ASSERT_MONOTONIC_REPORT_SEQNO(&seqno, report);
+}
+
+TEST_F(TsTabletManagerTest, TestTabletStatsReports) {
+  TabletReportPB report;
+  int64_t seqno = -1;
+  const int64_t kCount = 12;
+
+  // 1. Create two tablets.
+  scoped_refptr<tablet::TabletReplica> replica1;
+  ASSERT_OK(CreateNewTablet("tablet-1", schema_, boost::none, boost::none, &replica1));
+  ASSERT_OK(CreateNewTablet("tablet-2", schema_, boost::none, boost::none, nullptr));
+
+  // 2. Do a full report - should include these two tablets but statistics are all zero.
+  NO_FATALS(GenerateFullTabletReport(&report));
+  ASSERT_FALSE(report.is_incremental());
+  ASSERT_EQ(2, report.updated_tablets().size());
+  ASSERT_FALSE(report.updated_tablets(0).has_stats());
+  ASSERT_FALSE(report.updated_tablets(1).has_stats());
+  ASSERT_MONOTONIC_REPORT_SEQNO(&seqno, report);
+  MarkTabletReportAcknowledged(report);
+
+  // 3. Trigger updates to tablet statistics as soon as possible.
+  tablet_manager_->SetNextUpdateTimeForTests();
+  heartbeater_->TriggerASAP();
+
+  // Do an incremental report - should include these two tablets and tablet statistics.
+  ASSERT_EVENTUALLY([&] () {
+    NO_FATALS(GenerateIncrementalTabletReport(&report));
+    ASSERT_TRUE(report.is_incremental());
+    ASSERT_EQ(2, report.updated_tablets().size());
+  });
+  ASSERT_MONOTONIC_REPORT_SEQNO(&seqno, report);
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_TRUE(report.updated_tablets(i).has_stats());
+    ASSERT_GT(report.updated_tablets(i).stats().on_disk_size(), 0);
+    ASSERT_EQ(0, report.updated_tablets(i).stats().live_row_count());
+  }
+  ASSERT_REPORT_HAS_UPDATED_TABLET(report, "tablet-1");
+  ASSERT_REPORT_HAS_UPDATED_TABLET(report, "tablet-2");
+  MarkTabletReportAcknowledged(report);
+
+  // Clean the pending dirty tablets that are not acknowledged since the seqno race.
+  ASSERT_EVENTUALLY([&] () {
+    NO_FATALS(GenerateIncrementalTabletReport(&report));
+    ASSERT_TRUE(report.is_incremental());
+    MarkTabletReportAcknowledged(report);
+    ASSERT_EQ(0, report.updated_tablets().size());
+  });
+  ASSERT_MONOTONIC_REPORT_SEQNO(&seqno, report);
+
+  // 4. Write some test rows to 'tablet-1'.
+  NO_FATALS(InsertTestRows(replica1->tablet(), kCount));
+
+  // Trigger updates to tablet statistics as soon as possible again.
+  tablet_manager_->SetNextUpdateTimeForTests();
+  heartbeater_->TriggerASAP();
+
+  // Do an incremental report - should include the tablet and tablet statistics.
+  ASSERT_EVENTUALLY([&] () {
+    NO_FATALS(GenerateIncrementalTabletReport(&report));
+    ASSERT_TRUE(report.is_incremental());
+    ASSERT_EQ(1, report.updated_tablets().size());
+  });
+  ASSERT_MONOTONIC_REPORT_SEQNO(&seqno, report);
+  ASSERT_GT(report.updated_tablets(0).stats().on_disk_size(), 0);
+  ASSERT_EQ(kCount, report.updated_tablets(0).stats().live_row_count());
+  ASSERT_REPORT_HAS_UPDATED_TABLET(report, "tablet-1");
+  MarkTabletReportAcknowledged(report);
 }
 
 } // namespace tserver

@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
 import static org.junit.Assert.assertEquals;
@@ -26,12 +27,17 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import com.google.common.collect.Lists;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
-import com.google.common.collect.Lists;
+import org.apache.kudu.test.junit.RetryRule;
 
 public class TestRequestTracker {
+
+  @Rule
+  public RetryRule retryRule = new RetryRule();
 
   @Test(timeout = 10000)
   public void test() {
@@ -84,6 +90,7 @@ public class TestRequestTracker {
 
   private static class Checker {
     long curIncomplete = 0;
+
     public synchronized void check(long seqNo, long firstIncomplete) {
       Assert.assertTrue("should not send a seq number that was previously marked complete",
           seqNo >= curIncomplete);

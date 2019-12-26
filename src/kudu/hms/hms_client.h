@@ -57,12 +57,14 @@ class HmsClient {
  public:
 
   static const char* const kExternalTableKey;
+  static const char* const kExternalPurgeKey;
   static const char* const kLegacyKuduStorageHandler;
-  static const char* const kLegacyKuduTableNameKey;
   static const char* const kLegacyTablePrefix;
   static const char* const kKuduTableIdKey;
+  static const char* const kKuduTableNameKey;
   static const char* const kKuduMasterAddrsKey;
-  static const char* const kKuduMasterEventKey;;
+  static const char* const kKuduMasterEventKey;
+  static const char* const kKuduCheckIdKey;
   static const char* const kStorageHandlerKey;
   static const char* const kKuduStorageHandler;
   static const char* const kHiveFilterFieldParams;
@@ -169,6 +171,9 @@ class HmsClient {
                                int32_t max_events,
                                std::vector<hive::NotificationEvent>* events) WARN_UNUSED_RESULT;
 
+  // Get the HMS's UUID (see HmsCatalog::GetUuid).
+  Status GetUuid(std::string* uuid) WARN_UNUSED_RESULT;
+
   // Adds partitions to an HMS table.
   Status AddPartitions(const std::string& database_name,
                        const std::string& table_name,
@@ -178,6 +183,14 @@ class HmsClient {
   Status GetPartitions(const std::string& database_name,
                        const std::string& table_name,
                        std::vector<hive::Partition>* partitions) WARN_UNUSED_RESULT;
+
+  // Returns true if the HMS table is a Kudu table.
+  static bool IsKuduTable(const hive::Table& table) WARN_UNUSED_RESULT;
+
+  // Returns if the HMS table should be synchronized.
+  // Returns true if the HMS table is a managed table or
+  // if the HMS is an external table with `external.table.purge = true`.
+  static bool IsSynchronized(const hive::Table& table) WARN_UNUSED_RESULT;
 
   // Deserializes a JSON encoded table.
   //
@@ -189,6 +202,7 @@ class HmsClient {
   static Status DeserializeJsonTable(Slice json, hive::Table* table) WARN_UNUSED_RESULT;
 
  private:
+  bool verify_kudu_sync_config_;
   hive::ThriftHiveMetastoreClient client_;
 };
 } // namespace hms

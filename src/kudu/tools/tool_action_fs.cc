@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "kudu/tools/tool_action.h"
-
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
@@ -31,7 +29,6 @@
 #include <boost/container/vector.hpp>
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #include "kudu/cfile/cfile.pb.h"
@@ -52,7 +49,6 @@
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
-#include "kudu/gutil/strings/ascii_ctype.h"
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/numbers.h"
@@ -63,9 +59,11 @@
 #include "kudu/tablet/delta_stats.h"
 #include "kudu/tablet/deltafile.h"
 #include "kudu/tablet/diskrowset.h"
+#include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/rowset_metadata.h"
 #include "kudu/tablet/tablet.pb.h"
 #include "kudu/tablet/tablet_metadata.h"
+#include "kudu/tools/tool_action.h"
 #include "kudu/tools/tool_action_common.h"
 #include "kudu/util/compression/compression.pb.h"
 #include "kudu/util/env.h"
@@ -74,6 +72,7 @@
 #include "kudu/util/pb_util.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
+#include "kudu/util/string_case.h"
 
 DECLARE_bool(force);
 DECLARE_bool(print_meta);
@@ -108,7 +107,7 @@ using cfile::CFileIterator;
 using cfile::CFileReader;
 using cfile::ReaderOptions;
 using fs::BlockDeletionTransaction;
-using fs::ConsistencyCheckBehavior;
+using fs::UpdateInstanceBehavior;
 using fs::FsReport;
 using fs::ReadableBlock;
 using std::cout;
@@ -120,6 +119,7 @@ using std::unordered_map;
 using std::vector;
 using strings::Substitute;
 using tablet::RowSetMetadata;
+using tablet::TabletDataState;
 using tablet::TabletMetadata;
 
 namespace {
@@ -127,6 +127,7 @@ namespace {
 Status Check(const RunnerContext& /*context*/) {
   FsManagerOpts fs_opts;
   fs_opts.read_only = !FLAGS_repair;
+  fs_opts.update_instances = UpdateInstanceBehavior::DONT_UPDATE;
   FsManager fs_manager(Env::Default(), std::move(fs_opts));
   FsReport report;
   RETURN_NOT_OK(fs_manager.Open(&report));
@@ -139,14 +140,14 @@ Status Check(const RunnerContext& /*context*/) {
   }
 
   // Get the "live" block IDs (i.e. those referenced by a tablet).
-  vector<BlockId> live_block_ids;
+  BlockIdContainer live_block_ids;
   unordered_map<BlockId, string, BlockIdHash, BlockIdEqual> live_block_id_to_tablet;
   vector<string> tablet_ids;
   RETURN_NOT_OK(fs_manager.ListTabletIds(&tablet_ids));
   for (const auto& t : tablet_ids) {
     scoped_refptr<TabletMetadata> meta;
     RETURN_NOT_OK(TabletMetadata::Load(&fs_manager, t, &meta));
-    vector<BlockId> tablet_live_block_ids = meta->CollectBlockIds();
+    BlockIdContainer tablet_live_block_ids = meta->CollectBlockIds();
     live_block_ids.insert(live_block_ids.end(),
                           tablet_live_block_ids.begin(),
                           tablet_live_block_ids.end());
@@ -231,8 +232,9 @@ Status Format(const RunnerContext& /*context*/) {
 Status DumpUuid(const RunnerContext& /*context*/) {
   FsManagerOpts fs_opts;
   fs_opts.read_only = true;
+  fs_opts.update_instances = UpdateInstanceBehavior::DONT_UPDATE;
   FsManager fs_manager(Env::Default(), std::move(fs_opts));
-  RETURN_NOT_OK(fs_manager.Open());
+  RETURN_NOT_OK(fs_manager.PartialOpen());
   cout << fs_manager.uuid() << endl;
   return Status::OK();
 }
@@ -255,6 +257,7 @@ Status DumpCFile(const RunnerContext& context) {
 
   FsManagerOpts fs_opts;
   fs_opts.read_only = true;
+  fs_opts.update_instances = UpdateInstanceBehavior::DONT_UPDATE;
   FsManager fs_manager(Env::Default(), std::move(fs_opts));
   RETURN_NOT_OK(fs_manager.Open());
 
@@ -270,7 +273,7 @@ Status DumpCFile(const RunnerContext& context) {
   }
 
   if (FLAGS_print_rows) {
-    gscoped_ptr<CFileIterator> it;
+    unique_ptr<CFileIterator> it;
     RETURN_NOT_OK(reader->NewIterator(&it, CFileReader::DONT_CACHE_BLOCK, nullptr));
     RETURN_NOT_OK(it->SeekToFirst());
 
@@ -286,6 +289,7 @@ Status DumpBlock(const RunnerContext& context) {
 
   FsManagerOpts fs_opts;
   fs_opts.read_only = true;
+  fs_opts.update_instances = UpdateInstanceBehavior::DONT_UPDATE;
   FsManager fs_manager(Env::Default(), std::move(fs_opts));
   RETURN_NOT_OK(fs_manager.Open());
 
@@ -312,6 +316,7 @@ Status DumpBlock(const RunnerContext& context) {
 Status DumpFsTree(const RunnerContext& /*context*/) {
   FsManagerOpts fs_opts;
   fs_opts.read_only = true;
+  fs_opts.update_instances = UpdateInstanceBehavior::DONT_UPDATE;
   FsManager fs_manager(Env::Default(), std::move(fs_opts));
   RETURN_NOT_OK(fs_manager.Open());
 
@@ -322,7 +327,7 @@ Status DumpFsTree(const RunnerContext& /*context*/) {
 Status CheckForTabletsThatWillFailWithUpdate() {
   FsManagerOpts opts;
   opts.read_only = true;
-  opts.consistency_check = ConsistencyCheckBehavior::IGNORE_INCONSISTENCY;
+  opts.update_instances = UpdateInstanceBehavior::DONT_UPDATE;
   FsManager fs(Env::Default(), std::move(opts));
   RETURN_NOT_OK(fs.Open());
 
@@ -332,9 +337,15 @@ Status CheckForTabletsThatWillFailWithUpdate() {
     scoped_refptr<TabletMetadata> meta;
     RETURN_NOT_OK(TabletMetadata::Load(&fs, t, &meta));
     DataDirGroupPB group;
-    RETURN_NOT_OK_PREPEND(
-        fs.dd_manager()->GetDataDirGroupPB(t, &group),
-        "at least one tablet is configured to use removed data directory. "
+    Status s = fs.dd_manager()->GetDataDirGroupPB(t, &group);
+    if (meta->tablet_data_state() == TabletDataState::TABLET_DATA_TOMBSTONED) {
+      // If we just loaded a tombstoned tablet, there should be no in-memory
+      // data dir group for the tablet, and the staged directory config won't
+      // affect this tablet.
+      DCHECK(s.IsNotFound()) << s.ToString();
+      continue;
+    }
+    RETURN_NOT_OK_PREPEND(s, "at least one tablet is configured to use removed data directory. "
         "Retry with --force to override this");
   }
   return Status::OK();
@@ -361,7 +372,7 @@ Status Update(const RunnerContext& /*context*/) {
 
   // Now perform the update.
   FsManagerOpts opts;
-  opts.consistency_check = ConsistencyCheckBehavior::UPDATE_ON_DISK;
+  opts.update_instances = UpdateInstanceBehavior::UPDATE_AND_ERROR_ON_FAILURE;
   FsManager fs(env, std::move(opts));
   return fs.Open();
 }
@@ -482,11 +493,6 @@ const char* ToString(FieldGroup group) {
     case FieldGroup::kCFile: return "cfile";
     default: LOG(FATAL) << "unhandled field group (this is a bug)";
   }
-}
-
-// Transforms an ASCII string to lowercase.
-void ToLowerCase(string* string) {
-  std::transform(string->begin(), string->end(), string->begin(), ascii_tolower);
 }
 
 // Parses a field name and returns the corresponding enum variant.
@@ -703,7 +709,7 @@ Status List(const RunnerContext& /*context*/) {
   vector<Field> fields;
   vector<string> columns;
   for (StringPiece name : strings::Split(FLAGS_columns, ",", strings::SkipEmpty())) {
-    Field field;
+    Field field = Field::kTable;
     RETURN_NOT_OK(ParseField(name.ToString(), &field));
     fields.push_back(field);
     columns.emplace_back(ToString(field));
@@ -716,6 +722,7 @@ Status List(const RunnerContext& /*context*/) {
 
   FsManagerOpts fs_opts;
   fs_opts.read_only = true;
+  fs_opts.update_instances = UpdateInstanceBehavior::DONT_UPDATE;
   FsManager fs_manager(Env::Default(), std::move(fs_opts));
   RETURN_NOT_OK(fs_manager.Open());
 
@@ -874,7 +881,10 @@ unique_ptr<Mode> BuildFsMode() {
       ActionBuilder("update_dirs", &Update)
       .Description("Updates the set of data directories in an existing Kudu filesystem")
       .ExtraDescription("If a data directory is in use by a tablet and is "
-          "removed, the operation will fail unless --force is also used")
+          "removed, the operation will fail unless --force is also used. "
+          "Starting with Kudu 1.12.0, it is not required to run this tool "
+          "to add or remove directories. This tool is preserved for backwards "
+          "compatibility")
       .AddOptionalParameter("force", boost::none, string("If true, permits "
           "the removal of a data directory that is configured for use by "
           "existing tablets. Those tablets will fail the next time the server "

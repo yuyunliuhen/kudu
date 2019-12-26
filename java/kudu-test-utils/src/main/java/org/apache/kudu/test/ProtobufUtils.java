@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.test;
 
 import com.google.protobuf.ByteString;
@@ -40,25 +41,34 @@ public class ProtobufUtils {
   }
 
   /**
-   * Create a ReplicaPB based on the passed information.
+   * Create a InternedReplicaPB based on the passed information.
+   * @param tsInfoIndex server's index in the TSInfoPB list
+   * @param role server's role in the configuration
+   * @return a fake InternedReplicaPB
+   */
+  public static Master.TabletLocationsPB.InternedReplicaPB.Builder getFakeTabletInternedReplicaPB(
+      int tsInfoIndex,  Metadata.RaftPeerPB.Role role) {
+    Master.TabletLocationsPB.InternedReplicaPB.Builder internedReplicaBuilder =
+        Master.TabletLocationsPB.InternedReplicaPB.newBuilder();
+    internedReplicaBuilder.setTsInfoIdx(tsInfoIndex);
+    internedReplicaBuilder.setRole(role);
+    return internedReplicaBuilder;
+  }
+
+  /**
+   * Create a TSInfoPB based on the passed information.
    * @param uuid server's identifier
    * @param host server's hostname
    * @param port server's port
-   * @param role server's role in the configuration
-   * @return a fake ReplicaPB
+   * @return a fake TSInfoPB
    */
-  public static Master.TabletLocationsPB.ReplicaPB.Builder getFakeTabletReplicaPB(
-      String uuid, String host, int port, Metadata.RaftPeerPB.Role role) {
+  public static Master.TSInfoPB.Builder getFakeTSInfoPB(String uuid, String host, int port) {
     Master.TSInfoPB.Builder tsInfoBuilder = Master.TSInfoPB.newBuilder();
     Common.HostPortPB.Builder hostBuilder = Common.HostPortPB.newBuilder();
     hostBuilder.setHost(host);
     hostBuilder.setPort(port);
     tsInfoBuilder.addRpcAddresses(hostBuilder);
     tsInfoBuilder.setPermanentUuid(ByteString.copyFromUtf8(uuid));
-    Master.TabletLocationsPB.ReplicaPB.Builder replicaBuilder =
-        Master.TabletLocationsPB.ReplicaPB.newBuilder();
-    replicaBuilder.setTsInfo(tsInfoBuilder);
-    replicaBuilder.setRole(role);
-    return replicaBuilder;
+    return tsInfoBuilder;
   }
 }

@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
 import static org.junit.Assert.assertEquals;
@@ -24,24 +25,31 @@ import java.math.BigDecimal;
 import java.util.List;
 
 import com.google.common.collect.Lists;
+import org.junit.Rule;
 import org.junit.Test;
 
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.ColumnTypeAttributes;
 import org.apache.kudu.Type;
+import org.apache.kudu.test.junit.RetryRule;
 import org.apache.kudu.tserver.Tserver;
 
 public class TestColumnRangePredicate {
 
-  @Test
-  public void testRawLists() {
-    ColumnSchema col1 = new ColumnSchema.ColumnSchemaBuilder("col1", Type.INT32).build();
-    ColumnSchema col2 = new ColumnSchema.ColumnSchemaBuilder("col2", Type.STRING).build();
+  @Rule
+  public RetryRule retryRule = new RetryRule();
 
-    ColumnSchema col3 = new ColumnSchema.ColumnSchemaBuilder("col3", Type.DECIMAL)
+  @Test
+  @SuppressWarnings("deprecation")
+  public void testRawLists() {
+    final ColumnSchema col1 =
+        new ColumnSchema.ColumnSchemaBuilder("col1", Type.INT32).build();
+    final ColumnSchema col2 =
+        new ColumnSchema.ColumnSchemaBuilder("col2", Type.STRING).build();
+
+    final ColumnSchema col3 = new ColumnSchema.ColumnSchemaBuilder("col3", Type.DECIMAL)
         .typeAttributes(new ColumnTypeAttributes.ColumnTypeAttributesBuilder()
-            .precision(6).scale(2).build()
-        ).build();
+            .precision(6).scale(2).build()).build();
 
     ColumnRangePredicate pred1 = new ColumnRangePredicate(col1);
     pred1.setLowerBound(1);
@@ -74,12 +82,15 @@ public class TestColumnRangePredicate {
     assertFalse(decodedPreds.get(0).hasInclusiveUpperBound());
 
     assertEquals(col1.getName(), decodedPreds.get(1).getColumn().getName());
-    assertEquals(2, Bytes.getInt(decodedPreds.get(1).getInclusiveUpperBound().toByteArray()));
+    assertEquals(2,
+        Bytes.getInt(decodedPreds.get(1).getInclusiveUpperBound().toByteArray()));
     assertFalse(decodedPreds.get(1).hasLowerBound());
 
     assertEquals(col2.getName(), decodedPreds.get(2).getColumn().getName());
-    assertEquals("aaa", Bytes.getString(decodedPreds.get(2).getLowerBound().toByteArray()));
-    assertEquals("bbb", Bytes.getString(decodedPreds.get(2).getInclusiveUpperBound().toByteArray()));
+    assertEquals("aaa",
+        Bytes.getString(decodedPreds.get(2).getLowerBound().toByteArray()));
+    assertEquals("bbb",
+        Bytes.getString(decodedPreds.get(2).getInclusiveUpperBound().toByteArray()));
 
     assertEquals(col3.getName(), decodedPreds.get(3).getColumn().getName());
     assertEquals(12345, Bytes.getInt(decodedPreds.get(3).getLowerBound().toByteArray()));

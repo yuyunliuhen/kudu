@@ -19,17 +19,35 @@ apply from: "$rootDir/gradle/shadow.gradle"
 
 dependencies {
   compile project(path: ":kudu-client")
+  compile libs.commonsIo
   compile libs.guava
+  compile libs.httpClient
+  compile libs.httpMime
+  compile libs.osdetector
 
-  compileUnshaded libs.junit
+  compileUnshaded libs.hamcrest
+  compileUnshaded(libs.junit) {
+    // Use the Kudu specified hamcrest.
+    exclude group: "org.hamcrest"
+  }
   compileUnshaded libs.slf4jApi
+
+  // Support using any kudu-binary jar for tests via `-PuseBinJar=<version>`.
+  if (propertyExists("useBinJar")) {
+    apply plugin: "com.google.osdetector"
+    def jarVersion = propertyWithDefault("useBinJar", project.version)
+    runtime "org.apache.kudu:kudu-binary:$jarVersion:${osdetector.classifier}"
+  }
 
   // Needed for CapturingLogAppender. Optional otherwise.
   optional libs.log4j
-  optional libs.slf4jLog4j12
+  optional libs.log4jSlf4jImpl
 
   optional libs.jsr305
   optional libs.yetusAnnotations
+
+  testCompile libs.jetty
+  testCompile libs.jettyServlet
 }
 
 // kudu-test-utils has no public Javadoc.

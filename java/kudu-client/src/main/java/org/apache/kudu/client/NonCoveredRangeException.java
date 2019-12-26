@@ -23,7 +23,7 @@ import org.apache.yetus.audience.InterfaceAudience;
  * Exception indicating that an operation attempted to access a non-covered range partition.
  */
 @InterfaceAudience.Private
-class NonCoveredRangeException extends NonRecoverableException {
+public class NonCoveredRangeException extends NonRecoverableException {
   private final byte[] nonCoveredRangeStart;
   private final byte[] nonCoveredRangeEnd;
 
@@ -42,9 +42,8 @@ class NonCoveredRangeException extends NonRecoverableException {
   }
 
   @Override
-  public String toString() {
-    return String.format(
-        "NonCoveredRangeException([%s, %s))",
+  public String getMessage() {
+    return String.format("([%s, %s))",
         nonCoveredRangeStart.length == 0 ? "<start>" : Bytes.hex(nonCoveredRangeStart),
         nonCoveredRangeEnd.length == 0 ? "<end>" : Bytes.hex(nonCoveredRangeEnd));
   }

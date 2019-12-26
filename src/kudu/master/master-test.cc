@@ -17,6 +17,8 @@
 
 #include "kudu/master/master.h"
 
+#include <time.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <map>
@@ -50,10 +52,11 @@
 #include "kudu/gutil/dynamic_annotations.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
-#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
+#include "kudu/gutil/walltime.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
@@ -67,7 +70,9 @@
 #include "kudu/security/tls_context.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/security/token_verifier.h"
+#include "kudu/server/monitored_task.h"
 #include "kudu/server/rpc_server.h"
+#include "kudu/tablet/metadata.pb.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/curl_util.h"
@@ -102,10 +107,14 @@ using std::vector;
 using strings::Substitute;
 
 DECLARE_bool(catalog_manager_check_ts_count_for_create_table);
+DECLARE_bool(master_support_authz_tokens);
+DECLARE_bool(mock_table_metrics_for_testing);
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_double(sys_catalog_fail_during_write);
 DECLARE_int32(diagnostics_log_stack_traces_interval_ms);
 DECLARE_int32(master_inject_latency_on_tablet_lookups_ms);
+DECLARE_int64(live_row_count_for_testing);
+DECLARE_int64(on_disk_size_for_testing);
 DECLARE_string(location_mapping_cmd);
 
 namespace kudu {
@@ -113,7 +122,7 @@ namespace master {
 
 class MasterTest : public KuduTest {
  protected:
-  virtual void SetUp() OVERRIDE {
+  void SetUp() override {
     KuduTest::SetUp();
 
     // In this test, we create tables to test catalog manager behavior,
@@ -134,7 +143,7 @@ class MasterTest : public KuduTest {
                                         mini_master_->bound_rpc_addr().host()));
   }
 
-  virtual void TearDown() OVERRIDE {
+  void TearDown() override {
     mini_master_->Shutdown();
     KuduTest::TearDown();
   }
@@ -209,6 +218,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
   MakeHostPortPB("localhost", 1000, fake_reg.add_rpc_addresses());
   MakeHostPortPB("localhost", 2000, fake_reg.add_http_addresses());
   fake_reg.set_software_version(VersionInfo::GetVersionInfo());
+  fake_reg.set_start_time(10000);
 
   // Information on replica management scheme.
   ReplicaManagementInfoPB rmi;
@@ -362,7 +372,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     EasyCurl c;
     faststring buf;
     string addr = mini_master_->bound_http_addr().ToString();
-    ASSERT_OK(c.FetchURL(Substitute("http://$0/dump-entities", addr), &buf))
+    ASSERT_OK(c.FetchURL(Substitute("http://$0/dump-entities", addr), &buf));
     rapidjson::Document doc;
     doc.Parse<0>(buf.ToString().c_str());
     const rapidjson::Value& tablet_servers = doc["tablet_servers"];
@@ -377,6 +387,9 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     ASSERT_EQ(true, tablet_server["live"].GetBool());
     ASSERT_STREQ(VersionInfo::GetVersionInfo().c_str(),
         tablet_server["version"].GetString());
+    string start_time;
+    StringAppendStrftime(&start_time, "%Y-%m-%d %H:%M:%S %Z", static_cast<time_t>(10000), true);
+    ASSERT_STREQ(start_time.c_str(), tablet_server["start_time"].GetString());
   }
 
   // Ensure that trying to re-register with a different version is OK.
@@ -391,6 +404,22 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     // the numeric portion will match.
     req.mutable_registration()->set_software_version(Substitute("kudu $0 (rev SOME_NON_GIT_HASH)",
                                                                 KUDU_VERSION_STRING));
+
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+    ASSERT_FALSE(resp.has_error());
+  }
+
+  // Ensure that trying to re-register with a different start_time is OK.
+  {
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    RpcController rpc;
+    req.mutable_common()->CopyFrom(common);
+    req.mutable_registration()->CopyFrom(fake_reg);
+    req.mutable_replica_management_info()->CopyFrom(rmi);
+    // 10 minutes later.
+    req.mutable_registration()->set_start_time(10600);
+
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
     ASSERT_FALSE(resp.has_error());
   }
@@ -449,6 +478,11 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     // Set a command that always fails.
     FLAGS_location_mapping_cmd = "false";
 
+    // Restarting the master to take into account the new setting for the
+    // --location_mapping_cmd flag.
+    mini_master_->Shutdown();
+    ASSERT_OK(mini_master_->Restart());
+
     // Set a new UUID so registration is for the first time.
     auto new_common = common;
     new_common.mutable_ts_instance()->set_permanent_uuid("lmc-fail-ts");
@@ -462,7 +496,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
 
     // Registration should fail.
     Status s = proxy_->TSHeartbeat(hb_req, &hb_resp, &rpc);
-    ASSERT_TRUE(s.IsRemoteError());
+    ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(), "failed to run location mapping command");
 
     // Make sure the tablet server isn't returned to clients.
@@ -473,11 +507,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
 
     LOG(INFO) << SecureDebugString(list_ts_resp);
     ASSERT_FALSE(list_ts_resp.has_error());
-    ASSERT_EQ(1, list_ts_resp.servers_size());
-    ASSERT_EQ("my-ts-uuid", list_ts_resp.servers(0).instance_id().permanent_uuid());
-
-    // Reset the flag.
-    FLAGS_location_mapping_cmd = "";
+    ASSERT_EQ(0, list_ts_resp.servers_size());
   }
 }
 
@@ -546,7 +576,7 @@ TEST_F(MasterTest, TestCatalog) {
   ASSERT_OK(CreateTable(kTableName, kTableSchema));
 
   ListTablesResponsePB tables;
-  ASSERT_NO_FATAL_FAILURE(DoListAllTables(&tables));
+  NO_FATALS(DoListAllTables(&tables));
   ASSERT_EQ(1, tables.tables_size());
   ASSERT_EQ(kTableName, tables.tables(0).name());
 
@@ -562,7 +592,7 @@ TEST_F(MasterTest, TestCatalog) {
   }
 
   // List tables, should show no table
-  ASSERT_NO_FATAL_FAILURE(DoListAllTables(&tables));
+  NO_FATALS(DoListAllTables(&tables));
   ASSERT_EQ(0, tables.tables_size());
 
   // Re-create the table
@@ -574,7 +604,7 @@ TEST_F(MasterTest, TestCatalog) {
   ASSERT_OK(mini_master_->master()->
       WaitUntilCatalogManagerIsLeaderAndReadyForTests(MonoDelta::FromSeconds(5)));
 
-  ASSERT_NO_FATAL_FAILURE(DoListAllTables(&tables));
+  NO_FATALS(DoListAllTables(&tables));
   ASSERT_EQ(1, tables.tables_size());
   ASSERT_EQ(kTableName, tables.tables(0).name());
 
@@ -800,6 +830,8 @@ TEST_F(MasterTest, TestVirtualColumns) {
   col = req.mutable_schema()->add_columns();
   col->set_name("bar");
   col->set_type(IS_DELETED);
+  bool read_default = true;
+  col->set_read_default_value(&read_default, sizeof(read_default));
 
   ASSERT_OK(proxy_->CreateTable(req, &resp, &controller));
   SCOPED_TRACE(SecureDebugString(resp));
@@ -1039,16 +1071,16 @@ class MasterMetadataVerifier : public TableVisitor,
       dead_table_names_(std::move(dead_table_names)) {
   }
 
-  virtual Status VisitTable(const std::string& table_id,
-                             const SysTablesEntryPB& metadata) OVERRIDE {
+  Status VisitTable(const std::string& table_id,
+                    const SysTablesEntryPB& metadata) override {
      InsertOrDie(&visited_tables_by_id_, table_id,
                  { table_id, metadata.name(), metadata.state() });
      return Status::OK();
    }
 
-  virtual Status VisitTablet(const std::string& table_id,
-                             const std::string& tablet_id,
-                             const SysTabletsEntryPB& metadata) OVERRIDE {
+  Status VisitTablet(const std::string& table_id,
+                     const std::string& tablet_id,
+                     const SysTabletsEntryPB& metadata) override {
     InsertOrDie(&visited_tablets_by_id_, tablet_id,
                 { tablet_id, table_id, metadata.state() });
     return Status::OK();
@@ -1619,6 +1651,62 @@ TEST_F(MasterTest, TestConnectToMaster) {
   ASSERT_EQ(1, resp.master_addrs_size());
   ASSERT_EQ("127.0.0.1", resp.master_addrs(0).host());
   ASSERT_NE(0, resp.master_addrs(0).port());
+
+  // The returned location should be empty because no location mapping command
+  // is defined.
+  ASSERT_TRUE(resp.client_location().empty());
+}
+
+TEST_F(MasterTest, TestConnectToMasterAndAssignLocation) {
+  // Test first with a valid location mapping command.
+  const string kLocationCmdPath = JoinPathSegments(GetTestExecutableDirectory(),
+                                                   "testdata/first_argument.sh");
+  const string location = "/foo";
+  FLAGS_location_mapping_cmd = Substitute("$0 $1", kLocationCmdPath, location);
+  {
+    // Restarting the master to take into account the new setting for the
+    // --location_mapping_cmd flag.
+    mini_master_->Shutdown();
+    ASSERT_OK(mini_master_->Restart());
+    ConnectToMasterRequestPB req;
+    ConnectToMasterResponsePB resp;
+    RpcController rpc;
+    ASSERT_OK(proxy_->ConnectToMaster(req, &resp, &rpc));
+    ASSERT_FALSE(resp.has_error());
+    ASSERT_EQ(location, resp.client_location());
+  }
+
+  // Now try again with an invalid command. The RPC should succeed but no
+  // location should be assigned.
+  FLAGS_location_mapping_cmd = "false";
+  {
+    // Restarting the master to take into account the new setting for the
+    // --location_mapping_cmd flag.
+    mini_master_->Shutdown();
+    ASSERT_OK(mini_master_->Restart());
+    ConnectToMasterRequestPB req;
+    ConnectToMasterResponsePB resp;
+    RpcController rpc;
+    ASSERT_OK(proxy_->ConnectToMaster(req, &resp, &rpc));
+    ASSERT_FALSE(resp.has_error());
+    ASSERT_TRUE(resp.client_location().empty());
+  }
+
+  // Finally, use a command returning a different location.
+  const string new_location = "/bar";
+  FLAGS_location_mapping_cmd = Substitute("$0 $1", kLocationCmdPath, new_location);
+  {
+    // Restarting the master to take into account the new setting for the
+    // --location_mapping_cmd flag.
+    mini_master_->Shutdown();
+    ASSERT_OK(mini_master_->Restart());
+    ConnectToMasterRequestPB req;
+    ConnectToMasterResponsePB resp;
+    RpcController rpc;
+    ASSERT_OK(proxy_->ConnectToMaster(req, &resp, &rpc));
+    ASSERT_FALSE(resp.has_error());
+    ASSERT_EQ(new_location, resp.client_location());
+  }
 }
 
 // Test that the master signs its on server certificate when it becomes the leader,
@@ -1637,7 +1725,7 @@ TEST_F(MasterTest, TestTableIdentifierWithIdAndName) {
   ASSERT_OK(CreateTable(kTableName, kTableSchema));
 
   ListTablesResponsePB tables;
-  ASSERT_NO_FATAL_FAILURE(DoListAllTables(&tables));
+  NO_FATALS(DoListAllTables(&tables));
   ASSERT_EQ(1, tables.tables_size());
   ASSERT_EQ(kTableName, tables.tables(0).name());
   string table_id = tables.tables(0).id();
@@ -1689,6 +1777,253 @@ TEST_F(MasterTest, TestTableIdentifierWithIdAndName) {
     ASSERT_FALSE(resp.has_error()) << resp.error().DebugString();
   }
 }
+
+TEST_F(MasterTest, TestDuplicateRequest) {
+  const char* const kTsUUID = "my-ts-uuid";
+  TSToMasterCommonPB common;
+  common.mutable_ts_instance()->set_permanent_uuid(kTsUUID);
+  common.mutable_ts_instance()->set_instance_seqno(1);
+
+  // Register the fake TS, without sending any tablet report.
+  ServerRegistrationPB fake_reg;
+  MakeHostPortPB("localhost", 1000, fake_reg.add_rpc_addresses());
+  MakeHostPortPB("localhost", 2000, fake_reg.add_http_addresses());
+  fake_reg.set_software_version(VersionInfo::GetVersionInfo());
+  fake_reg.set_start_time(10000);
+
+  // Information on replica management scheme.
+  ReplicaManagementInfoPB rmi;
+  rmi.set_replacement_scheme(ReplicaManagementInfoPB::PREPARE_REPLACEMENT_BEFORE_EVICTION);
+
+  {
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    RpcController rpc;
+    req.mutable_common()->CopyFrom(common);
+    req.mutable_registration()->CopyFrom(fake_reg);
+    req.mutable_replica_management_info()->CopyFrom(rmi);
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+
+    ASSERT_FALSE(resp.has_error());
+    ASSERT_TRUE(resp.leader_master());
+    ASSERT_FALSE(resp.needs_reregister());
+    ASSERT_FALSE(resp.needs_full_tablet_report());
+    ASSERT_FALSE(resp.has_tablet_report());
+  }
+
+  vector<shared_ptr<TSDescriptor> > descs;
+  master_->ts_manager()->GetAllDescriptors(&descs);
+  ASSERT_EQ(1, descs.size()) << "Should have registered the TS";
+  ServerRegistrationPB reg;
+  descs[0]->GetRegistration(&reg);
+  ASSERT_EQ(SecureDebugString(fake_reg), SecureDebugString(reg))
+      << "Master got different registration";
+  shared_ptr<TSDescriptor> ts_desc;
+  ASSERT_TRUE(master_->ts_manager()->LookupTSByUUID(kTsUUID, &ts_desc));
+  ASSERT_EQ(ts_desc, descs[0]);
+
+  // Create a table with three tablets.
+  const char *kTableName = "test_table";
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  vector<scoped_refptr<TableInfo>> tables;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    ASSERT_OK(master_->catalog_manager()->GetAllTables(&tables));
+    ASSERT_EQ(1, tables.size());
+  }
+
+  scoped_refptr<TableInfo> table = tables[0];
+  vector<scoped_refptr<TabletInfo>> tablets;
+  table->GetAllTablets(&tablets);
+  ASSERT_EQ(tablets.size(), 3);
+
+  // Delete the table.
+  {
+    DeleteTableRequestPB req;
+    DeleteTableResponsePB resp;
+    RpcController controller;
+    req.mutable_table()->set_table_name(kTableName);
+    ASSERT_OK(proxy_->DeleteTable(req, &resp, &controller));
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error());
+  }
+
+  // The table has no pending task.
+  // The master would not send DeleteTablet requests for no consensus state for tablets.
+  vector<scoped_refptr<MonitoredTask>> task_list;
+  tables[0]->GetTaskList(&task_list);
+  ASSERT_EQ(task_list.size(), 0);
+
+  // Now the tserver send a full report with a deleted tablet.
+  // The master will process it and send 'DeleteTablet' request to the tserver.
+  {
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    RpcController rpc;
+    req.mutable_common()->CopyFrom(common);
+    TabletReportPB* tr = req.mutable_tablet_report();
+    tr->set_is_incremental(false);
+    tr->set_sequence_number(0);
+    tr->add_updated_tablets()->set_tablet_id(tablets[0]->id());
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+    ASSERT_TRUE(resp.has_tablet_report());
+  }
+
+  // The 'DeleteTablet' task is running for the master will continue
+  // retrying to connect to the fake TS.
+  tables[0]->GetTaskList(&task_list);
+  ASSERT_EQ(task_list.size(), 1);
+  ASSERT_EQ(task_list[0]->state(), MonitoredTask::kStateRunning);
+
+  // Now the tserver send a full report with two deleted tablets.
+  // The master will not send duplicate DeleteTablet request to the tserver.
+  {
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    RpcController rpc;
+    req.mutable_common()->CopyFrom(common);
+    TabletReportPB* tr = req.mutable_tablet_report();
+    tr->set_is_incremental(true);
+    tr->set_sequence_number(0);
+    tr->add_updated_tablets()->set_tablet_id(tablets[0]->id());
+    tr->add_updated_tablets()->set_tablet_id(tablets[1]->id());
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+    ASSERT_TRUE(resp.has_tablet_report());
+  }
+
+  tables[0]->GetTaskList(&task_list);
+  ASSERT_EQ(task_list.size(), 2);
+}
+
+TEST_F(MasterTest, TestGetTableStatistics) {
+  const char *kTableName = "testtable";
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  // Get table statistics with right name.
+  GetTableStatisticsRequestPB req;
+  GetTableStatisticsResponsePB resp;
+  RpcController controller;
+  req.mutable_table()->set_table_name(kTableName);
+  ASSERT_OK(proxy_->GetTableStatistics(req, &resp, &controller));
+  ASSERT_FALSE(resp.has_error()) << resp.error().DebugString();
+  ASSERT_EQ(0, resp.on_disk_size());
+  ASSERT_EQ(0, resp.live_row_count());
+
+  FLAGS_mock_table_metrics_for_testing = true;
+  FLAGS_on_disk_size_for_testing = 1024;
+  FLAGS_live_row_count_for_testing = 100;
+  controller.Reset();
+  ASSERT_OK(proxy_->GetTableStatistics(req, &resp, &controller));
+  ASSERT_FALSE(resp.has_error()) << resp.error().DebugString();
+  ASSERT_EQ(FLAGS_on_disk_size_for_testing, resp.on_disk_size());
+  ASSERT_EQ(FLAGS_live_row_count_for_testing, resp.live_row_count());
+}
+
+TEST_F(MasterTest, TestHideLiveRowCountInTableMetrics) {
+  const char* kTableName = "testtable";
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  vector<scoped_refptr<TableInfo>> tables;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    ASSERT_OK(master_->catalog_manager()->GetAllTables(&tables));
+    ASSERT_EQ(1, tables.size());
+  }
+  vector<scoped_refptr<TabletInfo>> tablets;
+  tables[0]->GetAllTablets(&tablets);
+
+  const auto call_update_metrics = [&] (
+      scoped_refptr<TabletInfo>& tablet,
+      bool support_live_row_count) {
+    tablet::ReportedTabletStatsPB old_stats;
+    tablet::ReportedTabletStatsPB new_stats;
+    new_stats.set_on_disk_size(1);
+    if (support_live_row_count) {
+      old_stats.set_live_row_count(1);
+      new_stats.set_live_row_count(1);
+    }
+    tables[0]->UpdateMetrics(tablet->id(), old_stats, new_stats);
+  };
+
+  // Trigger to cause 'live_row_count' invisible.
+  {
+    for (int i = 0; i < 100; ++i) {
+      for (int j = 0; j < tablets.size(); ++j) {
+        NO_FATALS(call_update_metrics(tablets[j], (tablets.size() - 1 != j)));
+      }
+    }
+
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(Substitute("http://$0/metrics?ids=$1",
+                                    mini_master_->bound_http_addr().ToString(),
+                                    tables[0]->id()),
+                         &buf));
+    string raw = buf.ToString();
+    ASSERT_STR_CONTAINS(raw, kTableName);
+    ASSERT_STR_CONTAINS(raw, "on_disk_size");
+    ASSERT_STR_NOT_CONTAINS(raw, "live_row_count");
+  }
+
+  // Trigger to cause 'live_row_count' visible.
+  {
+    tables[0]->RemoveMetrics(tablets.back()->id(), tablet::ReportedTabletStatsPB());
+    for (int i = 0; i < 100; ++i) {
+      for (int j = 0; j < tablets.size(); ++j) {
+        NO_FATALS(call_update_metrics(tablets[j], true));
+      }
+    }
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(Substitute("http://$0/metrics?ids=$1",
+                                    mini_master_->bound_http_addr().ToString(),
+                                    tables[0]->id()),
+                         &buf));
+    string raw = buf.ToString();
+    ASSERT_STR_CONTAINS(raw, kTableName);
+    ASSERT_STR_CONTAINS(raw, "on_disk_size");
+    ASSERT_STR_CONTAINS(raw, "live_row_count");
+  }
+}
+
+class AuthzTokenMasterTest : public MasterTest,
+                             public ::testing::WithParamInterface<bool> {};
+
+// Some basic verifications that we get authz tokens when we expect.
+TEST_P(AuthzTokenMasterTest, TestGenerateAuthzTokens) {
+  bool supports_authz = GetParam();
+  FLAGS_master_support_authz_tokens = supports_authz;
+  const char* kTableName = "testtb";
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+  const auto send_req = [&] (GetTableSchemaResponsePB* resp) -> Status {
+    RpcController rpc;
+    GetTableSchemaRequestPB req;
+    req.mutable_table()->set_table_name(kTableName);
+    return proxy_->GetTableSchema(req, resp, &rpc);
+  };
+  // Send a request for which there is no table. Whether or not authz tokens are
+  // supported, the response should have an error.
+  {
+    GetTableSchemaResponsePB resp;
+    ASSERT_OK(send_req(&resp));
+    ASSERT_TRUE(resp.has_error());
+    const Status s = StatusFromPB(resp.error().status());
+    ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+  }
+  // Now create the table and check that we only get tokens when we expect.
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+  {
+    GetTableSchemaResponsePB resp;
+    ASSERT_OK(send_req(&resp));
+    ASSERT_EQ(supports_authz, resp.has_authz_token());
+  }
+}
+
+INSTANTIATE_TEST_CASE_P(SupportsAuthzTokens, AuthzTokenMasterTest, ::testing::Bool());
 
 } // namespace master
 } // namespace kudu

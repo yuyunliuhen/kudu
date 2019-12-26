@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/consensus/consensus_queue.h"
+
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -35,7 +37,6 @@
 #include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/consensus-test-util.h"
 #include "kudu/consensus/consensus.pb.h"
-#include "kudu/consensus/consensus_queue.h"
 #include "kudu/consensus/log-test-base.h"
 #include "kudu/consensus/log.h"
 #include "kudu/consensus/log_anchor_registry.h"
@@ -62,6 +63,7 @@ DECLARE_int32(consensus_max_batch_size_bytes);
 DECLARE_int32(follower_unavailable_considered_failed_sec);
 
 using kudu::consensus::HealthReportPB;
+using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
@@ -228,7 +230,7 @@ class ConsensusQueueTest : public KuduTest {
   MetricRegistry metric_registry_;
   scoped_refptr<MetricEntity> metric_entity_;
   scoped_refptr<log::Log> log_;
-  gscoped_ptr<ThreadPool> raft_pool_;
+  unique_ptr<ThreadPool> raft_pool_;
   gscoped_ptr<PeerMessageQueue> queue_;
   scoped_refptr<log::LogAnchorRegistry> registry_;
   scoped_refptr<clock::Clock> clock_;
@@ -561,7 +563,7 @@ TEST_F(ConsensusQueueTest, TestQueueLoadsOperationsForPeer) {
     ASSERT_OK(log::AppendNoOpToLogSync(clock_, log_.get(), &opid));
     // Roll the log every 10 ops
     if (i % 10 == 0) {
-      ASSERT_OK(log_->AllocateSegmentAndRollOver());
+      ASSERT_OK(log_->AllocateSegmentAndRollOverForTests());
     }
   }
   ASSERT_OK(log_->WaitUntilAllFlushed());
@@ -590,11 +592,11 @@ TEST_F(ConsensusQueueTest, TestQueueLoadsOperationsForPeer) {
 
   // Now we start tracking the peer, this negotiation round should let
   // the queue know how far along the peer is.
-  ASSERT_NO_FATAL_FAILURE(UpdatePeerWatermarkToOp(&request,
-                                                  &response,
-                                                  peers_last_op,
-                                                  MinimumOpId(),
-                                                  &send_more_immediately));
+  NO_FATALS(UpdatePeerWatermarkToOp(&request,
+                                    &response,
+                                    peers_last_op,
+                                    MinimumOpId(),
+                                    &send_more_immediately));
 
   // The queue should reply that there are more messages for the peer.
   ASSERT_TRUE(send_more_immediately);
@@ -624,7 +626,7 @@ TEST_F(ConsensusQueueTest, TestQueueHandlesOperationOverwriting) {
     ASSERT_OK(log::AppendNoOpToLogSync(clock_, log_.get(), &opid));
     // Roll the log every 3 ops
     if (i % 3 == 0) {
-      ASSERT_OK(log_->AllocateSegmentAndRollOver());
+      ASSERT_OK(log_->AllocateSegmentAndRollOverForTests());
     }
   }
 
@@ -634,7 +636,7 @@ TEST_F(ConsensusQueueTest, TestQueueHandlesOperationOverwriting) {
     ASSERT_OK(log::AppendNoOpToLogSync(clock_, log_.get(), &opid));
     // Roll the log every 3 ops
     if (i % 3 == 0) {
-      ASSERT_OK(log_->AllocateSegmentAndRollOver());
+      ASSERT_OK(log_->AllocateSegmentAndRollOverForTests());
     }
   }
 

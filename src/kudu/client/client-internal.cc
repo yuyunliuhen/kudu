@@ -19,19 +19,25 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <ostream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <boost/bind.hpp> // IWYU pragma: keep
 #include <boost/function.hpp>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
+#include "kudu/client/authz_token_cache.h"
+#include "kudu/client/master_proxy_rpc.h"
 #include "kudu/client/master_rpc.h"
 #include "kudu/client/meta_cache.h"
 #include "kudu/client/schema.h"
@@ -50,8 +56,9 @@
 #include "kudu/rpc/connection.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/request_tracker.h"
+#include "kudu/rpc/response_callback.h"
+#include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
-#include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/security/cert.h"
 #include "kudu/security/openssl_util.h"
 #include "kudu/security/tls_context.h"
@@ -60,9 +67,13 @@
 #include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
-#include "kudu/util/pb_util.h"
 #include "kudu/util/thread_restrictions.h"
 
+DECLARE_int32(dns_resolver_max_threads_num);
+DECLARE_uint32(dns_resolver_cache_capacity_mb);
+DECLARE_uint32(dns_resolver_cache_ttl_sec);
+
+using std::map;
 using std::pair;
 using std::set;
 using std::shared_ptr;
@@ -72,6 +83,10 @@ using std::vector;
 
 namespace kudu {
 
+namespace security {
+class SignedTokenPB;
+} // namespace security
+
 using master::AlterTableRequestPB;
 using master::AlterTableResponsePB;
 using master::CreateTableRequestPB;
@@ -80,32 +95,23 @@ using master::DeleteTableRequestPB;
 using master::DeleteTableResponsePB;
 using master::GetTableSchemaRequestPB;
 using master::GetTableSchemaResponsePB;
-using master::GetTabletLocationsRequestPB;
-using master::GetTabletLocationsResponsePB;
 using master::IsAlterTableDoneRequestPB;
 using master::IsAlterTableDoneResponsePB;
 using master::IsCreateTableDoneRequestPB;
 using master::IsCreateTableDoneResponsePB;
-using master::ListMastersRequestPB;
-using master::ListMastersResponsePB;
-using master::ListTablesRequestPB;
-using master::ListTablesResponsePB;
-using master::ListTabletServersRequestPB;
 using master::ListTabletServersResponsePB;
-using master::MasterErrorPB;
+using master::ListTabletServersRequestPB;
 using master::MasterFeatures;
 using master::MasterServiceProxy;
-using master::ReplaceTabletRequestPB;
-using master::ReplaceTabletResponsePB;
 using master::TableIdentifierPB;
-using pb_util::SecureShortDebugString;
+using rpc::BackoffType;
 using rpc::CredentialsPolicy;
-using rpc::ErrorStatusPB;
-using rpc::RpcController;
+using security::SignedTokenPB;
 using strings::Substitute;
 
 namespace client {
 
+using internal::AsyncLeaderMasterRpc;
 using internal::ConnectToClusterRpc;
 using internal::RemoteTablet;
 using internal::RemoteTabletServer;
@@ -154,200 +160,12 @@ Status RetryFunc(const MonoTime& deadline,
   return Status::TimedOut(timeout_msg);
 }
 
-template<class ReqClass, class RespClass>
-Status KuduClient::Data::SyncLeaderMasterRpc(
-    const MonoTime& deadline,
-    KuduClient* client,
-    const ReqClass& req,
-    RespClass* resp,
-    const char* func_name,
-    const boost::function<Status(MasterServiceProxy*,
-                                 const ReqClass&,
-                                 RespClass*,
-                                 RpcController*)>& func,
-    vector<uint32_t> required_feature_flags) {
-  DCHECK(deadline.Initialized());
-
-  for (int num_attempts = 0;; num_attempts++) {
-    RpcController rpc;
-
-    // Sleep if necessary.
-    if (num_attempts > 0) {
-      SleepFor(ComputeExponentialBackoff(num_attempts));
-    }
-
-    // Have we already exceeded our deadline?
-    MonoTime now = MonoTime::Now();
-    if (deadline < now) {
-      return Status::TimedOut(Substitute("$0 timed out after deadline expired",
-                                         func_name));
-    }
-
-    // The RPC's deadline is intentionally earlier than the overall
-    // deadline so that we reserve some time with which to find a new
-    // leader master and retry before the overall deadline expires.
-    //
-    // TODO(KUDU-683): cleanup this up
-    MonoTime rpc_deadline = now + client->default_rpc_timeout();
-    rpc.set_deadline(std::min(rpc_deadline, deadline));
-
-    for (uint32_t required_feature_flag : required_feature_flags) {
-      rpc.RequireServerFeature(required_feature_flag);
-    }
-
-    // Take a ref to the proxy in case it disappears from underneath us.
-    shared_ptr<MasterServiceProxy> proxy(master_proxy());
-
-    Status s = func(proxy.get(), req, resp, &rpc);
-    if (s.IsRemoteError()) {
-      const ErrorStatusPB* err = rpc.error_response();
-      if (err &&
-          err->has_code() &&
-          (err->code() == ErrorStatusPB::ERROR_SERVER_TOO_BUSY ||
-           err->code() == ErrorStatusPB::ERROR_UNAVAILABLE)) {
-        // The UNAVAILABLE error code is a broader counterpart of the
-        // SERVER_TOO_BUSY. In both cases it's necessary to retry a bit later.
-        continue;
-      }
-    }
-
-    // A network error is a special case for retries: in most cases a network
-    // error means there is some misconfiguration, a typo in the command line,
-    // or the whole Kudu cluster is offline. It's better to report on such
-    // errors right away to allow faster troubleshooting.
-    if (s.IsNetworkError()) {
-      KLOG_EVERY_N_SECS(WARNING, 1)
-          << "Unable to send the request (" << SecureShortDebugString(req)
-          << ") to leader Master (" << leader_master_hostport().ToString()
-          << "): " << s.ToString();
-      if (client->IsMultiMaster()) {
-        LOG(INFO) << "Determining the new leader Master and retrying...";
-        ReconnectToCluster(client, deadline, ReconnectionReason::OTHER);
-        continue;
-      }
-    }
-
-    if (s.IsNotAuthorized()) {
-      const ErrorStatusPB* err = rpc.error_response();
-      if (err && err->has_code() &&
-          err->code() == ErrorStatusPB::FATAL_INVALID_AUTHENTICATION_TOKEN) {
-        // Assuming the token has expired: it's necessary to get a new one.
-        ReconnectToCluster(client, deadline,
-                           ReconnectionReason::INVALID_AUTHN_TOKEN);
-        continue;
-      }
-    }
-
-    if (s.IsServiceUnavailable()) {
-      KLOG_EVERY_N_SECS(WARNING, 1)
-          << "Unable to send the request (" << SecureShortDebugString(req)
-          << ") to leader Master (" << leader_master_hostport().ToString()
-          << "): " << s.ToString();
-      if (client->IsMultiMaster()) {
-        LOG(INFO) << "Determining the new leader Master and retrying...";
-        ReconnectToCluster(client, deadline, ReconnectionReason::OTHER);
-      }
-      continue;
-    }
-
-    if (s.IsTimedOut()) {
-      if (MonoTime::Now() < deadline) {
-        KLOG_EVERY_N_SECS(WARNING, 1)
-            << "Unable to send the request (" << SecureShortDebugString(req)
-            << ") to leader Master (" << leader_master_hostport().ToString()
-            << "): " << s.ToString();
-        if (client->IsMultiMaster()) {
-          LOG(INFO) << "Determining the new leader Master and retrying...";
-          ReconnectToCluster(client, deadline, ReconnectionReason::OTHER);
-        }
-        continue;
-      } else {
-        // Operation deadline expired during this latest RPC.
-        s = s.CloneAndPrepend(Substitute("$0 timed out after deadline expired",
-                                         func_name));
-      }
-    }
-
-    if (s.ok() && resp->has_error()) {
-      if (resp->error().code() == MasterErrorPB::NOT_THE_LEADER ||
-          resp->error().code() == MasterErrorPB::CATALOG_MANAGER_NOT_INITIALIZED) {
-        if (client->IsMultiMaster()) {
-          KLOG_EVERY_N_SECS(INFO, 1) << "Determining the new leader Master and retrying...";
-          ReconnectToCluster(client, deadline, ReconnectionReason::OTHER);
-        }
-        continue;
-      } else {
-        return StatusFromPB(resp->error().status());
-      }
-    }
-    return s;
-  }
-}
-
-// Explicit specializations for callers outside this compilation unit.
-template
-Status KuduClient::Data::SyncLeaderMasterRpc(
-    const MonoTime& deadline,
-    KuduClient* client,
-    const GetTabletLocationsRequestPB& req,
-    GetTabletLocationsResponsePB* resp,
-    const char* func_name,
-    const boost::function<Status(MasterServiceProxy*,
-                                 const GetTabletLocationsRequestPB&,
-                                 GetTabletLocationsResponsePB*,
-                                 RpcController*)>& func,
-    vector<uint32_t> required_feature_flags);
-template
-Status KuduClient::Data::SyncLeaderMasterRpc(
-    const MonoTime& deadline,
-    KuduClient* client,
-    const ListTablesRequestPB& req,
-    ListTablesResponsePB* resp,
-    const char* func_name,
-    const boost::function<Status(MasterServiceProxy*,
-                                 const ListTablesRequestPB&,
-                                 ListTablesResponsePB*,
-                                 RpcController*)>& func,
-    vector<uint32_t> required_feature_flags);
-template
-Status KuduClient::Data::SyncLeaderMasterRpc(
-    const MonoTime& deadline,
-    KuduClient* client,
-    const ListTabletServersRequestPB& req,
-    ListTabletServersResponsePB* resp,
-    const char* func_name,
-    const boost::function<Status(MasterServiceProxy*,
-                                 const ListTabletServersRequestPB&,
-                                 ListTabletServersResponsePB*,
-                                 RpcController*)>& func,
-    vector<uint32_t> required_feature_flags);
-template
-Status KuduClient::Data::SyncLeaderMasterRpc(
-    const MonoTime& deadline,
-    KuduClient* client,
-    const ListMastersRequestPB& req,
-    ListMastersResponsePB* resp,
-    const char* func_name,
-    const boost::function<Status(MasterServiceProxy*,
-                                 const ListMastersRequestPB&,
-                                 ListMastersResponsePB*,
-                                 RpcController*)>& func,
-    vector<uint32_t> required_feature_flags);
-template
-Status KuduClient::Data::SyncLeaderMasterRpc(
-    const MonoTime& deadline,
-    KuduClient* client,
-    const ReplaceTabletRequestPB& req,
-    ReplaceTabletResponsePB* resp,
-    const char* func_name,
-    const boost::function<Status(MasterServiceProxy*,
-                                 const ReplaceTabletRequestPB&,
-                                 ReplaceTabletResponsePB*,
-                                 RpcController*)>& func,
-    vector<uint32_t> required_feature_flags);
-
 KuduClient::Data::Data()
-    : hive_metastore_sasl_enabled_(false),
+    : dns_resolver_(new DnsResolver(
+          FLAGS_dns_resolver_max_threads_num,
+          FLAGS_dns_resolver_cache_capacity_mb * 1024 * 1024,
+          MonoDelta::FromSeconds(FLAGS_dns_resolver_cache_ttl_sec))),
+      hive_metastore_sasl_enabled_(false),
       latest_observed_timestamp_(KuduClient::kNoTimestamp) {
 }
 
@@ -382,7 +200,7 @@ RemoteTabletServer* KuduClient::Data::SelectTServer(const scoped_refptr<RemoteTa
     case CLOSEST_REPLICA:
     case FIRST_REPLICA: {
       rt->GetRemoteTabletServers(candidates);
-      // Filter out all the blacklisted candidates.
+      // Exclude all the blacklisted candidates.
       vector<RemoteTabletServer*> filtered;
       for (RemoteTabletServer* rts : *candidates) {
         if (!ContainsKey(blacklist, rts->permanent_uuid())) {
@@ -395,23 +213,44 @@ RemoteTabletServer* KuduClient::Data::SelectTServer(const scoped_refptr<RemoteTa
         if (!filtered.empty()) {
           ret = filtered[0];
         }
-      } else if (selection == CLOSEST_REPLICA) {
-        // Choose a local replica.
-        for (RemoteTabletServer* rts : filtered) {
-          if (IsTabletServerLocal(*rts)) {
-            ret = rts;
-            break;
+        break;
+      }
+      // Choose a replica as follows:
+      // 1. If there is a replica local to the client, pick it. If there are
+      // multiple, pick a random one.
+      // 2. Otherwise, if there is a replica in the same location, pick it. If
+      // there are multiple, pick a random one.
+      // 3. If there are no local replicas or replicas in the same location,
+      // pick a random replica.
+      // TODO(wdberkeley): Eventually, the client might use the hierarchical
+      // structure of a location to determine proximity.
+      const string client_location = location();
+      vector<RemoteTabletServer*> local;
+      vector<RemoteTabletServer*> same_location;
+      local.reserve(filtered.size());
+      same_location.reserve(filtered.size());
+      for (RemoteTabletServer* rts : filtered) {
+        if (IsTabletServerLocal(*rts)) {
+          local.push_back(rts);
+        }
+        if (!client_location.empty()) {
+          const string replica_location = rts->location();
+          if (client_location == replica_location) {
+            same_location.push_back(rts);
           }
         }
-        // Fallback to a random replica if none are local.
-        if (ret == nullptr && !filtered.empty()) {
-          ret = filtered[rand() % filtered.size()];
-        }
+      }
+      if (!local.empty()) {
+        ret = local[rand() % local.size()];
+      } else if (!same_location.empty()) {
+        ret = same_location[rand() % same_location.size()];
+      } else if (!filtered.empty()) {
+        ret = filtered[rand() % filtered.size()];
       }
       break;
     }
     default: {
-      LOG(FATAL) << "Unknown ProxySelection value " << selection;
+      LOG(FATAL) << "Unknown ReplicaSelection value " << selection;
       break;
     }
   }
@@ -456,9 +295,13 @@ Status KuduClient::Data::CreateTable(KuduClient* client,
   if (has_range_partition_bounds) {
     features.push_back(MasterFeatures::RANGE_PARTITION_BOUNDS);
   }
-  return SyncLeaderMasterRpc<CreateTableRequestPB, CreateTableResponsePB>(
-      deadline, client, req, resp, "CreateTable",
-      &MasterServiceProxy::CreateTable, features);
+  Synchronizer sync;
+  AsyncLeaderMasterRpc<CreateTableRequestPB, CreateTableResponsePB> rpc(
+      deadline, client, BackoffType::EXPONENTIAL, req, resp,
+      &MasterServiceProxy::CreateTableAsync, "CreateTable", sync.AsStatusCallback(),
+      std::move(features));
+  rpc.SendRpc();
+  return sync.Wait();
 }
 
 Status KuduClient::Data::IsCreateTableInProgress(
@@ -473,15 +316,13 @@ Status KuduClient::Data::IsCreateTableInProgress(
   // TODO(aserbin): Add client rpc timeout and use
   // 'default_admin_operation_timeout_' as the default timeout for all
   // admin operations.
-  RETURN_NOT_OK((
-      SyncLeaderMasterRpc<IsCreateTableDoneRequestPB, IsCreateTableDoneResponsePB>(
-          deadline,
-          client,
-          req,
-          &resp,
-          "IsCreateTableDone",
-          &MasterServiceProxy::IsCreateTableDone,
-          {})));
+  Synchronizer sync;
+  AsyncLeaderMasterRpc<IsCreateTableDoneRequestPB, IsCreateTableDoneResponsePB> rpc(
+      deadline, client, BackoffType::EXPONENTIAL, req, &resp,
+      &MasterServiceProxy::IsCreateTableDoneAsync,
+      "IsCreateTableDone", sync.AsStatusCallback(), {});
+  rpc.SendRpc();
+  RETURN_NOT_OK(sync.Wait());
   *create_in_progress = !resp.done();
   return Status::OK();
 }
@@ -506,9 +347,12 @@ Status KuduClient::Data::DeleteTable(KuduClient* client,
 
   req.mutable_table()->set_table_name(table_name);
   req.set_modify_external_catalogs(modify_external_catalogs);
-  return SyncLeaderMasterRpc<DeleteTableRequestPB, DeleteTableResponsePB>(
-      deadline, client, req, &resp,
-      "DeleteTable", &MasterServiceProxy::DeleteTable, {});
+  Synchronizer sync;
+  AsyncLeaderMasterRpc<DeleteTableRequestPB, DeleteTableResponsePB> rpc(
+      deadline, client, BackoffType::EXPONENTIAL, req, &resp,
+      &MasterServiceProxy::DeleteTableAsync, "DeleteTable", sync.AsStatusCallback(), {});
+  rpc.SendRpc();
+  return sync.Wait();
 }
 
 Status KuduClient::Data::AlterTable(KuduClient* client,
@@ -520,14 +364,13 @@ Status KuduClient::Data::AlterTable(KuduClient* client,
   if (has_add_drop_partition) {
     required_feature_flags.push_back(MasterFeatures::ADD_DROP_RANGE_PARTITIONS);
   }
-  return SyncLeaderMasterRpc<AlterTableRequestPB, AlterTableResponsePB>(
-      deadline,
-      client,
-      req,
-      resp,
-      "AlterTable",
-      &MasterServiceProxy::AlterTable,
+  Synchronizer sync;
+  AsyncLeaderMasterRpc<AlterTableRequestPB, AlterTableResponsePB> rpc(
+      deadline, client, BackoffType::EXPONENTIAL, req, resp,
+      &MasterServiceProxy::AlterTableAsync, "AlterTable", sync.AsStatusCallback(),
       std::move(required_feature_flags));
+  rpc.SendRpc();
+  return sync.Wait();
 }
 
 Status KuduClient::Data::IsAlterTableInProgress(
@@ -539,15 +382,13 @@ Status KuduClient::Data::IsAlterTableInProgress(
   IsAlterTableDoneResponsePB resp;
   *req.mutable_table() = std::move(table);
 
-  RETURN_NOT_OK((
-      SyncLeaderMasterRpc<IsAlterTableDoneRequestPB, IsAlterTableDoneResponsePB>(
-          deadline,
-          client,
-          req,
-          &resp,
-          "IsAlterTableDone",
-          &MasterServiceProxy::IsAlterTableDone,
-          {})));
+  Synchronizer sync;
+  AsyncLeaderMasterRpc<IsAlterTableDoneRequestPB, IsAlterTableDoneResponsePB> rpc(
+      deadline, client, BackoffType::EXPONENTIAL, req, &resp,
+      &MasterServiceProxy::IsAlterTableDoneAsync, "IsAlterTableInProgres",
+      sync.AsStatusCallback(), {});
+  rpc.SendRpc();
+  RETURN_NOT_OK(sync.Wait());
   *alter_in_progress = !resp.done();
   return Status::OK();
 }
@@ -578,8 +419,9 @@ Status KuduClient::Data::InitLocalHostNames() {
   }
 
   vector<Sockaddr> addresses;
-  RETURN_NOT_OK_PREPEND(HostPort(hostname, 0).ResolveAddresses(&addresses),
-                        Substitute("Could not resolve local host name '$0'", hostname));
+  RETURN_NOT_OK_PREPEND(dns_resolver_->ResolveAddresses(HostPort(hostname, 0),
+                                                        &addresses),
+      Substitute("Could not resolve local host name '$0'", hostname));
 
   for (const Sockaddr& addr : addresses) {
     // Similar to above, ignore local or wildcard addresses.
@@ -606,21 +448,96 @@ bool KuduClient::Data::IsTabletServerLocal(const RemoteTabletServer& rts) const 
   return false;
 }
 
+Status KuduClient::Data::ListTabletServers(KuduClient* client,
+                                           const MonoTime& deadline,
+                                           const ListTabletServersRequestPB& req,
+                                           ListTabletServersResponsePB* resp) const {
+  Synchronizer sync;
+  AsyncLeaderMasterRpc<ListTabletServersRequestPB, ListTabletServersResponsePB> rpc(
+      deadline, client, BackoffType::EXPONENTIAL, req, resp,
+      &MasterServiceProxy::ListTabletServersAsync, "ListTabletServers",
+      sync.AsStatusCallback(), {});
+  rpc.SendRpc();
+  RETURN_NOT_OK(sync.Wait());
+  if (resp->has_error()) {
+    return StatusFromPB(resp->error().status());
+  }
+  return Status::OK();
+}
+
+void KuduClient::Data::StoreAuthzToken(const string& table_id,
+                                       const SignedTokenPB& token) {
+  authz_token_cache_.Put(table_id, token);
+}
+
+bool KuduClient::Data::FetchCachedAuthzToken(const string& table_id, SignedTokenPB* token) {
+  return authz_token_cache_.Fetch(table_id, token);
+}
+
+Status KuduClient::Data::OpenTable(KuduClient* client,
+                                   const TableIdentifierPB& table_identifier,
+                                   client::sp::shared_ptr<KuduTable>* table) {
+  KuduSchema schema;
+  string table_id;
+  string table_name;
+  int num_replicas;
+  PartitionSchema partition_schema;
+  map<string, string> extra_configs;
+  MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout_;
+  RETURN_NOT_OK(GetTableSchema(client,
+                               deadline,
+                               table_identifier,
+                               &schema,
+                               &partition_schema,
+                               &table_id,
+                               &table_name,
+                               &num_replicas,
+                               &extra_configs));
+
+  // When the table name is specified, use the caller-provided table name.
+  // This reduces surprises, e.g., when the HMS integration is on and table
+  // names are case-insensitive.
+  string effective_table_name = table_identifier.has_table_name() ?
+      table_identifier.table_name() :
+      table_name;
+
+  // TODO(wdberkeley): In the future, probably will look up the table in some
+  //                   map to reuse KuduTable instances.
+  table->reset(new KuduTable(client->shared_from_this(),
+                             effective_table_name, table_id, num_replicas,
+                             schema, partition_schema, extra_configs));
+
+  // When opening a table, clear the existing cached non-covered range entries.
+  // This avoids surprises where a new table instance won't be able to see the
+  // current range partitions of a table for up to the ttl.
+  meta_cache_->ClearNonCoveredRangeEntries(table_id);
+
+  return Status::OK();
+}
+
 Status KuduClient::Data::GetTableSchema(KuduClient* client,
-                                        const string& table_name,
                                         const MonoTime& deadline,
+                                        const TableIdentifierPB& table,
                                         KuduSchema* schema,
                                         PartitionSchema* partition_schema,
-                                        string* table_id,
-                                        int* num_replicas) {
+                                        std::string* table_id,
+                                        std::string* table_name,
+                                        int* num_replicas,
+                                        map<string, string>* extra_configs) {
   GetTableSchemaRequestPB req;
   GetTableSchemaResponsePB resp;
 
-  req.mutable_table()->set_table_name(table_name);
-  RETURN_NOT_OK((
-      SyncLeaderMasterRpc<GetTableSchemaRequestPB, GetTableSchemaResponsePB>(
-          deadline, client, req, &resp,
-          "GetTableSchema", &MasterServiceProxy::GetTableSchema, {})));
+  if (table.has_table_id()) {
+    req.mutable_table()->set_table_id(table.table_id());
+  } else {
+    req.mutable_table()->set_table_name(table.table_name());
+  }
+  Synchronizer sync;
+  AsyncLeaderMasterRpc<GetTableSchemaRequestPB, GetTableSchemaResponsePB> rpc(
+      deadline, client, BackoffType::EXPONENTIAL, req, &resp,
+      &MasterServiceProxy::GetTableSchemaAsync, "GetTableSchema", sync.AsStatusCallback(), {});
+  rpc.SendRpc();
+  RETURN_NOT_OK(sync.Wait());
   // Parse the server schema out of the response.
   unique_ptr<Schema> new_schema(new Schema());
   RETURN_NOT_OK(SchemaFromPB(resp.schema(), new_schema.get()));
@@ -637,11 +554,23 @@ Status KuduClient::Data::GetTableSchema(KuduClient* client,
   if (partition_schema) {
     *partition_schema = std::move(new_partition_schema);
   }
+  if (table_name) {
+    *table_name = resp.table_name();
+  }
   if (table_id) {
     *table_id = resp.table_id();
   }
   if (num_replicas) {
     *num_replicas = resp.num_replicas();
+  }
+  if (extra_configs) {
+    map<string, string> result(resp.extra_configs().begin(), resp.extra_configs().end());
+    *extra_configs = std::move(result);
+  }
+  // Cache the authz token if the response came with one. It might not have one
+  // if running against an older master that does not support authz tokens.
+  if (resp.has_authz_token()) {
+    StoreAuthzToken(resp.table_id(), resp.authz_token());
   }
   return Status::OK();
 }
@@ -706,6 +635,8 @@ void KuduClient::Data::ConnectedToClusterCb(
       hive_metastore_sasl_enabled_ = hive_config.hms_sasl_enabled();
       hive_metastore_uuid_ = hive_config.hms_uuid();
 
+      location_ = connect_response.client_location();
+
       master_proxy_.reset(new MasterServiceProxy(messenger_, leader_addr, leader_hostname));
       master_proxy_->set_user_credentials(user_credentials_);
     }
@@ -736,8 +667,10 @@ void KuduClient::Data::ConnectToClusterAsync(KuduClient* client,
     HostPort hp;
     Status s = hp.ParseString(master_server_addr, master::Master::kDefaultPort);
     if (s.ok()) {
-      // TODO(todd): Do address resolution asynchronously as well.
-      s = hp.ResolveAddresses(&addrs);
+      // TODO(todd): Until address resolution is done asynchronously, we need
+      // to allow waiting as some callers may be reactor threads.
+      ThreadRestrictions::ScopedAllowWait allow_wait;
+      s = dns_resolver_->ResolveAddresses(hp, &addrs);
     }
     if (!s.ok()) {
       cb.Run(s);
@@ -750,8 +683,9 @@ void KuduClient::Data::ConnectToClusterAsync(KuduClient* client,
     }
     if (addrs.size() > 1) {
       KLOG_EVERY_N_SECS(WARNING, 1)
-          << "Specified master server address '" << master_server_addr << "' "
-          << "resolved to multiple IPs. Using " << addrs[0].ToString();
+          << Substitute("Specified master server address '$0' resolved to "
+                        "multiple IPs. Using $1",
+                        master_server_addr, addrs[0].ToString());
     }
     master_addrs_with_names.emplace_back(addrs[0], hp.host());
   }
@@ -821,38 +755,18 @@ void KuduClient::Data::ConnectToClusterAsync(KuduClient* client,
   }
 }
 
-void KuduClient::Data::ReconnectToCluster(KuduClient* client,
-                                          const MonoTime& deadline,
-                                          ReconnectionReason reason) {
-  DCHECK(client);
-  DCHECK(reason == ReconnectionReason::OTHER ||
-         reason == ReconnectionReason::INVALID_AUTHN_TOKEN);
-  if (reason == ReconnectionReason::OTHER) {
-    const auto s = ConnectToCluster(client, deadline,
-                                    CredentialsPolicy::ANY_CREDENTIALS);
-    if (s.ok()) {
-      return;
-    }
-    if (!s.IsNotAuthorized()) {
-      // In case of NotAutorized() error, that's most likely due to invalid
-      // authentication token. That's the only case when it's worth trying
-      // to re-connect to the cluster using primary credentials.
-      //
-      // TODO(aserbin): refactor ConnectToCluster to purge cached master proxy
-      //                in case of NOT_THE_LEADER error and update it to
-      //                handle FATAL_INVALID_AUTHENTICATION_TOKEN error as well.
-      WARN_NOT_OK(s, "Unable to determine the new leader Master");
-      return;
-    }
-  }
-  LOG(INFO) << "Reconnecting to the cluster for a new authn token";
-  const auto connect_status = ConnectToCluster(
-      client, deadline, CredentialsPolicy::PRIMARY_CREDENTIALS);
-  if (PREDICT_FALSE(!connect_status.ok())) {
-    KLOG_EVERY_N_SECS(WARNING, 1)
-        << "Unable to reconnect to the cluster for a new authn token: "
-        << connect_status.ToString();
-  }
+Status KuduClient::Data::RetrieveAuthzToken(const KuduTable* table,
+                                            const MonoTime& deadline) {
+  Synchronizer sync;
+  RetrieveAuthzTokenAsync(table, sync.AsStatusCallback(), deadline);
+  return sync.Wait();
+}
+
+void KuduClient::Data::RetrieveAuthzTokenAsync(const KuduTable* table,
+                                               const StatusCallback& cb,
+                                               const MonoTime& deadline) {
+  DCHECK(deadline.Initialized());
+  authz_token_cache_.RetrieveNewAuthzToken(table, cb, deadline);
 }
 
 HostPort KuduClient::Data::leader_master_hostport() const {
@@ -863,6 +777,11 @@ HostPort KuduClient::Data::leader_master_hostport() const {
 vector<HostPort> KuduClient::Data::master_hostports() const {
   std::lock_guard<simple_spinlock> l(leader_master_lock_);
   return master_hostports_;
+}
+
+string KuduClient::Data::location() const {
+  std::lock_guard<simple_spinlock> l(leader_master_lock_);
+  return location_;
 }
 
 shared_ptr<master::MasterServiceProxy> KuduClient::Data::master_proxy() const {

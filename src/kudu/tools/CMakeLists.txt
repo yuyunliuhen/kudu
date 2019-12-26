@@ -40,8 +40,8 @@ target_link_libraries(tool_proto
 
 add_library(kudu_tools_util
   color.cc
-  data_gen_util.cc
   diagnostics_log_parser.cc
+  table_scanner.cc
   tool_action.cc
   tool_action_common.cc
 )
@@ -75,6 +75,7 @@ target_link_libraries(ksck
   kudu_tools_util
   master
   master_proto
+  rebalance
   server_base_proto
   tserver_proto
   tserver_service_proto
@@ -86,14 +87,13 @@ target_link_libraries(ksck
 #######################################
 
 add_library(kudu_tools_rebalance
-  rebalancer.cc
-  rebalance_algo.cc
-  placement_policy_util.cc
+  rebalancer_tool.cc
   tool_replica_util.cc
 )
 target_link_libraries(kudu_tools_rebalance
   ksck
   kudu_common
+  rebalance
   ${KUDU_BASE_LIBS}
 )
 
@@ -129,6 +129,7 @@ target_link_libraries(kudu
   kudu_client
   kudu_common
   kudu_fs
+  kudu_subprocess
   kudu_tools_rebalance
   kudu_util
   log
@@ -139,6 +140,12 @@ target_link_libraries(kudu
   tserver
   ${KUDU_BASE_LIBS}
 )
+option(KUDU_CLIENT_INSTALL "Whether to install the Kudu command line tool" ON)
+if(KUDU_CLIENT_INSTALL)
+  install(TARGETS kudu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+else()
+  message(STATUS "Skipping install rule for the Kudu command line tool")
+endif()
 
 #######################################
 # kudu_tools_test_util
@@ -159,10 +166,15 @@ SET_KUDU_TEST_LINK_LIBS(
   itest_util
   ksck
   kudu_hms
+  kudu_subprocess
   kudu_tools_rebalance
   kudu_tools_test_util
   kudu_tools_util
   mini_cluster)
+ADD_KUDU_TEST(create-table-tool-test
+  NUM_SHARDS 4 PROCESSORS 3)
+ADD_KUDU_TEST_DEPENDENCIES(create-table-tool-test
+  kudu)
 ADD_KUDU_TEST(diagnostics_log_parser-test)
 ADD_KUDU_TEST(ksck-test)
 ADD_KUDU_TEST(ksck_remote-test
@@ -181,9 +193,6 @@ ADD_KUDU_TEST_DEPENDENCIES(kudu-tool-test
 ADD_KUDU_TEST(kudu-ts-cli-test)
 ADD_KUDU_TEST_DEPENDENCIES(kudu-ts-cli-test
   kudu)
-ADD_KUDU_TEST(placement_policy_util-test)
-ADD_KUDU_TEST(rebalance-test)
-ADD_KUDU_TEST(rebalance_algo-test)
 ADD_KUDU_TEST(rebalancer_tool-test
   NUM_SHARDS 8 PROCESSORS 3
   DATA_FILES ../scripts/assign-location.py)

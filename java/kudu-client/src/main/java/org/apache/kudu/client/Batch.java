@@ -18,17 +18,22 @@
 package org.apache.kudu.client;
 
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import com.google.common.base.MoreObjects;
+import com.google.common.collect.Iterables;
 import com.google.protobuf.Message;
 import com.google.protobuf.UnsafeByteOperations;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.jboss.netty.util.Timer;
 
-import org.apache.kudu.WireProtocol;
+import org.apache.kudu.WireProtocol.AppStatusPB.ErrorCode;
 import org.apache.kudu.client.Statistics.Statistic;
 import org.apache.kudu.client.Statistics.TabletStatistics;
+import org.apache.kudu.security.Token;
 import org.apache.kudu.tserver.Tserver;
 import org.apache.kudu.tserver.Tserver.TabletServerErrorPB;
 import org.apache.kudu.util.Pair;
@@ -48,20 +53,52 @@ class Batch extends KuduRpc<BatchResponse> {
   /** The tablet this batch will be routed to. */
   private final LocatedTablet tablet;
 
+  /** The token with which to authorize this RPC. */
+  private Token.SignedTokenPB authzToken;
+
   /**
    * This size will be set when serialize is called. It stands for the size of rows in all
    * operations in this batch.
    */
   private long rowOperationsSizeBytes = 0;
 
-  /** See {@link SessionConfiguration#setIgnoreAllDuplicateRows(boolean)} */
-  private final boolean ignoreAllDuplicateRows;
+  private final EnumSet<ErrorCode> ignoredErrors;
 
-
-  Batch(KuduTable table, LocatedTablet tablet, boolean ignoreAllDuplicateRows) {
-    super(table);
-    this.ignoreAllDuplicateRows = ignoreAllDuplicateRows;
+  Batch(KuduTable table, LocatedTablet tablet, boolean ignoreAllDuplicateRows,
+        boolean ignoreAllNotFoundRows) {
+    super(table, null, 0);
+    // Build a set of ignored errors.
+    Set<ErrorCode> ignoredErrors = new HashSet<>();
+    if (ignoreAllDuplicateRows) {
+      ignoredErrors.add(ErrorCode.ALREADY_PRESENT);
+    }
+    if (ignoreAllNotFoundRows) {
+      ignoredErrors.add(ErrorCode.NOT_FOUND);
+    }
+    // EnumSet.copyOf doesn't handle an empty set, so handle that case specially.
+    if (ignoredErrors.isEmpty()) {
+      this.ignoredErrors = EnumSet.noneOf(ErrorCode.class);
+    } else {
+      this.ignoredErrors = EnumSet.copyOf(ignoredErrors);
+    }
     this.tablet = tablet;
+  }
+
+  /**
+   * Reset the timeout of this batch.
+   *
+   * TODO(wdberkeley): The fact we have to do this is a sign an Operation should not subclass
+   * KuduRpc.
+   *
+   * @param timeoutMillis the new timeout of the batch in milliseconds
+   */
+  void resetTimeoutMillis(Timer timer, long timeoutMillis) {
+    timeoutTracker.reset();
+    timeoutTracker.setTimeout(timeoutMillis);
+    if (timeoutTask != null) {
+      timeoutTask.cancel();
+    }
+    timeoutTask = AsyncKuduClient.newTimeout(timer, new RpcTimeoutTask(), timeoutMillis);
   }
 
   /**
@@ -88,6 +125,16 @@ class Batch extends KuduRpc<BatchResponse> {
   }
 
   @Override
+  boolean needsAuthzToken() {
+    return true;
+  }
+
+  @Override
+  void bindAuthzToken(Token.SignedTokenPB token) {
+    authzToken = token;
+  }
+
+  @Override
   Message createRequestPB() {
     final Tserver.WriteRequestPB.Builder builder =
         Operation.createAndFillWriteRequestPB(operations);
@@ -95,6 +142,9 @@ class Batch extends KuduRpc<BatchResponse> {
                              (long)builder.getRowOperations().getIndirectData().size();
     builder.setTabletId(UnsafeByteOperations.unsafeWrap(getTablet().getTabletIdAsBytes()));
     builder.setExternalConsistencyMode(externalConsistencyMode.pbVersion());
+    if (authzToken != null) {
+      builder.setAuthzToken(authzToken);
+    }
     return builder.build();
   }
 
@@ -115,21 +165,21 @@ class Batch extends KuduRpc<BatchResponse> {
     readProtobuf(callResponse.getPBMessage(), builder);
 
     List<Tserver.WriteResponsePB.PerRowErrorPB> errorsPB = builder.getPerRowErrorsList();
-    if (ignoreAllDuplicateRows) {
-      boolean allAlreadyPresent = true;
+    // Create a new list of errors that doesn't contain ignored error codes.
+    if (!ignoredErrors.isEmpty()) {
+      List<Tserver.WriteResponsePB.PerRowErrorPB> filteredErrors = new ArrayList<>();
       for (Tserver.WriteResponsePB.PerRowErrorPB errorPB : errorsPB) {
-        if (errorPB.getError().getCode() != WireProtocol.AppStatusPB.ErrorCode.ALREADY_PRESENT) {
-          allAlreadyPresent = false;
-          break;
+        if (!ignoredErrors.contains(errorPB.getError().getCode())) {
+          filteredErrors.add(errorPB);
         }
       }
-      if (allAlreadyPresent) {
-        errorsPB = Collections.emptyList();
-      }
+      errorsPB = filteredErrors;
     }
-
-    BatchResponse response = new BatchResponse(deadlineTracker.getElapsedMillis(), tsUUID,
-                                               builder.getTimestamp(), errorsPB, operations,
+    BatchResponse response = new BatchResponse(timeoutTracker.getElapsedMillis(),
+                                               tsUUID,
+                                               builder.getTimestamp(),
+                                               errorsPB,
+                                               operations,
                                                operationIndexes);
 
     if (injectedError != null) {
@@ -140,10 +190,10 @@ class Batch extends KuduRpc<BatchResponse> {
           Thread.currentThread().interrupt();
         }
       }
-      return new Pair<BatchResponse, Object>(response, injectedError);
+      return new Pair<>(response, injectedError);
     }
 
-    return new Pair<BatchResponse, Object>(response,
+    return new Pair<>(response,
         builder.hasError() ? builder.getError() : null);
   }
 
@@ -183,7 +233,7 @@ class Batch extends KuduRpc<BatchResponse> {
     return MoreObjects.toStringHelper(this)
                       .add("operations", operations.size())
                       .add("tablet", tablet)
-                      .add("ignoreAllDuplicateRows", ignoreAllDuplicateRows)
+                      .add("ignoredErrors", Iterables.toString(ignoredErrors))
                       .add("rpc", super.toString())
                       .toString();
   }

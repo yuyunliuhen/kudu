@@ -1,22 +1,24 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package org.apache.kudu.spark.kudu
 
 import java.math.BigDecimal
+import java.nio.charset.StandardCharsets.UTF_8
 import java.util.Date
 
 import scala.collection.JavaConverters._
@@ -30,12 +32,15 @@ import org.apache.kudu.client.KuduTable
 import org.apache.kudu.Schema
 import org.apache.kudu.Type
 import org.apache.kudu.test.KuduTestHarness
+import org.apache.kudu.util.CharUtil
 import org.apache.kudu.util.DecimalUtil
+import org.apache.spark.sql.execution.datasources.LogicalRelation
+import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.SparkSession
 import org.junit.After
 import org.junit.Before
 import org.junit.Rule
-import org.scalatest.junit.JUnitSuite
+import org.scalatestplus.junit.JUnitSuite
 
 import scala.annotation.meta.getter
 
@@ -82,6 +87,10 @@ trait KuduTestSuite extends JUnitSuite {
             .precision(DecimalUtil.MAX_DECIMAL128_PRECISION)
             .build()
         )
+        .build(),
+      new ColumnSchemaBuilder("c14_varchar", Type.VARCHAR)
+        .typeAttributes(CharUtil.typeAttributes(CharUtil.MAX_VARCHAR_LENGTH))
+        .nullable(true)
         .build()
     )
     new Schema(columns.asJava)
@@ -154,10 +163,11 @@ trait KuduTestSuite extends JUnitSuite {
 
   def insertRows(
       targetTable: KuduTable,
-      rowCount: Integer): IndexedSeq[(Int, Int, String, Long)] = {
+      rowCount: Int,
+      startIndex: Int = 0): IndexedSeq[(Int, Int, String, Long)] = {
     val kuduSession = kuduClient.newSession()
 
-    val rows = Range(0, rowCount).map { i =>
+    val rows = Range(startIndex, rowCount + startIndex).map { i =>
       val insert = targetTable.newInsert
       val row = insert.getRow
       row.addInt(0, i)
@@ -167,7 +177,7 @@ trait KuduTestSuite extends JUnitSuite {
       row.addBoolean(5, i % 2 == 1)
       row.addShort(6, i.toShort)
       row.addFloat(7, i.toFloat)
-      row.addBinary(8, s"bytes $i".getBytes())
+      row.addBinary(8, s"bytes $i".getBytes(UTF_8))
       val ts = System.currentTimeMillis() * 1000
       row.addLong(9, ts)
       row.addByte(10, i.toByte)
@@ -178,9 +188,11 @@ trait KuduTestSuite extends JUnitSuite {
       // Sprinkling some nulls so that queries see them.
       val s = if (i % 2 == 0) {
         row.addString(2, i.toString)
+        row.addVarchar(14, i.toString)
         i.toString
       } else {
         row.setNull(2)
+        row.setNull(14)
         null
       }
 
@@ -188,5 +200,57 @@ trait KuduTestSuite extends JUnitSuite {
       (i, i, s, ts)
     }
     rows
+  }
+
+  def upsertRowsWithRowDataSize(
+      targetTable: KuduTable,
+      rowCount: Integer,
+      rowDataSize: Integer): IndexedSeq[(Int, Int, String, Long)] = {
+    val kuduSession = kuduClient.newSession()
+
+    val rows = Range(0, rowCount).map { i =>
+      val upsert = targetTable.newUpsert
+      val row = upsert.getRow
+      row.addInt(0, i)
+      row.addInt(1, i)
+      row.addDouble(3, i.toDouble)
+      row.addLong(4, i.toLong)
+      row.addBoolean(5, i % 2 == 1)
+      row.addShort(6, i.toShort)
+      row.addFloat(7, i.toFloat)
+      row.addBinary(8, (s"*" * rowDataSize).getBytes(UTF_8))
+      val ts = System.currentTimeMillis() * 1000
+      row.addLong(9, ts)
+      row.addByte(10, i.toByte)
+      row.addDecimal(11, BigDecimal.valueOf(i))
+      row.addDecimal(12, BigDecimal.valueOf(i))
+      row.addDecimal(13, BigDecimal.valueOf(i))
+      row.addVarchar(14, i.toString)
+
+      // Sprinkling some nulls so that queries see them.
+      val s = if (i % 2 == 0) {
+        row.addString(2, i.toString)
+        i.toString
+      } else {
+        row.setNull(2)
+        null
+      }
+
+      kuduSession.apply(upsert)
+      (i, i, s, ts)
+    }
+    rows
+  }
+
+  /**
+   * Assuming that the only part of the logical plan is a Kudu scan, this
+   * function extracts the KuduRelation from the passed DataFrame for
+   * testing purposes.
+   */
+  def kuduRelationFromDataFrame(dataFrame: DataFrame) = {
+    val logicalPlan = dataFrame.queryExecution.logical
+    val logicalRelation = logicalPlan.asInstanceOf[LogicalRelation]
+    val baseRelation = logicalRelation.relation
+    baseRelation.asInstanceOf[KuduRelation]
   }
 }

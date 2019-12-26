@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <ostream>
 #include <string>
 
@@ -28,7 +29,9 @@
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/block_cache_metrics.h"
 #include "kudu/util/cache.h"
+#include "kudu/util/cache_metrics.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/flag_validators.h"
 #include "kudu/util/process_memory.h"
@@ -51,8 +54,9 @@ DEFINE_string(block_cache_type, "DRAM",
               "Which type of block cache to use for caching data. "
               "Valid choices are 'DRAM' or 'NVM'. DRAM, the default, "
               "caches data in regular memory. 'NVM' caches data "
-              "in a memory-mapped file using the NVML library.");
-TAG_FLAG(block_cache_type, experimental);
+              "in a memory-mapped file using the memkind library. To use 'NVM', "
+              "libmemkind 1.8.0 or newer must be available on the system; "
+              "otherwise Kudu will crash.");
 
 using strings::Substitute;
 
@@ -67,14 +71,27 @@ namespace cfile {
 namespace {
 
 Cache* CreateCache(int64_t capacity) {
-  CacheType t = BlockCache::GetConfiguredCacheTypeOrDie();
-  return NewLRUCache(t, capacity, "block_cache");
+  const auto mem_type = BlockCache::GetConfiguredCacheMemoryTypeOrDie();
+  switch (mem_type) {
+    case Cache::MemoryType::DRAM:
+      return NewCache<Cache::EvictionPolicy::LRU, Cache::MemoryType::DRAM>(
+          capacity, "block_cache");
+    case Cache::MemoryType::NVM:
+      return NewCache<Cache::EvictionPolicy::LRU, Cache::MemoryType::NVM>(
+          capacity, "block_cache");
+    default:
+      LOG(FATAL) << "unsupported LRU cache memory type: " << mem_type;
+      return nullptr;
+  }
 }
 
-// Validates the block cache capacity won't permit the cache to grow large enough
-// to cause pernicious flushing behavior. See KUDU-2318.
+} // anonymous namespace
+
 bool ValidateBlockCacheCapacity() {
   if (FLAGS_force_block_cache_capacity) {
+    return true;
+  }
+  if (FLAGS_block_cache_type != "DRAM") {
     return true;
   }
   int64_t capacity = FLAGS_block_cache_capacity_mb * 1024 * 1024;
@@ -99,17 +116,16 @@ bool ValidateBlockCacheCapacity() {
   return true;
 }
 
-} // anonymous namespace
 
 GROUP_FLAG_VALIDATOR(block_cache_capacity_mb, ValidateBlockCacheCapacity);
 
-CacheType BlockCache::GetConfiguredCacheTypeOrDie() {
+Cache::MemoryType BlockCache::GetConfiguredCacheMemoryTypeOrDie() {
     ToUpperCase(FLAGS_block_cache_type, &FLAGS_block_cache_type);
   if (FLAGS_block_cache_type == "NVM") {
-    return NVM_CACHE;
+    return Cache::MemoryType::NVM;
   }
   if (FLAGS_block_cache_type == "DRAM") {
-    return DRAM_CACHE;
+    return Cache::MemoryType::DRAM;
   }
 
   LOG(FATAL) << "Unknown block cache type: '" << FLAGS_block_cache_type
@@ -118,36 +134,38 @@ CacheType BlockCache::GetConfiguredCacheTypeOrDie() {
 }
 
 BlockCache::BlockCache()
-  : BlockCache(FLAGS_block_cache_capacity_mb * 1024 * 1024) {
+    : BlockCache(FLAGS_block_cache_capacity_mb * 1024 * 1024) {
 }
 
 BlockCache::BlockCache(size_t capacity)
-  : cache_(CreateCache(capacity)) {
+    : cache_(CreateCache(capacity)) {
 }
 
 BlockCache::PendingEntry BlockCache::Allocate(const CacheKey& key, size_t block_size) {
   Slice key_slice(reinterpret_cast<const uint8_t*>(&key), sizeof(key));
-  return PendingEntry(cache_.get(), cache_->Allocate(key_slice, block_size));
+  return PendingEntry(cache_->Allocate(key_slice, block_size));
 }
 
 bool BlockCache::Lookup(const CacheKey& key, Cache::CacheBehavior behavior,
-                        BlockCacheHandle *handle) {
-  Cache::Handle *h = cache_->Lookup(Slice(reinterpret_cast<const uint8_t*>(&key),
-                                          sizeof(key)), behavior);
-  if (h != nullptr) {
-    handle->SetHandle(cache_.get(), h);
+                        BlockCacheHandle* handle) {
+  auto h(cache_->Lookup(
+      Slice(reinterpret_cast<const uint8_t*>(&key), sizeof(key)), behavior));
+  if (h) {
+    handle->SetHandle(std::move(h));
+    return true;
   }
-  return h != nullptr;
+  return false;
 }
 
 void BlockCache::Insert(BlockCache::PendingEntry* entry, BlockCacheHandle* inserted) {
-  Cache::Handle *h = cache_->Insert(entry->handle_, /* eviction_callback= */ nullptr);
-  entry->handle_ = nullptr;
-  inserted->SetHandle(cache_.get(), h);
+  auto h(cache_->Insert(std::move(entry->handle_),
+                        /* eviction_callback= */ nullptr));
+  inserted->SetHandle(std::move(h));
 }
 
 void BlockCache::StartInstrumentation(const scoped_refptr<MetricEntity>& metric_entity) {
-  cache_->SetMetrics(metric_entity);
+  std::unique_ptr<BlockCacheMetrics> metrics(new BlockCacheMetrics(metric_entity));
+  cache_->SetMetrics(std::move(metrics));
 }
 
 } // namespace cfile

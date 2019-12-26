@@ -107,7 +107,7 @@ public class KuduSession implements SessionConfiguration {
   }
 
   /**
-   * Blocking call that flushes the buffers (see {@link #flush()} and closes the sessions.
+   * Blocking call that flushes the buffers (see {@link #flush()}) and closes the sessions.
    * @return List of OperationResponse, one per operation that was flushed
    * @throws KuduException if anything went wrong
    */
@@ -126,18 +126,19 @@ public class KuduSession implements SessionConfiguration {
   }
 
   @Override
-  public void setMutationBufferSpace(int size) {
-    session.setMutationBufferSpace(size);
+  public void setMutationBufferSpace(int numOps) {
+    session.setMutationBufferSpace(numOps);
   }
 
   @Override
+  @Deprecated
   public void setMutationBufferLowWatermark(float mutationBufferLowWatermarkPercentage) {
-    session.setMutationBufferLowWatermark(mutationBufferLowWatermarkPercentage);
+    LOG.warn("setMutationBufferLowWatermark is deprecated");
   }
 
   @Override
-  public void setFlushInterval(int interval) {
-    session.setFlushInterval(interval);
+  public void setFlushInterval(int intervalMillis) {
+    session.setFlushInterval(intervalMillis);
   }
 
   @Override
@@ -173,6 +174,16 @@ public class KuduSession implements SessionConfiguration {
   @Override
   public void setIgnoreAllDuplicateRows(boolean ignoreAllDuplicateRows) {
     session.setIgnoreAllDuplicateRows(ignoreAllDuplicateRows);
+  }
+
+  @Override
+  public boolean isIgnoreAllNotFoundRows() {
+    return session.isIgnoreAllNotFoundRows();
+  }
+
+  @Override
+  public void setIgnoreAllNotFoundRows(boolean ignoreAllNotFoundRows) {
+    session.setIgnoreAllNotFoundRows(ignoreAllNotFoundRows);
   }
 
   @Override

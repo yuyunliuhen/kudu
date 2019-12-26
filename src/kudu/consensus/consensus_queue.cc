@@ -76,7 +76,6 @@ TAG_FLAG(consensus_inject_latency_ms_in_notifications, unsafe);
 DECLARE_int32(consensus_rpc_timeout_ms);
 DECLARE_bool(safe_time_advancement_without_writes);
 DECLARE_bool(raft_prepare_replacement_before_eviction);
-DECLARE_bool(raft_attempt_to_replace_replica_without_majority);
 
 using kudu::log::Log;
 using kudu::pb_util::SecureDebugString;
@@ -93,14 +92,17 @@ namespace consensus {
 METRIC_DEFINE_gauge_int64(tablet, majority_done_ops, "Leader Operations Acked by Majority",
                           MetricUnit::kOperations,
                           "Number of operations in the leader queue ack'd by a majority but "
-                          "not all peers. This metric is always zero for followers.");
+                          "not all peers. This metric is always zero for followers.",
+                          kudu::MetricLevel::kDebug);
 METRIC_DEFINE_gauge_int64(tablet, in_progress_ops, "Operations in Progress",
                           MetricUnit::kOperations,
                           "Number of operations in the peer's queue ack'd by a minority of "
-                          "peers.");
+                          "peers.",
+                          kudu::MetricLevel::kDebug);
 METRIC_DEFINE_gauge_int64(tablet, ops_behind_leader, "Operations Behind Leader",
                           MetricUnit::kOperations,
-                          "Number of operations this server believes it is behind the leader.");
+                          "Number of operations this server believes it is behind the leader.",
+                          kudu::MetricLevel::kWarn);
 
 const char* PeerStatusToString(PeerStatus p) {
   switch (p) {
@@ -493,11 +495,9 @@ bool PeerMessageQueue::SafeToEvictUnlocked(const string& evict_uuid) const {
     VLOG(2) << LogPrefixUnlocked() << "Not evicting P $0 (only one voter would remain)";
     return false;
   }
-  // Unless the --raft_attempt_to_replace_replica_without_majority flag is set,
-  // don't evict anything if the remaining number of viable voters is not enough
-  // to form a majority of the remaining voters.
-  if (PREDICT_TRUE(!FLAGS_raft_attempt_to_replace_replica_without_majority) &&
-      remaining_viable_voters < MajoritySize(remaining_voters)) {
+  // Don't evict anything if the remaining number of viable voters is not enough
+  // to form a quorum.
+  if (remaining_viable_voters < MajoritySize(remaining_voters)) {
     VLOG(2) << LogPrefixUnlocked() << Substitute(
         "Not evicting P $0 (only $1/$2 remaining voters appear viable)",
         evict_uuid, remaining_viable_voters, remaining_voters);
@@ -696,11 +696,12 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
       }
       if (s.IsIncomplete()) {
         // IsIncomplete() means that we tried to read beyond the head of the log
-        // (in the future). See KUDU-1078.
-        LOG_WITH_PREFIX_UNLOCKED(ERROR) << "Error trying to read ahead of the log "
-                                        << "while preparing peer request: "
-                                        << s.ToString() << ". Destination peer: "
-                                        << peer_copy.ToString();
+        // (in the future). This is usually a sign that this peer is under load
+        // and is about to step down as leader. See KUDU-1078.
+        LOG_WITH_PREFIX_UNLOCKED(INFO) << "Error trying to read ahead of the log "
+                                       << "while preparing peer request: "
+                                       << s.ToString() << ". Destination peer: "
+                                       << peer_copy.ToString();
         return s;
       }
       LOG_WITH_PREFIX_UNLOCKED(FATAL) << "Error reading the log while preparing peer request: "
@@ -749,13 +750,17 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
 
   if (PREDICT_FALSE(VLOG_IS_ON(2))) {
     if (request->ops_size() > 0) {
-      VLOG_WITH_PREFIX_UNLOCKED(2) << "Sending request with operations to Peer: " << uuid
-          << ". Size: " << request->ops_size()
-          << ". From: " << SecureShortDebugString(request->ops(0).id()) << ". To: "
-          << SecureShortDebugString(request->ops(request->ops_size() - 1).id());
+      VLOG_WITH_PREFIX_UNLOCKED(2)
+          << Substitute("Sending request with operations to Peer: $0. Size: $1. From: $2. To: $3",
+                        uuid,
+                        request->ops_size(),
+                        SecureShortDebugString(request->ops(0).id()),
+                        SecureShortDebugString(request->ops(request->ops_size() - 1).id()));
     } else {
-      VLOG_WITH_PREFIX_UNLOCKED(2) << "Sending status only request to Peer: " << uuid
-          << ": " << SecureDebugString(*request);
+      VLOG_WITH_PREFIX_UNLOCKED(2)
+          << Substitute("Sending status only request to Peer: $0: $1",
+                        uuid,
+                        SecureDebugString(*request));
     }
   }
 
@@ -796,12 +801,14 @@ void PeerMessageQueue::AdvanceQueueWatermark(const char* type,
                                              ReplicaTypes replica_types,
                                              const TrackedPeer* who_caused) {
 
-  if (VLOG_IS_ON(2)) {
-    VLOG_WITH_PREFIX_UNLOCKED(2) << "Updating " << type << " watermark: "
-        << "Peer (" << who_caused->ToString() << ") changed from "
-        << replicated_before << " to " << replicated_after << ". "
-                                 << "Current value: " << *watermark;
-  }
+  VLOG_WITH_PREFIX_UNLOCKED(2)
+      << Substitute("Updating $0 watermark: Peer ($1) changed from $2 to $3. "
+                    "Current value: $4",
+                    type,
+                    who_caused->ToString(),
+                    OpIdToString(replicated_before),
+                    OpIdToString(replicated_after),
+                    *watermark);
 
   // Go through the peer's watermarks, we want the highest watermark that
   // 'num_peers_required' of peers has replicated. To find this we do the
@@ -854,15 +861,16 @@ void PeerMessageQueue::AdvanceQueueWatermark(const char* type,
   int64_t old_watermark = *watermark;
   *watermark = new_watermark;
 
-  VLOG_WITH_PREFIX_UNLOCKED(1) << "Updated " << type << " watermark "
-      << "from " << old_watermark << " to " << new_watermark;
+  VLOG_WITH_PREFIX_UNLOCKED(1)
+      << Substitute("Updated $0 watermark from $1 to $2",
+                    type, old_watermark, new_watermark);
   if (VLOG_IS_ON(3)) {
     VLOG_WITH_PREFIX_UNLOCKED(3) << "Peers: ";
-    for (const PeersMap::value_type& peer : peers_map_) {
+    for (const auto& peer : peers_map_) {
       VLOG_WITH_PREFIX_UNLOCKED(3) << "Peer: " << peer.second->ToString();
     }
     VLOG_WITH_PREFIX_UNLOCKED(3) << "Sorted watermarks:";
-    for (int64_t watermark : watermarks) {
+    for (const auto watermark : watermarks) {
       VLOG_WITH_PREFIX_UNLOCKED(3) << "Watermark: " << watermark;
     }
   }
@@ -1175,10 +1183,9 @@ bool PeerMessageQueue::ResponseFromPeer(const std::string& peer_uuid,
       CHECK_LE(response.responder_term(), queue_state_.current_term);
     }
 
-    if (PREDICT_FALSE(VLOG_IS_ON(2))) {
-      VLOG_WITH_PREFIX_UNLOCKED(2) << "Received Response from Peer (" << peer->ToString() << "). "
-          << "Response: " << SecureShortDebugString(response);
-    }
+    VLOG_WITH_PREFIX_UNLOCKED(2)
+        << Substitute("Received Response from Peer ($0). Response: $1",
+                      peer->ToString(), SecureShortDebugString(response));
 
     mode_copy = queue_state_.mode;
 
@@ -1252,7 +1259,11 @@ bool PeerMessageQueue::ResponseFromPeer(const std::string& peer_uuid,
   }
 
   if (mode_copy == LEADER && updated_commit_index != boost::none) {
+  // Suppress false positive about 'updated_commit_index' used when uninitialized.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
     NotifyObserversOfCommitIndexChange(*updated_commit_index);
+#pragma GCC diagnostic pop
   }
 
   return send_more_immediately;
@@ -1333,7 +1344,7 @@ void PeerMessageQueue::DumpToHtml(std::ostream& out) const {
 
   std::lock_guard<simple_spinlock> lock(queue_lock_);
   out << "<h3>Watermarks</h3>" << endl;
-  out << "<table>" << endl;;
+  out << "<table>" << endl;
   out << "  <tr><th>Peer</th><th>Watermark</th></tr>" << endl;
   for (const PeersMap::value_type& entry : peers_map_) {
     out << Substitute("  <tr><td>$0</td><td>$1</td></tr>",

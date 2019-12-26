@@ -35,6 +35,7 @@ import java.security.PrivilegedActionException;
 import java.security.PrivilegedExceptionAction;
 import java.security.cert.Certificate;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import javax.net.ssl.SSLEngine;
@@ -91,7 +92,7 @@ import org.apache.kudu.util.SecurityUtil;
 public class Negotiator extends SimpleChannelUpstreamHandler {
   private static final Logger LOG = LoggerFactory.getLogger(Negotiator.class);
 
-  private final SaslClientCallbackHandler SASL_CALLBACK = new SaslClientCallbackHandler();
+  private final SaslClientCallbackHandler saslCallback = new SaslClientCallbackHandler();
   private static final ImmutableSet<RpcHeader.RpcFeatureFlag> SUPPORTED_RPC_FEATURES =
       ImmutableSet.of(
           RpcHeader.RpcFeatureFlag.APPLICATION_FEATURE_FLAGS,
@@ -154,7 +155,7 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
    */
   private final SignedTokenPB authnToken;
 
-  private static enum AuthnTokenNotUsedReason {
+  private enum AuthnTokenNotUsedReason {
     NONE_AVAILABLE("no token is available"),
     NO_TRUSTED_CERTS("no TLS certificates are trusted by the client"),
     FORBIDDEN_BY_POLICY("this connection will be used to acquire a new token and " +
@@ -164,8 +165,10 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
     AuthnTokenNotUsedReason(String msg) {
       this.msg = msg;
     }
+
     final String msg;
-  };
+  }
+
   private AuthnTokenNotUsedReason authnTokenNotUsedReason = null;
 
   private State state = State.INITIAL;
@@ -398,7 +401,7 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
     Map<String, String> errorsByMech = Maps.newHashMap();
     Set<SaslMechanism> serverMechs = Sets.newHashSet();
     for (RpcHeader.NegotiatePB.SaslMechanism mech : response.getSaslMechanismsList()) {
-      switch (mech.getMechanism().toUpperCase()) {
+      switch (mech.getMechanism().toUpperCase(Locale.ENGLISH)) {
         case "GSSAPI":
           serverMechs.add(SaslMechanism.GSSAPI);
           break;
@@ -448,7 +451,7 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
                                            "kudu",
                                            remoteHostname,
                                            props,
-                                           SASL_CALLBACK);
+                                           saslCallback);
         chosenMech = clientMech;
         break;
       } catch (SaslException e) {
@@ -600,6 +603,9 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
     if (certs.length == 0) {
       throw new SSLPeerUnverifiedException("no peer cert found");
     }
+
+    // The first element of the array is the peer's own certificate.
+    peerCert = certs[0];
 
     // Don't wrap the TLS socket if we are using TLS for authentication only.
     boolean isAuthOnly = serverFeatures.contains(RpcFeatureFlag.TLS_AUTHENTICATION_ONLY) &&

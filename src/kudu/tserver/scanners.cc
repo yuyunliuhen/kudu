@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <ostream>
 
@@ -43,6 +44,7 @@
 #include "kudu/util/logging.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/status.h"
+#include "kudu/util/stopwatch.h"
 #include "kudu/util/thread.h"
 
 DEFINE_int32(scanner_ttl_ms, 60000,
@@ -61,9 +63,12 @@ TAG_FLAG(scan_history_count, experimental);
 METRIC_DEFINE_gauge_size(server, active_scanners,
                          "Active Scanners",
                          kudu::MetricUnit::kScanners,
-                         "Number of scanners that are currently active");
+                         "Number of scanners that are currently active",
+                         kudu::MetricLevel::kInfo);
 
 using std::string;
+using std::unique_ptr;
+using std::unordered_map;
 using std::vector;
 using strings::Substitute;
 
@@ -219,31 +224,38 @@ void ScannerManager::ListScanners(std::vector<SharedScanner>* scanners) const {
 }
 
 vector<ScanDescriptor> ScannerManager::ListScans() const {
-  vector<ScanDescriptor> scans;
+  unordered_map<string, ScanDescriptor> scans;
   for (const ScannerMapStripe* stripe : scanner_maps_) {
     shared_lock<RWMutex> l(stripe->lock_);
     for (const auto& se : stripe->scanners_by_id_) {
       if (se.second->IsInitialized()) {
-        scans.emplace_back(se.second->descriptor());
-        scans.back().state = ScanState::kActive;
+        ScanDescriptor desc = se.second->descriptor();
+        desc.state = ScanState::kActive;
+        EmplaceOrDie(&scans, se.first, std::move(desc));
       }
     }
   }
 
   {
     shared_lock<RWMutex> l(completed_scans_lock_);
-    scans.insert(scans.end(), completed_scans_.begin(), completed_scans_.end());
+    // A scanner in 'scans' may have completed between the above loop and here.
+    // As we'd rather have the finalized descriptor of the completed scan,
+    // update over the old descriptor in this case.
+    for (const auto& scan : completed_scans_) {
+      InsertOrUpdate(&scans, scan.scanner_id, scan);
+    }
   }
 
-  // TODO(dan): It's possible for a descriptor to be included twice in the
-  // result set if its scanner is concurrently removed from the scanner map.
+  vector<ScanDescriptor> ret;
+  ret.reserve(scans.size());
+  AppendValuesFromMap(scans, &ret);
 
   // Sort oldest to newest, so that the ordering is consistent across calls.
-  std::sort(scans.begin(), scans.end(), [] (const ScanDescriptor& a, const ScanDescriptor& b) {
+  std::sort(ret.begin(), ret.end(), [] (const ScanDescriptor& a, const ScanDescriptor& b) {
       return a.start_time > b.start_time;
   });
 
-  return scans;
+  return ret;
 }
 
 void ScannerManager::RemoveExpiredScanners() {
@@ -341,11 +353,16 @@ void Scanner::UpdateAccessTime() {
   last_access_time_ = MonoTime::Now();
 }
 
-void Scanner::Init(gscoped_ptr<RowwiseIterator> iter,
+void Scanner::AddTimings(const CpuTimes& elapsed) {
+  std::lock_guard<simple_spinlock> l(lock_);
+  cpu_times_.Add(elapsed);
+}
+
+void Scanner::Init(unique_ptr<RowwiseIterator> iter,
                    gscoped_ptr<ScanSpec> spec) {
   std::lock_guard<simple_spinlock> l(lock_);
   CHECK(!iter_) << "Already initialized";
-  iter_.reset(iter.release());
+  iter_ = std::move(iter);
   spec_.reset(spec.release());
 }
 
@@ -404,9 +421,15 @@ ScanDescriptor Scanner::descriptor() const {
     std::lock_guard<simple_spinlock> l(lock_);
     descriptor.last_call_seq_id = call_seq_id_;
     descriptor.last_access_time = last_access_time_;
+    descriptor.cpu_times = cpu_times_;
   }
 
   return descriptor;
+}
+
+CpuTimes Scanner::cpu_times() const {
+  std::lock_guard<simple_spinlock> l(lock_);
+  return cpu_times_;
 }
 
 } // namespace tserver

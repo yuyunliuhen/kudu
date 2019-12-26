@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <string>
@@ -40,6 +41,7 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/rebalance/cluster_status.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet.pb.h"
@@ -58,27 +60,38 @@ DECLARE_string(color);
 DECLARE_string(ksck_format);
 DECLARE_uint32(truncate_server_csv_length);
 
-namespace kudu {
-namespace tools {
+using kudu::cluster_summary::ConsensusConfigType;
+using kudu::cluster_summary::ConsensusState;
+using kudu::cluster_summary::ConsensusStateMap;
+using kudu::cluster_summary::ReplicaSummary;
+using kudu::cluster_summary::ServerHealth;
+using kudu::cluster_summary::ServerHealthSummary;
+using kudu::cluster_summary::TableSummary;
+using kudu::cluster_summary::TabletSummary;
+using kudu::server::GetFlagsResponsePB;
+using kudu::tablet::TabletDataState;
 
-using server::GetFlagsResponsePB;
 using std::ostringstream;
 using std::shared_ptr;
 using std::static_pointer_cast;
 using std::string;
-using std::unordered_map;
 using std::vector;
 using strings::Substitute;
-using tablet::TabletDataState;
+
+namespace kudu {
+namespace tools {
 
 class MockKsckMaster : public KsckMaster {
  public:
-  explicit MockKsckMaster(const string& address, const string& uuid)
+  explicit MockKsckMaster(const string& address, const string& uuid, bool is_get_flags_available)
       : KsckMaster(address),
-        fetch_info_status_(Status::OK()) {
+        fetch_info_status_(Status::OK()),
+        is_get_flags_available_(is_get_flags_available) {
     uuid_ = uuid;
     version_ = "mock-version";
-    flags_ = GetFlagsResponsePB{};
+    if (is_get_flags_available_) {
+      flags_ = GetFlagsResponsePB{};
+    }
   }
 
   Status Init() override {
@@ -99,8 +112,12 @@ class MockKsckMaster : public KsckMaster {
   }
 
   Status FetchUnusualFlags() override {
-    flags_state_ = KsckFetchState::FETCHED;
-    return Status::OK();
+    if (is_get_flags_available_) {
+      flags_state_ = KsckFetchState::FETCHED;
+      return Status::OK();
+    }
+    flags_state_ = KsckFetchState::FETCH_FAILED;
+    return Status::RemoteError("GetFlags not available");
   }
 
   // Public because the unit tests mutate these variables directly.
@@ -110,20 +127,25 @@ class MockKsckMaster : public KsckMaster {
   using KsckMaster::cstate_;
   using KsckMaster::flags_;
   using KsckMaster::version_;
+ private:
+  const bool is_get_flags_available_;
 };
 
 class MockKsckTabletServer : public KsckTabletServer {
  public:
-  explicit MockKsckTabletServer(const string& uuid)
+  explicit MockKsckTabletServer(const string& uuid, bool is_get_flags_available)
       : KsckTabletServer(uuid),
         fetch_info_status_(Status::OK()),
-        fetch_info_health_(KsckServerHealth::HEALTHY),
-        address_("<mock>") {
+        fetch_info_health_(ServerHealth::HEALTHY),
+        address_("<mock>"),
+        is_get_flags_available_(is_get_flags_available) {
     version_ = "mock-version";
-    flags_ = GetFlagsResponsePB{};
+    if (is_get_flags_available_) {
+      flags_ = GetFlagsResponsePB{};
+    }
   }
 
-  Status FetchInfo(KsckServerHealth* health) override {
+  Status FetchInfo(ServerHealth* health) override {
     CHECK(health);
     *health = fetch_info_health_;
     timestamp_ = 12345;
@@ -135,13 +157,17 @@ class MockKsckTabletServer : public KsckTabletServer {
     return fetch_info_status_;
   }
 
-  Status FetchConsensusState(KsckServerHealth* /*health*/) override {
+  Status FetchConsensusState(ServerHealth* /*health*/) override {
     return Status::OK();
   }
 
   Status FetchUnusualFlags() override {
-    flags_state_ = KsckFetchState::FETCHED;
-    return Status::OK();
+    if (is_get_flags_available_) {
+      flags_state_ = KsckFetchState::FETCHED;
+      return Status::OK();
+    }
+    flags_state_ = KsckFetchState::FETCH_FAILED;
+    return Status::RemoteError("GetFlags not available");
   }
 
   void FetchCurrentTimestampAsync() override {}
@@ -167,7 +193,7 @@ class MockKsckTabletServer : public KsckTabletServer {
 
   // Public because the unit tests mutate these variables directly.
   Status fetch_info_status_;
-  KsckServerHealth fetch_info_health_;
+  ServerHealth fetch_info_health_;
   // The fake checksum for replicas on this mock server.
   uint64_t checksum_ = 0;
   // The fake progress amount for this mock server, used to mock checksum
@@ -179,6 +205,7 @@ class MockKsckTabletServer : public KsckTabletServer {
 
  private:
   const string address_;
+  const bool is_get_flags_available_;
 };
 
 class MockKsckCluster : public KsckCluster {
@@ -199,7 +226,11 @@ class MockKsckCluster : public KsckCluster {
     return Status::OK();
   }
 
-  virtual Status RetrieveTabletsList(const shared_ptr<KsckTable>& table) override {
+  virtual Status RetrieveAllTablets() override {
+    return Status::OK();
+  }
+
+  virtual Status RetrieveTabletsList(const shared_ptr<KsckTable>& /* unused */) override {
     return Status::OK();
   }
 
@@ -216,7 +247,9 @@ class KsckTest : public KuduTest {
       : cluster_(new MockKsckCluster()),
         ksck_(new Ksck(cluster_, &err_stream_)) {
     FLAGS_color = "never";
+  }
 
+  void SetUp() override {
     // Set up the master consensus state.
     consensus::ConsensusStatePB cstate;
     cstate.set_current_term(0);
@@ -230,7 +263,7 @@ class KsckTest : public KuduTest {
     for (int i = 0; i < 3; i++) {
       const string uuid = Substitute("master-id-$0", i);
       const string addr = Substitute("master-$0", i);
-      shared_ptr<MockKsckMaster> master = std::make_shared<MockKsckMaster>(addr, uuid);
+      auto master = std::make_shared<MockKsckMaster>(addr, uuid, IsGetFlagsAvailable());
       master->cstate_ = cstate;
       cluster_->masters_.push_back(master);
     }
@@ -238,7 +271,7 @@ class KsckTest : public KuduTest {
     KsckCluster::TSMap tablet_servers;
     for (int i = 0; i < 3; i++) {
       string name = Substitute("ts-id-$0", i);
-      shared_ptr<MockKsckTabletServer> ts(new MockKsckTabletServer(name));
+      auto ts = std::make_shared<MockKsckTabletServer>(name, IsGetFlagsAvailable());
       InsertOrDie(&tablet_servers, ts->uuid(), ts);
     }
     cluster_->tablet_servers_.swap(tablet_servers);
@@ -246,14 +279,14 @@ class KsckTest : public KuduTest {
 
  protected:
   // Returns the expected summary for a table with the given tablet states.
-  std::string ExpectedKsckTableSummary(const string& table_name,
-                                       int replication_factor,
-                                       int healthy_tablets,
-                                       int recovering_tablets,
-                                       int underreplicated_tablets,
-                                       int consensus_mismatch_tablets,
-                                       int unavailable_tablets) {
-    KsckTableSummary table_summary;
+  std::string ExpectedTableSummary(const string& table_name,
+                                   int replication_factor,
+                                   int healthy_tablets,
+                                   int recovering_tablets,
+                                   int underreplicated_tablets,
+                                   int consensus_mismatch_tablets,
+                                   int unavailable_tablets) {
+    TableSummary table_summary;
     table_summary.name = table_name;
     table_summary.replication_factor = replication_factor;
     table_summary.healthy_tablets = healthy_tablets;
@@ -272,7 +305,7 @@ class KsckTest : public KuduTest {
         // written to expect a reversed order and doing that here is more
         // convenient than rewriting many ASSERTs.
         std::reverse(assignment_plan_.begin(), assignment_plan_.end());
-      })
+      });
     while (tablets_count > 0) {
       for (const auto& entry : cluster_->tablet_servers_) {
         if (tablets_count-- == 0) return;
@@ -403,10 +436,16 @@ class KsckTest : public KuduTest {
     return ksck_->RunAndPrintResults();
   }
 
-  const string KsckResultsToJsonString() {
+  const string KsckResultsToJsonString(int sections = PrintSections::ALL_SECTIONS) {
     ostringstream json_stream;
-    ksck_->results().PrintJsonTo(PrintMode::JSON_COMPACT, json_stream);
+    ksck_->results().PrintJsonTo(PrintMode::JSON_COMPACT,
+                                 sections,
+                                 json_stream);
     return json_stream.str();
+  }
+
+  virtual bool IsGetFlagsAvailable() const {
+    return true;
   }
 
   shared_ptr<MockKsckCluster> cluster_;
@@ -421,6 +460,13 @@ class KsckTest : public KuduTest {
   std::ostringstream err_stream_;
 };
 
+class GetFlagsUnavailableKsckTest : public KsckTest {
+ protected:
+  bool IsGetFlagsAvailable() const override {
+    return false;
+  }
+};
+
 // Helpful macros for checking JSON fields vs. expected values.
 // In all cases, the meaning of the parameters are as follows:
 // 'reader' is the JsonReader that owns the parsed JSON data.
@@ -433,24 +479,24 @@ class KsckTest : public KuduTest {
   string actual; \
   ASSERT_OK((reader).ExtractString((value), (field), &actual)); \
   EXPECT_EQ((expected), actual); \
-} while (0);
+} while (0)
 
 #define EXPECT_JSON_INT_FIELD(reader, value, field, expected) do { \
   int64_t actual; \
   ASSERT_OK((reader).ExtractInt64((value), (field), &actual)); \
   EXPECT_EQ((expected), actual); \
-} while (0);
+} while (0)
 
 #define EXPECT_JSON_BOOL_FIELD(reader, value, field, expected) do { \
   bool actual; \
   ASSERT_OK((reader).ExtractBool((value), (field), &actual)); \
   EXPECT_EQ((expected), actual); \
-} while (0);
+} while (0)
 
 #define EXPECT_JSON_FIELD_NOT_PRESENT(reader, value, field) do { \
   int64_t unused; \
   ASSERT_TRUE((reader).ExtractInt64((value), (field), &unused).IsNotFound()); \
-} while (0);
+} while (0)
 
 // 'array' is a vector<const rapidjson::Value*> into which the array elements
 // will be extracted.
@@ -458,19 +504,20 @@ class KsckTest : public KuduTest {
 #define EXTRACT_ARRAY_CHECK_SIZE(reader, value, field, array, exp_size) do { \
   ASSERT_OK((reader).ExtractObjectArray((value), (field), &(array))); \
   ASSERT_EQ(exp_size, (array).size()); \
-} while (0);
+} while (0)
 
-void CheckJsonVsServerHealthSummaries(const JsonReader& r,
-                                      const string& key,
-                                      const vector<KsckServerHealthSummary>& summaries) {
-  if (summaries.empty()) {
+void CheckJsonVsServerHealthSummaries(
+    const JsonReader& r,
+    const string& key,
+    const boost::optional<vector<ServerHealthSummary>>& summaries) {
+  if (!summaries || summaries->empty()) {
     EXPECT_JSON_FIELD_NOT_PRESENT(r, r.root(), key.c_str());
     return;
   }
   vector<const rapidjson::Value*> health;
-  EXTRACT_ARRAY_CHECK_SIZE(r, r.root(), key.c_str(), health, summaries.size());
-  for (int i = 0; i < summaries.size(); i++) {
-    const auto& summary = summaries[i];
+  EXTRACT_ARRAY_CHECK_SIZE(r, r.root(), key.c_str(), health, summaries->size());
+  for (int i = 0; i < summaries->size(); i++) {
+    const auto& summary = (*summaries)[i];
     const auto* server = health[i];
     EXPECT_JSON_STRING_FIELD(r, server, "uuid", summary.uuid);
     EXPECT_JSON_STRING_FIELD(r, server, "address", summary.address);
@@ -482,25 +529,24 @@ void CheckJsonVsServerHealthSummaries(const JsonReader& r,
   }
 }
 
-const string KsckConsensusConfigTypeToString(KsckConsensusConfigType t) {
+const string ConsensusConfigTypeToString(ConsensusConfigType t) {
   switch (t) {
-    case KsckConsensusConfigType::COMMITTED:
+    case ConsensusConfigType::COMMITTED:
       return "COMMITTED";
-    case KsckConsensusConfigType::PENDING:
+    case ConsensusConfigType::PENDING:
       return "PENDING";
-    case KsckConsensusConfigType::MASTER:
+    case ConsensusConfigType::MASTER:
       return "MASTER";
     default:
-      LOG(FATAL) << "unknown KsckConsensusConfigType";
+      LOG(FATAL) << "unknown ConsensusConfigType";
   }
 }
 
 void CheckJsonVsConsensusState(const JsonReader& r,
                                const rapidjson::Value* cstate,
-                               const string& ref_id,
-                               const KsckConsensusState& ref_cstate) {
+                               const ConsensusState& ref_cstate) {
   EXPECT_JSON_STRING_FIELD(r, cstate, "type",
-                           KsckConsensusConfigTypeToString(ref_cstate.type));
+                           ConsensusConfigTypeToString(ref_cstate.type));
   if (ref_cstate.leader_uuid) {
     EXPECT_JSON_STRING_FIELD(r, cstate, "leader_uuid", ref_cstate.leader_uuid);
   } else {
@@ -546,7 +592,7 @@ void CheckJsonVsConsensusState(const JsonReader& r,
 
 void CheckJsonVsReplicaSummary(const JsonReader& r,
                                const rapidjson::Value* replica,
-                               const KsckReplicaSummary& ref_replica) {
+                               const ReplicaSummary& ref_replica) {
   EXPECT_JSON_STRING_FIELD(r, replica, "ts_uuid", ref_replica.ts_uuid);
   if (ref_replica.ts_address) {
     EXPECT_JSON_STRING_FIELD(r, replica, "ts_address", ref_replica.ts_address);
@@ -573,7 +619,7 @@ void CheckJsonVsReplicaSummary(const JsonReader& r,
   if (ref_replica.consensus_state) {
     const rapidjson::Value* cstate;
     ASSERT_OK(r.ExtractObject(replica, "consensus_state", &cstate));
-    CheckJsonVsConsensusState(r, cstate, ref_replica.ts_uuid, *ref_replica.consensus_state);
+    CheckJsonVsConsensusState(r, cstate, *ref_replica.consensus_state);
   } else {
     EXPECT_JSON_FIELD_NOT_PRESENT(r, replica, "consensus_state");
   }
@@ -581,37 +627,37 @@ void CheckJsonVsReplicaSummary(const JsonReader& r,
 
 void CheckJsonVsMasterConsensus(const JsonReader& r,
                                 bool ref_conflict,
-                                const KsckConsensusStateMap& ref_cstates) {
-  if (ref_cstates.empty()) {
+                                const boost::optional<ConsensusStateMap>& ref_cstates) {
+  if (!ref_cstates || ref_cstates->empty()) {
     EXPECT_JSON_FIELD_NOT_PRESENT(r, r.root(), "master_consensus_states");
     return;
   }
   EXPECT_JSON_BOOL_FIELD(r, r.root(), "master_consensus_conflict", ref_conflict);
   vector<const rapidjson::Value*> cstates;
   EXTRACT_ARRAY_CHECK_SIZE(r, r.root(), "master_consensus_states",
-                           cstates, ref_cstates.size());
+                           cstates, ref_cstates->size());
   int i = 0;
-  for (const auto& entry : ref_cstates) {
-    CheckJsonVsConsensusState(r, cstates[i++], entry.first, entry.second);
+  for (const auto& entry : *ref_cstates) {
+    CheckJsonVsConsensusState(r, cstates[i++], entry.second);
   }
 }
 
 void CheckJsonVsTableSummaries(const JsonReader& r,
                                const string& key,
-                               const vector<KsckTableSummary>& ref_tables) {
-  if (ref_tables.empty()) {
+                               const boost::optional<vector<TableSummary>>& ref_tables) {
+  if (!ref_tables || ref_tables->empty()) {
     EXPECT_JSON_FIELD_NOT_PRESENT(r, r.root(), key.c_str());
     return;
   }
   vector<const rapidjson::Value*> tables;
-  EXTRACT_ARRAY_CHECK_SIZE(r, r.root(), key.c_str(), tables, ref_tables.size());
-  for (int i = 0; i < ref_tables.size(); i++) {
-    const auto& ref_table = ref_tables[i];
+  EXTRACT_ARRAY_CHECK_SIZE(r, r.root(), key.c_str(), tables, ref_tables->size());
+  for (int i = 0; i < ref_tables->size(); i++) {
+    const auto& ref_table = (*ref_tables)[i];
     const auto* table = tables[i];
     EXPECT_JSON_STRING_FIELD(r, table, "id", ref_table.id);
     EXPECT_JSON_STRING_FIELD(r, table, "name", ref_table.name);
     EXPECT_JSON_STRING_FIELD(r, table,
-                             "health", KsckCheckResultToString(ref_table.TableStatus()));
+                             "health", HealthCheckResultToString(ref_table.TableStatus()));
     EXPECT_JSON_INT_FIELD(r, table,
                           "replication_factor", ref_table.replication_factor);
     EXPECT_JSON_INT_FIELD(r, table,
@@ -631,25 +677,25 @@ void CheckJsonVsTableSummaries(const JsonReader& r,
 
 void CheckJsonVsTabletSummaries(const JsonReader& r,
                                 const string& key,
-                                const vector<KsckTabletSummary>& ref_tablets) {
-  if (ref_tablets.empty()) {
+                                const boost::optional<vector<TabletSummary>>& ref_tablets) {
+  if (!ref_tablets || ref_tablets->empty()) {
     EXPECT_JSON_FIELD_NOT_PRESENT(r, r.root(), key.c_str());
     return;
   }
   vector<const rapidjson::Value*> tablets;
-  EXTRACT_ARRAY_CHECK_SIZE(r, r.root(), key.c_str(), tablets, ref_tablets.size());
-  for (int i = 0; i < ref_tablets.size(); i++) {
-    const auto& ref_tablet = ref_tablets[i];
+  EXTRACT_ARRAY_CHECK_SIZE(r, r.root(), key.c_str(), tablets, ref_tablets->size());
+  for (int i = 0; i < ref_tablets->size(); i++) {
+    const auto& ref_tablet = (*ref_tablets)[i];
     const auto& tablet = tablets[i];
     EXPECT_JSON_STRING_FIELD(r, tablet, "id", ref_tablet.id);
     EXPECT_JSON_STRING_FIELD(r, tablet, "table_id", ref_tablet.table_id);
     EXPECT_JSON_STRING_FIELD(r, tablet, "table_name", ref_tablet.table_name);
     EXPECT_JSON_STRING_FIELD(r, tablet,
-                             "health", KsckCheckResultToString(ref_tablet.result));
+                             "health", HealthCheckResultToString(ref_tablet.result));
     EXPECT_JSON_STRING_FIELD(r, tablet, "status", ref_tablet.status);
     const rapidjson::Value* master_cstate;
     ASSERT_OK(r.ExtractObject(tablet, "master_cstate", &master_cstate));
-    CheckJsonVsConsensusState(r, master_cstate, "master", ref_tablet.master_cstate);
+    CheckJsonVsConsensusState(r, master_cstate, ref_tablet.master_cstate);
     if (ref_tablet.replicas.empty()) {
       EXPECT_JSON_FIELD_NOT_PRESENT(r, tablet, "replicas");
       continue;
@@ -667,24 +713,24 @@ void CheckJsonVsTabletSummaries(const JsonReader& r,
 
 void CheckJsonVsChecksumResults(const JsonReader& r,
                                 const string& key,
-                                const KsckChecksumResults& ref_checksum_results) {
-  if (ref_checksum_results.tables.empty()) {
+                                const boost::optional<KsckChecksumResults>& ref_checksum_results) {
+  if (!ref_checksum_results || ref_checksum_results->tables.empty()) {
     EXPECT_JSON_FIELD_NOT_PRESENT(r, r.root(), key.c_str());
     return;
   }
   const rapidjson::Value* checksum_results;
   ASSERT_OK(r.ExtractObject(r.root(), key.c_str(), &checksum_results));
-  if (ref_checksum_results.snapshot_timestamp) {
+  if (ref_checksum_results->snapshot_timestamp) {
     EXPECT_JSON_INT_FIELD(r, checksum_results,
-                          "snapshot_timestamp", *ref_checksum_results.snapshot_timestamp);
+                          "snapshot_timestamp", *ref_checksum_results->snapshot_timestamp);
   } else {
     EXPECT_JSON_FIELD_NOT_PRESENT(r, checksum_results, "snapshot_timestamp");
   }
   vector<const rapidjson::Value*> tables;
   EXTRACT_ARRAY_CHECK_SIZE(r, checksum_results, "tables",
-                           tables, ref_checksum_results.tables.size());
+                           tables, ref_checksum_results->tables.size());
   int i = 0;
-  for (const auto& table_entry : ref_checksum_results.tables) {
+  for (const auto& table_entry : ref_checksum_results->tables) {
     const auto& ref_table = table_entry.second;
     const auto* table = tables[i++];
     EXPECT_JSON_STRING_FIELD(r, table, "name", table_entry.first);
@@ -716,6 +762,60 @@ void CheckJsonVsChecksumResults(const JsonReader& r,
   }
 }
 
+void CheckJsonVsVersionSummaries(const JsonReader& r,
+                                 const string& key,
+                                 const boost::optional<KsckVersionToServersMap>& ref_result) {
+  if (!ref_result || ref_result->empty()) {
+    EXPECT_JSON_FIELD_NOT_PRESENT(r, r.root(), key.c_str());
+    return;
+  }
+
+  vector<const rapidjson::Value*> version_servers_map;
+  EXTRACT_ARRAY_CHECK_SIZE(r, r.root(), key.c_str(), version_servers_map, ref_result->size());
+  auto version_servers = version_servers_map.begin();
+  for (const auto& ref_version_servers : *ref_result) {
+    ASSERT_NE(version_servers, version_servers_map.end());
+    EXPECT_JSON_STRING_FIELD(r, *version_servers, "version", ref_version_servers.first);
+    vector<const rapidjson::Value *> servers;
+    EXTRACT_ARRAY_CHECK_SIZE(r, *version_servers, "servers", servers,
+                             ref_version_servers.second.size());
+    auto server = servers.begin();
+    for (const auto& ref_server : ref_version_servers.second) {
+      ASSERT_NE(server, servers.end());
+      EXPECT_EQ((*server)->GetString(), ref_server);
+      ++server;
+    }
+    ++version_servers;
+  }
+}
+
+void CheckJsonVsCountSummaries(const JsonReader& r,
+                               const string& key,
+                               const boost::optional<KsckResults>& ref_result) {
+  if (!ref_result) {
+    EXPECT_JSON_FIELD_NOT_PRESENT(r, r.root(), key.c_str());
+    return;
+  }
+  vector<const rapidjson::Value*> count_results;
+  EXTRACT_ARRAY_CHECK_SIZE(r, r.root(), key.c_str(), count_results, 1);
+
+  EXPECT_JSON_INT_FIELD(r, count_results[0], "masters",
+                        ref_result->cluster_status.master_summaries.size());
+  EXPECT_JSON_INT_FIELD(r, count_results[0], "tservers",
+                        ref_result->cluster_status.tserver_summaries.size());
+  EXPECT_JSON_INT_FIELD(r, count_results[0], "tables",
+                        ref_result->cluster_status.table_summaries.size());
+  EXPECT_JSON_INT_FIELD(r, count_results[0], "tablets",
+                        ref_result->cluster_status.tablet_summaries.size());
+  int replica_count = std::accumulate(ref_result->cluster_status.tablet_summaries.begin(),
+                                      ref_result->cluster_status.tablet_summaries.end(),
+                                      0,
+                                      [](int acc, const TabletSummary& ts) {
+                                        return acc + ts.replicas.size();
+                                      });
+  EXPECT_JSON_INT_FIELD(r, count_results[0], "replicas", replica_count);
+}
+
 void CheckJsonVsErrors(const JsonReader& r,
                        const string& key,
                        const vector<Status>& ref_errors) {
@@ -730,19 +830,97 @@ void CheckJsonVsErrors(const JsonReader& r,
   }
 }
 
-void CheckJsonStringVsKsckResults(const string& json, const KsckResults& results) {
+void CheckPlainStringSection(const string& plain, const string& header, bool present) {
+  if (present) {
+    ASSERT_STR_CONTAINS(plain, header);
+  } else {
+    ASSERT_STR_NOT_CONTAINS(plain, header);
+  }
+}
+
+void CheckPlainStringSections(const string& plain, int sections) {
+  CheckPlainStringSection(plain,
+                          "Master Summary\n",
+                          sections & PrintSections::Values::MASTER_SUMMARIES);
+  CheckPlainStringSection(plain,
+                          "Tablet Server Summary\n",
+                          sections & PrintSections::Values::TSERVER_SUMMARIES);
+  CheckPlainStringSection(plain,
+                          "Version Summary\n",
+                          sections & PrintSections::Values::VERSION_SUMMARIES);
+  CheckPlainStringSection(plain,
+                          "Tablet Summary\n",
+                          sections & PrintSections::Values::TABLET_SUMMARIES);
+  CheckPlainStringSection(plain,
+                          "Summary by table\n",
+                          sections & PrintSections::Values::TABLE_SUMMARIES);
+  CheckPlainStringSection(plain,
+                          "Checksum Summary\n",
+                          sections & PrintSections::Values::CHECKSUM_RESULTS);
+  CheckPlainStringSection(plain,
+                          "Total Count Summary\n",
+                          sections & PrintSections::Values::TOTAL_COUNT);
+}
+
+void CheckJsonStringVsKsckResults(const string& json,
+                                  const KsckResults& results,
+                                  int sections = PrintSections::ALL_SECTIONS) {
   JsonReader r(json);
   ASSERT_OK(r.Init());
 
-  CheckJsonVsServerHealthSummaries(r, "master_summaries", results.master_summaries);
-  CheckJsonVsMasterConsensus(r,
-                             results.master_consensus_conflict,
-                             results.master_consensus_state_map);
-  CheckJsonVsServerHealthSummaries(r, "tserver_summaries", results.tserver_summaries);
-  CheckJsonVsTabletSummaries(r, "tablet_summaries", results.tablet_summaries);;
-  CheckJsonVsTableSummaries(r, "table_summaries", results.table_summaries);;
-  CheckJsonVsChecksumResults(r, "checksum_results", results.checksum_results);
+  CheckJsonVsServerHealthSummaries(
+      r,
+      "master_summaries",
+      sections & PrintSections::Values::MASTER_SUMMARIES ?
+      boost::optional<vector<ServerHealthSummary>>
+        (results.cluster_status.master_summaries) : boost::none);
+  CheckJsonVsMasterConsensus(
+      r,
+      results.cluster_status.master_consensus_conflict,
+      sections & PrintSections::Values::MASTER_SUMMARIES ?
+      boost::optional<ConsensusStateMap>
+        (results.cluster_status.master_consensus_state_map) : boost::none);
+  CheckJsonVsServerHealthSummaries(
+      r,
+      "tserver_summaries",
+      sections & PrintSections::Values::TSERVER_SUMMARIES ?
+      boost::optional<vector<ServerHealthSummary>>
+        (results.cluster_status.tserver_summaries) : boost::none);
+  CheckJsonVsVersionSummaries(
+      r,
+      "version_summaries",
+      sections & PrintSections::Values::VERSION_SUMMARIES ?
+      boost::optional<KsckVersionToServersMap>
+        (results.version_summaries) : boost::none);
+  CheckJsonVsTabletSummaries(
+      r,
+      "tablet_summaries",
+      sections & PrintSections::Values::TABLET_SUMMARIES ?
+      boost::optional<vector<TabletSummary>>
+        (results.cluster_status.tablet_summaries) : boost::none);
+  CheckJsonVsTableSummaries(
+      r,
+      "table_summaries",
+      sections & PrintSections::Values::TABLE_SUMMARIES ?
+      boost::optional<vector<TableSummary>>
+        (results.cluster_status.table_summaries) : boost::none);
+  CheckJsonVsChecksumResults(
+      r,
+      "checksum_results",
+      sections & PrintSections::Values::CHECKSUM_RESULTS ?
+      boost::optional<KsckChecksumResults>(results.checksum_results) : boost::none);
+  CheckJsonVsCountSummaries(
+      r,
+      "count_summaries",
+      sections & PrintSections::Values::TOTAL_COUNT ?
+      boost::optional<KsckResults>(results) : boost::none);
   CheckJsonVsErrors(r, "errors", results.error_messages);
+}
+
+void CheckMessageNotPresent(const vector<Status>& messages, const string& msg) {
+  for (const auto& status : messages) {
+    ASSERT_STR_NOT_CONTAINS(status.ToString(), msg);
+  }
 }
 
 TEST_F(KsckTest, TestServersOk) {
@@ -934,6 +1112,14 @@ TEST_F(KsckTest, TestMasterFlagCheck) {
       " hidden_unsafe_flag | 1     | hidden,unsafe | master-1");
 }
 
+TEST_F(GetFlagsUnavailableKsckTest, TestMasterFlagsUnavailable) {
+  ASSERT_OK(ksck_->CheckMasterHealth());
+  ASSERT_TRUE(ksck_->CheckMasterUnusualFlags().IsIncomplete());
+
+  static const string flags_msg = "unable to get flag information for master";
+  CheckMessageNotPresent(ksck_->results().warning_messages, flags_msg);
+}
+
 TEST_F(KsckTest, TestWrongUUIDTabletServer) {
   CreateOneTableOneTablet();
 
@@ -942,7 +1128,7 @@ TEST_F(KsckTest, TestWrongUUIDTabletServer) {
   static_pointer_cast<MockKsckTabletServer>(cluster_->tablet_servers_["ts-id-1"])
     ->fetch_info_status_ = error;
   static_pointer_cast<MockKsckTabletServer>(cluster_->tablet_servers_["ts-id-1"])
-    ->fetch_info_health_ = KsckServerHealth::WRONG_SERVER_UUID;
+    ->fetch_info_health_ = ServerHealth::WRONG_SERVER_UUID;
 
   ASSERT_OK(ksck_->CheckClusterRunning());
   ASSERT_OK(ksck_->FetchTableAndTabletInfo());
@@ -967,7 +1153,7 @@ TEST_F(KsckTest, TestBadTabletServer) {
   static_pointer_cast<MockKsckTabletServer>(cluster_->tablet_servers_["ts-id-1"])
       ->fetch_info_status_ = error;
   static_pointer_cast<MockKsckTabletServer>(cluster_->tablet_servers_["ts-id-1"])
-      ->fetch_info_health_ = KsckServerHealth::UNAVAILABLE;
+      ->fetch_info_health_ = ServerHealth::UNAVAILABLE;
 
   ASSERT_OK(ksck_->CheckClusterRunning());
   ASSERT_OK(ksck_->FetchTableAndTabletInfo());
@@ -1060,6 +1246,14 @@ TEST_F(KsckTest, TestTserverFlagCheck) {
       " hidden_unsafe_flag | 1     | hidden,unsafe | <mock>");
 }
 
+TEST_F(GetFlagsUnavailableKsckTest, TestTserverFlagsUnavailable) {
+  ASSERT_OK(ksck_->FetchInfoFromTabletServers());
+  ASSERT_TRUE(ksck_->CheckTabletServerUnusualFlags().IsIncomplete());
+
+  static const string flags_msg = "unable to get flag information for tablet server";
+  CheckMessageNotPresent(ksck_->results().warning_messages, flags_msg);
+}
+
 TEST_F(KsckTest, TestOneTableCheck) {
   CreateOneTableOneTablet();
   FLAGS_checksum_scan = true;
@@ -1080,74 +1274,17 @@ TEST_F(KsckTest, TestOneSmallReplicatedTable) {
   CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
 }
 
-// Test filtering on a non-matching table pattern.
-TEST_F(KsckTest, TestNonMatchingTableFilter) {
-  CreateOneSmallReplicatedTable();
-  ksck_->set_table_filters({"xyz"});
-  FLAGS_checksum_scan = true;
-  ASSERT_TRUE(RunKsck().IsRuntimeError());
-  const vector<Status>& error_messages = ksck_->results().error_messages;
-  ASSERT_EQ(1, error_messages.size());
-  EXPECT_EQ("Not found: checksum scan error: No table found. Filter: table_filters=xyz",
-            error_messages[0].ToString());
-  ASSERT_STR_CONTAINS(err_stream_.str(),
-                      "The cluster doesn't have any matching tables");
-
-  CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
-}
-
-// Test filtering with a matching table pattern.
-TEST_F(KsckTest, TestMatchingTableFilter) {
-  CreateOneSmallReplicatedTable();
-  ksck_->set_table_filters({"te*"});
-  FLAGS_checksum_scan = true;
-  ASSERT_OK(RunKsck());
-  ASSERT_STR_CONTAINS(err_stream_.str(),
-                      "0/9 replicas remaining (180B from disk, 90 rows summed)");
-
-  CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
-}
-
-// Test filtering on a non-matching tablet id pattern.
-TEST_F(KsckTest, TestNonMatchingTabletIdFilter) {
-  CreateOneSmallReplicatedTable();
-  ksck_->set_tablet_id_filters({"xyz"});
-  FLAGS_checksum_scan = true;
-  ASSERT_TRUE(RunKsck().IsRuntimeError());
-  const vector<Status>& error_messages = ksck_->results().error_messages;
-  ASSERT_EQ(1, error_messages.size());
-  EXPECT_EQ(
-      "Not found: checksum scan error: No tablet replicas found. Filter: tablet_id_filters=xyz",
-      error_messages[0].ToString());
-  ASSERT_STR_CONTAINS(err_stream_.str(),
-                      "The cluster doesn't have any matching tablets");
-
-  CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
-}
-
-// Test filtering with a matching tablet ID pattern.
-TEST_F(KsckTest, TestMatchingTabletIdFilter) {
-  CreateOneSmallReplicatedTable();
-  ksck_->set_tablet_id_filters({"*-id-2"});
-  FLAGS_checksum_scan = true;
-  ASSERT_OK(RunKsck());
-  ASSERT_STR_CONTAINS(err_stream_.str(),
-                      "0/3 replicas remaining (60B from disk, 30 rows summed)");
-
-  CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
-}
-
 TEST_F(KsckTest, TestOneSmallReplicatedTableWithConsensusState) {
   CreateOneSmallReplicatedTable();
   ASSERT_OK(RunKsck());
   ASSERT_STR_CONTAINS(err_stream_.str(),
-                      ExpectedKsckTableSummary("test",
-                                               /*replication_factor=*/ 3,
-                                               /*healthy_tablets=*/ 3,
-                                               /*recovering_tablets=*/ 0,
-                                               /*underreplicated_tablets=*/ 0,
-                                               /*consensus_mismatch_tablets=*/ 0,
-                                               /*unavailable_tablets=*/ 0));
+                      ExpectedTableSummary("test",
+                                           /*replication_factor=*/ 3,
+                                           /*healthy_tablets=*/ 3,
+                                           /*recovering_tablets=*/ 0,
+                                           /*underreplicated_tablets=*/ 0,
+                                           /*consensus_mismatch_tablets=*/ 0,
+                                           /*unavailable_tablets=*/ 0));
 
   CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
 }
@@ -1165,7 +1302,10 @@ TEST_F(KsckTest, TestConsensusConflictExtraPeer) {
   ASSERT_EQ(1, error_messages.size());
   ASSERT_EQ("Corruption: table consistency check error: 1 out of 1 table(s) are not healthy",
             error_messages[0].ToString());
-  ASSERT_STR_CONTAINS(err_stream_.str(),
+  const string err_str = err_stream_.str();
+  ASSERT_STR_CONTAINS(err_str, "Tablet tablet-id-0 of table 'test' is conflicted: "
+                               "3 replicas' active configs disagree with the leader master's");
+  ASSERT_STR_CONTAINS(err_str,
       "The consensus matrix is:\n"
       " Config source |     Replicas     | Current term | Config index | Committed?\n"
       "---------------+------------------+--------------+--------------+------------\n"
@@ -1173,14 +1313,14 @@ TEST_F(KsckTest, TestConsensusConflictExtraPeer) {
       " A             | A*  B   C   D    | 0            |              | Yes\n"
       " B             | A*  B   C        | 0            |              | Yes\n"
       " C             | A*  B   C        | 0            |              | Yes");
-  ASSERT_STR_CONTAINS(err_stream_.str(),
-                      ExpectedKsckTableSummary("test",
-                                               /*replication_factor=*/ 3,
-                                               /*healthy_tablets=*/ 2,
-                                               /*recovering_tablets=*/ 0,
-                                               /*underreplicated_tablets=*/ 0,
-                                               /*consensus_mismatch_tablets=*/ 1,
-                                               /*unavailable_tablets=*/ 0));
+  ASSERT_STR_CONTAINS(err_str,
+                      ExpectedTableSummary("test",
+                                           /*replication_factor=*/ 3,
+                                           /*healthy_tablets=*/ 2,
+                                           /*recovering_tablets=*/ 0,
+                                           /*underreplicated_tablets=*/ 0,
+                                           /*consensus_mismatch_tablets=*/ 1,
+                                           /*unavailable_tablets=*/ 0));
 
   CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
 }
@@ -1207,13 +1347,13 @@ TEST_F(KsckTest, TestConsensusConflictMissingPeer) {
       " B             | A*  B   C    | 0            |              | Yes\n"
       " C             | A*  B   C    | 0            |              | Yes");
   ASSERT_STR_CONTAINS(err_stream_.str(),
-                      ExpectedKsckTableSummary("test",
-                                               /*replication_factor=*/ 3,
-                                               /*healthy_tablets=*/ 2,
-                                               /*recovering_tablets=*/ 0,
-                                               /*underreplicated_tablets=*/ 0,
-                                               /*consensus_mismatch_tablets=*/ 1,
-                                               /*unavailable_tablets=*/ 0));
+                      ExpectedTableSummary("test",
+                                           /*replication_factor=*/ 3,
+                                           /*healthy_tablets=*/ 2,
+                                           /*recovering_tablets=*/ 0,
+                                           /*underreplicated_tablets=*/ 0,
+                                           /*consensus_mismatch_tablets=*/ 1,
+                                           /*unavailable_tablets=*/ 0));
 
   CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
 }
@@ -1240,13 +1380,13 @@ TEST_F(KsckTest, TestConsensusConflictDifferentLeader) {
       " B             | A*  B   C    | 0            |              | Yes\n"
       " C             | A*  B   C    | 0            |              | Yes");
   ASSERT_STR_CONTAINS(err_stream_.str(),
-                      ExpectedKsckTableSummary("test",
-                                               /*replication_factor=*/ 3,
-                                               /*healthy_tablets=*/ 2,
-                                               /*recovering_tablets=*/ 0,
-                                               /*underreplicated_tablets=*/ 0,
-                                               /*consensus_mismatch_tablets=*/ 1,
-                                               /*unavailable_tablets=*/ 0));
+                      ExpectedTableSummary("test",
+                                           /*replication_factor=*/ 3,
+                                           /*healthy_tablets=*/ 2,
+                                           /*recovering_tablets=*/ 0,
+                                           /*underreplicated_tablets=*/ 0,
+                                           /*consensus_mismatch_tablets=*/ 1,
+                                           /*unavailable_tablets=*/ 0));
 
   CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
 }
@@ -1262,13 +1402,13 @@ TEST_F(KsckTest, TestOneOneTabletBrokenTable) {
                       "Tablet tablet-id-1 of table 'test' is under-replicated: "
                       "configuration has 2 replicas vs desired 3");
   ASSERT_STR_CONTAINS(err_stream_.str(),
-                      ExpectedKsckTableSummary("test",
-                                               /*replication_factor=*/ 3,
-                                               /*healthy_tablets=*/ 0,
-                                               /*recovering_tablets=*/ 0,
-                                               /*underreplicated_tablets=*/ 1,
-                                               /*consensus_mismatch_tablets=*/ 0,
-                                               /*unavailable_tablets=*/ 0));
+                      ExpectedTableSummary("test",
+                                           /*replication_factor=*/ 3,
+                                           /*healthy_tablets=*/ 0,
+                                           /*recovering_tablets=*/ 0,
+                                           /*underreplicated_tablets=*/ 1,
+                                           /*consensus_mismatch_tablets=*/ 0,
+                                           /*unavailable_tablets=*/ 0));
 
   CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
 }
@@ -1291,13 +1431,13 @@ TEST_F(KsckTest, TestMismatchedAssignments) {
                       "  ts-id-1 (<mock>): RUNNING\n"
                       "  ts-id-2 (<mock>): RUNNING\n");
   ASSERT_STR_CONTAINS(err_stream_.str(),
-                     ExpectedKsckTableSummary("test",
-                                              /*replication_factor=*/ 3,
-                                              /*healthy_tablets=*/ 2,
-                                              /*recovering_tablets=*/ 0,
-                                              /*underreplicated_tablets=*/ 1,
-                                              /*consensus_mismatch_tablets=*/ 0,
-                                              /*unavailable_tablets=*/ 0));
+                     ExpectedTableSummary("test",
+                                          /*replication_factor=*/ 3,
+                                          /*healthy_tablets=*/ 2,
+                                          /*recovering_tablets=*/ 0,
+                                          /*underreplicated_tablets=*/ 1,
+                                          /*consensus_mismatch_tablets=*/ 0,
+                                          /*unavailable_tablets=*/ 0));
 
   CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
 }
@@ -1326,13 +1466,13 @@ TEST_F(KsckTest, TestTabletNotRunning) {
       "    Data state:  TABLET_DATA_UNKNOWN\n"
       "    Last status: \n");
   ASSERT_STR_CONTAINS(err_stream_.str(),
-                      ExpectedKsckTableSummary("test",
-                                               /*replication_factor=*/ 3,
-                                               /*healthy_tablets=*/ 2,
-                                               /*recovering_tablets=*/ 0,
-                                               /*underreplicated_tablets=*/ 0,
-                                               /*consensus_mismatch_tablets=*/ 0,
-                                               /*unavailable_tablets=*/ 1));
+                      ExpectedTableSummary("test",
+                                           /*replication_factor=*/ 3,
+                                           /*healthy_tablets=*/ 2,
+                                           /*recovering_tablets=*/ 0,
+                                           /*underreplicated_tablets=*/ 0,
+                                           /*consensus_mismatch_tablets=*/ 0,
+                                           /*unavailable_tablets=*/ 1));
 
   CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
 }
@@ -1352,13 +1492,13 @@ TEST_F(KsckTest, TestTabletCopying) {
   ASSERT_EQ("Corruption: table consistency check error: 1 out of 1 table(s) are not healthy",
             error_messages[0].ToString());
   ASSERT_STR_CONTAINS(err_stream_.str(),
-                      ExpectedKsckTableSummary("test",
-                                               /*replication_factor=*/ 3,
-                                               /*healthy_tablets=*/ 2,
-                                               /*recovering_tablets=*/ 1,
-                                               /*underreplicated_tablets=*/ 0,
-                                               /*consensus_mismatch_tablets=*/ 0,
-                                               /*unavailable_tablets=*/ 0));
+                      ExpectedTableSummary("test",
+                                           /*replication_factor=*/ 3,
+                                           /*healthy_tablets=*/ 2,
+                                           /*recovering_tablets=*/ 1,
+                                           /*underreplicated_tablets=*/ 0,
+                                           /*consensus_mismatch_tablets=*/ 0,
+                                           /*unavailable_tablets=*/ 0));
 
   CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
 }
@@ -1377,13 +1517,13 @@ TEST_F(KsckTest, TestMasterNotReportingTabletServer) {
   ASSERT_EQ("Corruption: table consistency check error: 1 out of 1 table(s) are not healthy",
             error_messages[0].ToString());
   ASSERT_STR_CONTAINS(err_stream_.str(),
-                      ExpectedKsckTableSummary("test",
-                                               /*replication_factor=*/ 3,
-                                               /*healthy_tablets=*/ 0,
-                                               /*recovering_tablets=*/ 0,
-                                               /*underreplicated_tablets=*/ 3,
-                                               /*consensus_mismatch_tablets=*/ 0,
-                                               /*unavailable_tablets=*/ 0));
+                      ExpectedTableSummary("test",
+                                           /*replication_factor=*/ 3,
+                                           /*healthy_tablets=*/ 0,
+                                           /*recovering_tablets=*/ 0,
+                                           /*underreplicated_tablets=*/ 3,
+                                           /*consensus_mismatch_tablets=*/ 0,
+                                           /*unavailable_tablets=*/ 0));
 
   CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
 }
@@ -1416,78 +1556,13 @@ TEST_F(KsckTest, TestMasterNotReportingTabletServerWithConsensusConflict) {
       " B             | A   B*  C              | 0            |              | Yes\n"
       " C             | A*  B   C              | 0            |              | Yes");
   ASSERT_STR_CONTAINS(err_stream_.str(),
-                      ExpectedKsckTableSummary("test",
-                                               /*replication_factor=*/ 3,
-                                               /*healthy_tablets=*/ 0,
-                                               /*recovering_tablets=*/ 0,
-                                               /*underreplicated_tablets=*/ 3,
-                                               /*consensus_mismatch_tablets=*/ 0,
-                                               /*unavailable_tablets=*/ 0));
-
-  CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
-}
-
-TEST_F(KsckTest, TestTableFiltersNoMatch) {
-  CreateOneSmallReplicatedTable();
-
-  ksck_->set_table_filters({ "fake-table" });
-
-  // Every table we check is healthy ;).
-  ASSERT_OK(RunKsck());
-  ASSERT_STR_CONTAINS(err_stream_.str(), "The cluster doesn't have any matching tables");
-  ASSERT_STR_NOT_CONTAINS(err_stream_.str(),
-      "                | Total Count\n"
-      "----------------+-------------\n");
-
-  CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
-}
-
-TEST_F(KsckTest, TestTableFilters) {
-  CreateOneSmallReplicatedTable();
-  CreateOneSmallReplicatedTable("other", "other-");
-
-  ksck_->set_table_filters({ "test" });
-  ASSERT_OK(RunKsck());
-  ASSERT_STR_CONTAINS(err_stream_.str(),
-      "                | Total Count\n"
-      "----------------+-------------\n"
-      " Masters        | 3\n"
-      " Tablet Servers | 3\n"
-      " Tables         | 1\n"
-      " Tablets        | 3\n"
-      " Replicas       | 9\n");
-
-  CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
-}
-
-TEST_F(KsckTest, TestTabletFiltersNoMatch) {
-  CreateOneSmallReplicatedTable();
-
-  ksck_->set_tablet_id_filters({ "tablet-id-fake" });
-
-  // Every tablet we check is healthy ;).
-  ASSERT_OK(RunKsck());
-  ASSERT_STR_CONTAINS(err_stream_.str(), "The cluster doesn't have any matching tablets");
-  ASSERT_STR_NOT_CONTAINS(err_stream_.str(),
-      "                | Total Count\n"
-      "----------------+-------------\n");
-
-  CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
-}
-
-TEST_F(KsckTest, TestTabletFilters) {
-  CreateOneSmallReplicatedTable();
-
-  ksck_->set_tablet_id_filters({ "tablet-id-0", "tablet-id-1" });
-  ASSERT_OK(RunKsck());
-  ASSERT_STR_CONTAINS(err_stream_.str(),
-      "                | Total Count\n"
-      "----------------+-------------\n"
-      " Masters        | 3\n"
-      " Tablet Servers | 3\n"
-      " Tables         | 1\n"
-      " Tablets        | 2\n"
-      " Replicas       | 6\n");
+                      ExpectedTableSummary("test",
+                                           /*replication_factor=*/ 3,
+                                           /*healthy_tablets=*/ 0,
+                                           /*recovering_tablets=*/ 0,
+                                           /*underreplicated_tablets=*/ 3,
+                                           /*consensus_mismatch_tablets=*/ 0,
+                                           /*unavailable_tablets=*/ 0));
 
   CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results());
 }
@@ -1567,7 +1642,7 @@ TEST_F(KsckTest, TestChecksumWithAllUnhealthyTabletServers) {
   for (const auto& entry : cluster_->tablet_servers_) {
     auto ts = static_pointer_cast<MockKsckTabletServer>(entry.second);
     ts->fetch_info_status_ = Status::NetworkError("gremlins");
-    ts->fetch_info_health_ = KsckServerHealth::UNAVAILABLE;
+    ts->fetch_info_health_ = ServerHealth::UNAVAILABLE;
   }
 
   // The checksum should short-circuit and fail because no tablet servers are
@@ -1585,12 +1660,12 @@ TEST_F(KsckTest, TestChecksumWithAllPeersUnhealthy) {
   for (const auto& entry : cluster_->tablet_servers_) {
     auto ts = static_pointer_cast<MockKsckTabletServer>(entry.second);
     ts->fetch_info_status_ = Status::NetworkError("gremlins");
-    ts->fetch_info_health_ = KsckServerHealth::UNAVAILABLE;
+    ts->fetch_info_health_ = ServerHealth::UNAVAILABLE;
   }
   const char* const new_uuid = "new";
   EmplaceOrDie(&cluster_->tablet_servers_,
                new_uuid,
-               std::make_shared<MockKsckTabletServer>(new_uuid));
+               std::make_shared<MockKsckTabletServer>(new_uuid, IsGetFlagsAvailable()));
 
   // The checksum should fail for tablet because none of its replicas are
   // available to provide a timestamp.
@@ -1621,6 +1696,35 @@ TEST_F(KsckTest, TestTabletServerLocation) {
     " ts-id-2 | <mock>  | HEALTHY | <none>\n");
 
   NO_FATALS(CheckJsonStringVsKsckResults(KsckResultsToJsonString(), ksck_->results()));
+}
+
+TEST_F(KsckTest, TestSectionFilter) {
+  std::map<int, std::string> sections = {
+          {PrintSections::Values::MASTER_SUMMARIES, "MASTER_SUMMARIES"},
+          {PrintSections::Values::TSERVER_SUMMARIES, "TSERVER_SUMMARIES"},
+          {PrintSections::Values::VERSION_SUMMARIES, "VERSION_SUMMARIES"},
+          {PrintSections::Values::TABLET_SUMMARIES, "TABLET_SUMMARIES"},
+          {PrintSections::Values::TABLE_SUMMARIES, "TABLE_SUMMARIES"},
+          {PrintSections::Values::CHECKSUM_RESULTS, "CHECKSUM_RESULTS"},
+          {PrintSections::Values::TOTAL_COUNT, "TOTAL_COUNT"}};
+  CreateOneTableOneTablet();
+  for (const auto& section : sections) {
+    if (section.first == PrintSections::Values::CHECKSUM_RESULTS) {
+      FLAGS_checksum_scan = true;
+    }
+    int selected_sections = section.first;
+    ksck_->set_print_sections({section.second});
+    err_stream_.str("");
+    err_stream_.clear();
+    ASSERT_OK(RunKsck());
+
+    // Check plain string output.
+    CheckPlainStringSections(err_stream_.str(), selected_sections);
+
+    // Check json string output.
+    const string& json_output = KsckResultsToJsonString(selected_sections);
+    CheckJsonStringVsKsckResults(json_output, ksck_->results(), selected_sections);
+  }
 }
 } // namespace tools
 } // namespace kudu

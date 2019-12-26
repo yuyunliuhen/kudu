@@ -20,8 +20,8 @@ package org.apache.kudu.client;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.math.BigInteger;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -36,7 +36,6 @@ import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.primitives.UnsignedBytes;
 import com.google.protobuf.ByteString;
-import org.apache.kudu.util.TimestampUtil;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
 
@@ -46,6 +45,7 @@ import org.apache.kudu.Common;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.util.DecimalUtil;
+import org.apache.kudu.util.TimestampUtil;
 
 /**
  * A predicate which can be used to filter rows based on the value of a column.
@@ -240,6 +240,7 @@ public class KuduPredicate {
    * @param op the comparison operation
    * @param value the value to compare against
    */
+  @SuppressWarnings("BigDecimalEquals")
   public static KuduPredicate newComparisonPredicate(ColumnSchema column,
                                                      ComparisonOp op,
                                                      BigDecimal value) {
@@ -412,7 +413,7 @@ public class KuduPredicate {
   public static KuduPredicate newComparisonPredicate(ColumnSchema column,
                                                      ComparisonOp op,
                                                      String value) {
-    checkColumn(column, Type.STRING);
+    checkColumn(column, Type.STRING, Type.VARCHAR);
 
     byte[] bytes = Bytes.fromString(value);
     if (op == ComparisonOp.LESS_EQUAL) {
@@ -479,6 +480,61 @@ public class KuduPredicate {
   }
 
   /**
+   * Creates a new comparison predicate on a column.
+   *
+   * This method is useful when you don't care about autoboxing
+   * and your existing type handling logic is based on Java types.
+   *
+   * The accepted Object type is based on the column's {@link Type}:
+   *  Type.BOOL -> java.lang.Boolean
+   *  Type.INT8 -> java.lang.Byte
+   *  Type.INT16 -> java.lang.Short
+   *  Type.INT32 -> java.lang.Integer
+   *  Type.INT64 -> java.lang.Long
+   *  Type.UNIXTIME_MICROS -> java.sql.Timestamp or java.lang.Long
+   *  Type.FLOAT -> java.lang.Float
+   *  Type.DOUBLE -> java.lang.Double
+   *  Type.STRING -> java.lang.String
+   *  Type.VARCHAR -> java.lang.String
+   *  Type.BINARY -> byte[]
+   *  Type.DECIMAL -> java.math.BigDecimal
+   *
+   * @param column column the column schema
+   * @param op the comparison operation
+   * @param value the value to compare against
+   */
+  public static KuduPredicate newComparisonPredicate(ColumnSchema column,
+                                                     ComparisonOp op,
+                                                     Object value) {
+    if (value instanceof Boolean) {
+      return newComparisonPredicate(column, op, (boolean) value);
+    } else if (value instanceof Byte) {
+      return newComparisonPredicate(column, op, (byte) value);
+    } else if (value instanceof Short) {
+      return newComparisonPredicate(column, op, (short) value);
+    } else if (value instanceof Integer) {
+      return newComparisonPredicate(column, op, (int) value);
+    } else if (value instanceof Long) {
+      return newComparisonPredicate(column, op, (long) value);
+    } else if (value instanceof Timestamp) {
+      return newComparisonPredicate(column, op, (Timestamp) value);
+    } else if (value instanceof Float) {
+      return newComparisonPredicate(column, op, (float) value);
+    } else if (value instanceof Double) {
+      return newComparisonPredicate(column, op, (double) value);
+    } else if (value instanceof BigDecimal) {
+      return newComparisonPredicate(column, op, (BigDecimal) value);
+    } else if (value instanceof String) {
+      return newComparisonPredicate(column, op, (String) value);
+    } else if (value instanceof byte[]) {
+      return newComparisonPredicate(column, op, (byte[]) value);
+    } else {
+      throw new IllegalArgumentException(String.format("illegal type for %s predicate: %s",
+              op, value.getClass().getName()));
+    }
+  }
+
+  /**
    * Creates a new IN list predicate.
    *
    * The list must contain values of the correct type for the column.
@@ -537,13 +593,13 @@ public class KuduPredicate {
         vals.add(Bytes.fromDouble((Double) value));
       }
     } else if (t instanceof BigDecimal) {
-        checkColumn(column, Type.DECIMAL);
-        for (T value : values) {
-          vals.add(Bytes.fromBigDecimal((BigDecimal) value,
-              column.getTypeAttributes().getPrecision()));
-        }
+      checkColumn(column, Type.DECIMAL);
+      for (T value : values) {
+        vals.add(Bytes.fromBigDecimal((BigDecimal) value,
+            column.getTypeAttributes().getPrecision()));
+      }
     } else if (t instanceof String) {
-      checkColumn(column, Type.STRING);
+      checkColumn(column, Type.STRING, Type.VARCHAR);
       for (T value : values) {
         vals.add(Bytes.fromString((String) value));
       }
@@ -929,6 +985,7 @@ public class KuduPredicate {
       case DOUBLE:
         return Double.compare(Bytes.getDouble(a), Bytes.getDouble(b));
       case STRING:
+      case VARCHAR:
       case BINARY:
         return UnsignedBytes.lexicographicalComparator().compare(a, b);
       case DECIMAL128:
@@ -958,7 +1015,7 @@ public class KuduPredicate {
         return m < n && m + 1 == n;
       }
       case INT32:
-      case DECIMAL32:{
+      case DECIMAL32: {
         int m = Bytes.getInt(a);
         int n = Bytes.getInt(b);
         return m < n && m + 1 == n;
@@ -981,6 +1038,7 @@ public class KuduPredicate {
         return m < n && Math.nextAfter(m, Double.POSITIVE_INFINITY) == n;
       }
       case STRING:
+      case VARCHAR:
       case BINARY: {
         if (a.length + 1 != b.length || b[a.length] != 0) {
           return false;
@@ -1098,6 +1156,7 @@ public class KuduPredicate {
       case UNIXTIME_MICROS: return TimestampUtil.timestampToString(Bytes.getLong(value));
       case FLOAT: return Float.toString(Bytes.getFloat(value));
       case DOUBLE: return Double.toString(Bytes.getDouble(value));
+      case VARCHAR:
       case STRING: {
         String v = Bytes.getString(value);
         StringBuilder sb = new StringBuilder(2 + v.length());
@@ -1110,9 +1169,9 @@ public class KuduPredicate {
       case DECIMAL32:
       case DECIMAL64:
       case DECIMAL128:
-       ColumnTypeAttributes typeAttributes = column.getTypeAttributes();
-       return Bytes.getDecimal(value, typeAttributes.getPrecision(),
-           typeAttributes.getScale()).toString();
+        ColumnTypeAttributes typeAttributes = column.getTypeAttributes();
+        return Bytes.getDecimal(value, typeAttributes.getPrecision(),
+            typeAttributes.getScale()).toString();
       default:
         throw new IllegalStateException(String.format("unknown column type %s", column.getType()));
     }
@@ -1152,7 +1211,7 @@ public class KuduPredicate {
     if (this == o) {
       return true;
     }
-    if (o == null || getClass() != o.getClass()) {
+    if (!(o instanceof KuduPredicate)) {
       return false;
     }
     KuduPredicate that = (KuduPredicate) o;

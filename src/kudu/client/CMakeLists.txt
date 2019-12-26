@@ -29,6 +29,7 @@ ADD_EXPORTABLE_LIBRARY(client_proto
   NONLINK_DEPS ${CLIENT_PROTO_TGTS})
 
 set(CLIENT_SRCS
+  authz_token_cache.cc
   batcher.cc
   client.cc
   client_builder-internal.cc
@@ -36,6 +37,7 @@ set(CLIENT_SRCS
   error_collector.cc
   error-internal.cc
   master_rpc.cc
+  master_proxy_rpc.cc
   meta_cache.cc
   partitioner-internal.cc
   scan_batch.cc
@@ -261,7 +263,8 @@ SET_KUDU_TEST_LINK_LIBS(
   itest_util
   kudu_client
   mini_cluster)
-ADD_KUDU_TEST(client-test NUM_SHARDS 8 PROCESSORS 2)
+ADD_KUDU_TEST(client-test NUM_SHARDS 8 PROCESSORS 2
+                          DATA_FILES ../scripts/first_argument.sh)
 ADD_KUDU_TEST(client-unittest)
 ADD_KUDU_TEST(predicate-test)
 ADD_KUDU_TEST(scan_token-test PROCESSORS 2)

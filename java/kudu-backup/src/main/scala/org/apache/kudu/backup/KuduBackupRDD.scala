@@ -1,25 +1,26 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package org.apache.kudu.backup
 
 import java.util.concurrent.TimeUnit
 
-import org.apache.kudu.Type
 import org.apache.kudu.client.AsyncKuduScanner.ReadMode
+import org.apache.kudu.client.KuduScannerIterator.NextRowsCallback
 import org.apache.kudu.client._
 import org.apache.kudu.spark.kudu.KuduContext
 import org.apache.kudu.util.HybridTimeUtil
@@ -35,59 +36,73 @@ import scala.collection.JavaConverters._
 
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
+@SerialVersionUID(1L)
 class KuduBackupRDD private[kudu] (
     @transient val table: KuduTable,
-    @transient val options: KuduBackupOptions,
+    @transient val options: BackupOptions,
+    val incremental: Boolean,
     val kuduContext: KuduContext,
     @transient val sc: SparkContext)
     extends RDD[Row](sc, Nil) {
 
-  // Defined here because the options are transient.
-  private val keepAlivePeriodMs = options.keepAlivePeriodMs
-
-  // TODO: Split large tablets into smaller scan tokens?
+  // TODO (KUDU-2785): Split large tablets into smaller scan tokens?
   override protected def getPartitions: Array[Partition] = {
     val client = kuduContext.syncClient
 
-    // Set a hybrid time for the scan to ensure application consistency.
-    val timestampMicros = TimeUnit.MILLISECONDS.toMicros(options.timestampMs)
-    val hybridTime =
-      HybridTimeUtil.physicalAndLogicalToHTTimestamp(timestampMicros, 0)
-
-    // Create the scan tokens for each partition.
-    val tokens = client
+    val builder = client
       .newScanTokenBuilder(table)
       .cacheBlocks(false)
-      // TODO: Use fault tolerant scans to get mostly.
-      // ordered results when KUDU-2466 is fixed.
-      // .setFaultTolerant(true)
       .replicaSelection(ReplicaSelection.CLOSEST_REPLICA)
       .readMode(ReadMode.READ_AT_SNAPSHOT)
-      .snapshotTimestampRaw(hybridTime)
       .batchSizeBytes(options.scanBatchSize)
-      .scanRequestTimeout(options.scanRequestTimeout)
+      .scanRequestTimeout(options.scanRequestTimeoutMs)
       .prefetching(options.scanPrefetching)
-      .build()
+      .keepAlivePeriodMs(options.keepAlivePeriodMs)
 
+    options.splitSizeBytes.foreach { size =>
+      builder.setSplitSizeBytes(size)
+    }
+
+    // Set a hybrid time for the scan to ensure application consistency.
+    val toMicros = TimeUnit.MILLISECONDS.toMicros(options.toMs)
+    val toHTT =
+      HybridTimeUtil.physicalAndLogicalToHTTimestamp(toMicros, 0)
+
+    if (incremental) {
+      val fromMicros = TimeUnit.MILLISECONDS.toMicros(options.fromMs)
+      val fromHTT =
+        HybridTimeUtil.physicalAndLogicalToHTTimestamp(fromMicros, 0)
+      builder.diffScan(fromHTT, toHTT)
+    } else {
+      builder.snapshotTimestampRaw(toHTT)
+    }
+
+    // Create the scan tokens for each partition.
+    val tokens = builder.build()
     tokens.asScala.zipWithIndex.map {
       case (token, index) =>
-        // TODO: Support backups from any replica or followers only.
-        // Always run on the leader for data locality.
-        val leaderLocation = token.getTablet.getLeaderReplica.getRpcHost
-        KuduBackupPartition(index, token.serialize(), Array(leaderLocation))
+        // Only list the leader replica as the preferred location if
+        // replica selection policy is leader only, to take advantage
+        // of scan locality.
+        val locations: Array[String] = {
+          if (options.scanLeaderOnly) {
+            Array(token.getTablet.getLeaderReplica.getRpcHost)
+          } else {
+            token.getTablet.getReplicas.asScala.map(_.getRpcHost).toArray
+          }
+        }
+        KuduBackupPartition(index, token.serialize(), locations)
     }.toArray
   }
-
-  // TODO: Do we need a custom spark partitioner for any guarantees?
-  // override val partitioner = None
 
   override def compute(part: Partition, taskContext: TaskContext): Iterator[Row] = {
     val client: KuduClient = kuduContext.syncClient
     val partition: KuduBackupPartition = part.asInstanceOf[KuduBackupPartition]
-    // TODO: Get deletes and updates for incremental backups.
     val scanner =
       KuduScanToken.deserializeIntoScanner(partition.scanToken, client)
-    new RowIterator(scanner, kuduContext, keepAlivePeriodMs)
+    // We don't store the RowResult so we can enable the reuseRowResult optimization.
+    scanner.setReuseRowResult(true)
+    new RowIterator(scanner, kuduContext, incremental)
   }
 
   override def getPreferredLocations(partition: Partition): Seq[String] = {
@@ -109,66 +124,43 @@ private case class KuduBackupPartition(index: Int, scanToken: Array[Byte], locat
 private class RowIterator(
     private val scanner: KuduScanner,
     val kuduContext: KuduContext,
-    val keepAlivePeriodMs: Long)
+    val incremental: Boolean)
     extends Iterator[Row] {
 
-  private var currentIterator: RowResultIterator = RowResultIterator.empty
-  private var lastKeepAliveTimeMs = System.currentTimeMillis()
-
-  /**
-   * Calls the keepAlive API on the current scanner if the keepAlivePeriodMs has passed.
-   */
-  private def KeepKuduScannerAlive(): Unit = {
-    val now = System.currentTimeMillis
-    if (now >= lastKeepAliveTimeMs + keepAlivePeriodMs && !scanner.isClosed) {
-      scanner.keepAlive()
-      lastKeepAliveTimeMs = now
+  private val scannerIterator = scanner.iterator()
+  private val nextRowsCallback = new NextRowsCallback {
+    override def call(numRows: Int): Unit = {
+      if (TaskContext.get().isInterrupted()) {
+        throw new RuntimeException("Kudu task interrupted")
+      }
+      kuduContext.timestampAccumulator.add(kuduContext.syncClient.getLastPropagatedTimestamp)
     }
   }
 
   override def hasNext: Boolean = {
-    while (!currentIterator.hasNext && scanner.hasMoreRows) {
-      if (TaskContext.get().isInterrupted()) {
-        throw new RuntimeException("KuduBackup spark task interrupted")
-      }
-      currentIterator = scanner.nextRows()
-    }
-    // Update timestampAccumulator with the client's last propagated
-    // timestamp on each executor.
-    kuduContext.timestampAccumulator.add(kuduContext.syncClient.getLastPropagatedTimestamp)
-    KeepKuduScannerAlive()
-    currentIterator.hasNext
+    scannerIterator.hasNext(nextRowsCallback)
   }
 
-  // TODO: Use a more "raw" encoding for efficiency?
-  private def get(rowResult: RowResult, i: Int): Any = {
-    if (rowResult.isNull(i)) null
-    else
-      rowResult.getColumnType(i) match {
-        case Type.BOOL => rowResult.getBoolean(i)
-        case Type.INT8 => rowResult.getByte(i)
-        case Type.INT16 => rowResult.getShort(i)
-        case Type.INT32 => rowResult.getInt(i)
-        case Type.INT64 => rowResult.getLong(i)
-        case Type.UNIXTIME_MICROS => rowResult.getTimestamp(i)
-        case Type.FLOAT => rowResult.getFloat(i)
-        case Type.DOUBLE => rowResult.getDouble(i)
-        case Type.STRING => rowResult.getString(i)
-        case Type.BINARY => rowResult.getBinaryCopy(i)
-        case Type.DECIMAL => rowResult.getDecimal(i)
-        case _ =>
-          throw new RuntimeException(s"Unsupported column type: ${rowResult.getColumnType(i)}")
-      }
-  }
-
-  // TODO: There may be an old KuduRDD implementation where we did some
-  // sort of zero copy/object pool pattern for performance (we could use that here).
   override def next(): Row = {
-    val rowResult = currentIterator.next()
-    val columnCount = rowResult.getColumnProjection.getColumnCount
-    val columns = Array.ofDim[Any](columnCount)
+    val rowResult = scannerIterator.next()
+    val fieldCount = rowResult.getColumnProjection.getColumnCount
+    // If this is an incremental backup, the last column is the is_deleted column.
+    val columnCount = if (incremental) fieldCount - 1 else fieldCount
+    val columns = Array.ofDim[Any](fieldCount)
     for (i <- 0 until columnCount) {
-      columns(i) = get(rowResult, i)
+      columns(i) = rowResult.getObject(i)
+    }
+    // If this is an incremental backup, translate the is_deleted column into
+    // the "change_type" column as the last field.
+    if (incremental) {
+      val rowAction = if (rowResult.isDeleted) {
+        RowAction.DELETE.getValue
+      } else {
+        // If the row is not deleted, we do not know if it was inserted or updated,
+        // so we use upsert.
+        RowAction.UPSERT.getValue
+      }
+      columns(fieldCount - 1) = rowAction
     }
     Row.fromSeq(columns)
   }

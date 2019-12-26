@@ -14,11 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
 import static org.apache.kudu.Type.STRING;
-import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
 import static org.apache.kudu.test.ClientTestUtil.countRowsInScan;
+import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNull;
@@ -29,29 +30,27 @@ import java.util.ArrayList;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.stumbleupon.async.Deferred;
-
-import org.apache.kudu.test.KuduTestHarness;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 
-import org.apache.kudu.client.Client.ScanTokenPB;
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Common;
 import org.apache.kudu.Schema;
+import org.apache.kudu.client.Client.ScanTokenPB;
+import org.apache.kudu.test.KuduTestHarness;
 
 public class TestScannerMultiTablet {
   // Generate a unique table name
   private static final String TABLE_NAME =
-      TestScannerMultiTablet.class.getName()+"-"+System.currentTimeMillis();
+      TestScannerMultiTablet.class.getName() + "-" + System.currentTimeMillis();
 
   private static Schema schema = getSchema();
 
   /**
    * The timestamp after inserting the rows into the test table during setUp().
    */
-  private static long beforeWriteTimestamp;
+  private long beforeWriteTimestamp;
   private KuduTable table;
   private KuduClient client;
   private AsyncKuduClient asyncClient;
@@ -108,6 +107,27 @@ public class TestScannerMultiTablet {
     asyncClient = harness.getAsyncClient();
   }
 
+  private void validateResourceMetrics(ResourceMetrics resourceMetrics) {
+    assertTrue("queue_duration_nanos > 0",
+        resourceMetrics.getMetric("queue_duration_nanos") > 0L);
+    assertTrue("total_duration_nanos > 0",
+        resourceMetrics.getMetric("total_duration_nanos") > 0L);
+  }
+
+  // Test scanner resource metrics.
+  @Test(timeout = 100000)
+  public void testResourceMetrics() throws Exception {
+    // Scan one tablet and the whole table.
+    AsyncKuduScanner oneTabletScanner = getScanner("1", "1", "1", "4"); // Whole second tablet.
+    assertEquals(3, countRowsInScan(oneTabletScanner));
+    AsyncKuduScanner fullTableScanner = getScanner(null, null, null, null);
+    assertEquals(9, countRowsInScan(fullTableScanner));
+    // Both scans should take a positive amount of wait duration, total duration, cpu user and cpu
+    // system time
+    validateResourceMetrics(oneTabletScanner.getResourceMetrics());
+    validateResourceMetrics(fullTableScanner.getResourceMetrics());
+  }
+
   // Test various combinations of start/end row keys.
   @Test(timeout = 100000)
   public void testKeyStartEnd() throws Exception {
@@ -145,6 +165,7 @@ public class TestScannerMultiTablet {
 
   // Test mixing start/end row keys with predicates.
   @Test(timeout = 100000)
+  @SuppressWarnings("deprecation")
   public void testKeysAndPredicates() throws Exception {
     // Value that doesn't exist, predicates has primary column
     ColumnRangePredicate predicate = new ColumnRangePredicate(schema.getColumnByIndex(1));
@@ -274,10 +295,7 @@ public class TestScannerMultiTablet {
   // Scanning a never-written-to tablet from a fresh client with no propagated
   // timestamp in "read-your-writes' mode should not fail.
   @Test(timeout = 100000)
-  @Ignore("TODO(KUDU-2415)") // not fixed yet!
   public void testReadYourWritesFreshClientFreshTable() throws Exception {
-    // NOTE: this test fails because the first tablet in the table
-    // is empty and has never been written to.
 
     // Perform scan in READ_YOUR_WRITES mode. Before the scan, verify that the
     // propagated timestamp is unset, since this is a fresh client.
@@ -289,7 +307,14 @@ public class TestScannerMultiTablet {
     assertEquals(AsyncKuduClient.NO_TIMESTAMP, asyncClient.getLastPropagatedTimestamp());
     assertEquals(AsyncKuduClient.NO_TIMESTAMP, scanner.getSnapshotTimestamp());
 
-    assertEquals(9, countRowsInScan(syncScanner));
+    // Since there isn't any write performed from the client, the count
+    // should range from [0, 9].
+    int count = countRowsInScan(syncScanner);
+    assertTrue(count >= 0);
+    assertTrue(count <= 9);
+
+    assertNotEquals(AsyncKuduClient.NO_TIMESTAMP, asyncClient.getLastPropagatedTimestamp());
+    assertNotEquals(AsyncKuduClient.NO_TIMESTAMP, scanner.getSnapshotTimestamp());
   }
 
   // Test multi tablets scan in READ_YOUR_WRITES mode for both AUTO_FLUSH_SYNC
@@ -437,6 +462,7 @@ public class TestScannerMultiTablet {
         exclusiveUpperBoundKeyOne, exclusiveUpperBoundKeyTwo, null);
   }
 
+  @SuppressWarnings("deprecation")
   private AsyncKuduScanner getScanner(String lowerBoundKeyOne,
                                       String lowerBoundKeyTwo,
                                       String exclusiveUpperBoundKeyOne,

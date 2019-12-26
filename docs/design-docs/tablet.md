@@ -135,12 +135,12 @@ Note that "mutation" in this case can be one of three types:
 
 As a concrete example, consider the following sequence on a table with schema
 (key STRING, val UINT32):
-
+```
   INSERT INTO t VALUES ("row", 1);         [timestamp 1]
   UPDATE t SET val = 2 WHERE key = "row";  [timestamp 2]
   DELETE FROM t WHERE key = "row";         [timestamp 3]
   INSERT INTO t VALUES ("row", 3);         [timestamp 4]
-
+```
 This would result in the following structure in the MemRowSet:
 ```
   +-----------------------------------+
@@ -453,8 +453,8 @@ number of REDO delta files.
 ```
 
 Major delta compactions satisfy delta compaction goals 1 and 2, but cost more
-than than minor delta compactions since they must read and re-write the base
-data, which is typically larger than the delta data.
+than minor delta compactions since they must read and re-write the base data,
+which is typically larger than the delta data.
 
 A major REDO delta compaction may be performed against any subset of the columns
 in a DiskRowSet -- if only a single column has received a significant number of updates,
@@ -647,11 +647,16 @@ Additionally, if the key is not needed in the query results, the query plan
 need not consult the key except perhaps to determine scan boundaries.
 
 As an example, consider the query:
+
+```
  > SELECT SUM(cpu_usage) FROM timeseries WHERE machine = 'foo.cloudera.com'
    AND unix_time BETWEEN 1349658729 AND 1352250720;
  ... given a composite primary key (host, unix_time)
+```
 
 This may be evaluated in Kudu with the following pseudo-code:
+
+```
   sum = 0
   foreach RowSet:
     start_rowid = rowset.lookup_key(1349658729)
@@ -662,6 +667,7 @@ This may be evaluated in Kudu with the following pseudo-code:
     while remaining > 0:
       block = iter.fetch_upto(remaining)
       sum += sum(block)
+```
 
 The fetching of blocks can be done very efficiently since the application
 of any potential mutations can simply index into the block and replace

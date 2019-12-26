@@ -30,11 +30,6 @@ import os
 import re
 import subprocess
 
-# Workaround a Python bug in which multiprocessing's atexit handler doesn't
-# play well with pytest. See http://bugs.python.org/issue15881 for details
-# and this suggested workaround (comment msg170215 in the thread).
-import multiprocessing
-
 if Cython.__version__ < '0.21.0':
     raise Exception('Please upgrade to Cython 0.21.0 or newer')
 
@@ -51,7 +46,8 @@ def find_version():
     if not version_match:
         raise RuntimeError("Unable to parse version string " + version_file)
     version = version_match.group("version")
-    if "SNAPSHOT" in version_match.group("label"):
+    label = version_match.group("label")
+    if label is not None and "SNAPSHOT" in label:
         version += '.dev0'
     return version
 

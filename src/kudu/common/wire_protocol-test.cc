@@ -17,9 +17,12 @@
 
 #include "kudu/common/wire_protocol.h"
 
-#include <cstddef>
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <memory>
+#include <numeric>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -32,8 +35,11 @@
 #include "kudu/common/row.h"
 #include "kudu/common/rowblock.h"
 #include "kudu/common/schema.h"
+#include "kudu/common/types.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/walltime.h"
 #include "kudu/util/bitmap.h"
 #include "kudu/util/bloom_filter.h"
 #include "kudu/util/faststring.h"
@@ -48,12 +54,17 @@
 #include "kudu/util/test_util.h"
 
 using std::string;
+using std::tuple;
 using std::unique_ptr;
 using std::vector;
+using strings::Substitute;
 
 namespace kudu {
 
-class WireProtocolTest : public KuduTest {
+class WireProtocolTest : public KuduTest,
+                         // Used for benchmark, int corresponds to the number of columns,
+                         // double corresponds to the selection rate.
+                         public testing::WithParamInterface<tuple<int, double>> {
  public:
   WireProtocolTest()
       : schema_({ ColumnSchema("col1", STRING),
@@ -83,8 +94,90 @@ class WireProtocolTest : public KuduTest {
       row.cell(2).set_null(false);
     }
   }
+
+  void ResetBenchmarkSchema(int num_columns) {
+    vector<ColumnSchema> column_schemas;
+    column_schemas.reserve(num_columns);
+    for (int i = 0; i < num_columns; i++) {
+      column_schemas.emplace_back(Substitute("col$0", i), i % 2 ? STRING : INT32);
+    }
+    benchmark_schema_.Reset(column_schemas, 1);
+  }
+
+  void FillRowBlockForBenchmark(RowBlock* block) {
+    test_data_arena_.Reset();
+    for (int i = 0; i < block->nrows(); i++) {
+      RowBlockRow row = block->row(i);
+      for (int j = 0; j < benchmark_schema_.num_columns(); j++) {
+        const ColumnSchema& column_schema = benchmark_schema_.column(j);
+        DataType type = column_schema.type_info()->type();
+        if (type == STRING) {
+          Slice col;
+          CHECK(test_data_arena_.RelocateSlice(Substitute("hello world $0",
+                                               column_schema.name()), &col));
+          memcpy(row.mutable_cell_ptr(j), &col, sizeof(Slice));
+        } else if (type == INT32) {
+          memcpy(row.mutable_cell_ptr(j), &i, sizeof(int32_t));
+        } else {
+          LOG(FATAL) << "Unexpected type.";
+        }
+      }
+    }
+  }
+
+  void SelectRandomRowsWithRate(RowBlock* block, double rate) {
+    CHECK_LE(rate, 1.0);
+    CHECK_GE(rate, 0.0);
+    int select_count = block->nrows() * rate;
+    SelectionVector* select_vector = block->selection_vector();
+    if (rate == 1.0) {
+      select_vector->SetAllTrue();
+    } else if (rate == 0.0) {
+      select_vector->SetAllFalse();
+    } else {
+      vector<int> indexes(block->nrows());
+      std::iota(indexes.begin(), indexes.end(), 0);
+      std::random_shuffle(indexes.begin(), indexes.end());
+      indexes.resize(select_count);
+      select_vector->SetAllFalse();
+      for (auto index : indexes) {
+        select_vector->SetRowSelected(index);
+      }
+    }
+    CHECK_EQ(select_vector->CountSelected(), select_count);
+  }
+
+  // Use column_count to control the schema scale.
+  // Use select_rate to control the number of selected rows.
+  void RunBenchmark(int column_count, double select_rate) {
+    ResetBenchmarkSchema(column_count);
+    Arena arena(1024);
+    RowBlock block(&benchmark_schema_, 1000, &arena);
+    // Regardless of the config, use a constant number of cells for the test by
+    // looping the conversion an appropriate number of times.
+    const int64_t kNumCellsToConvert = AllowSlowTests() ? 100000000 : 1000000;
+    const int kNumTrials = kNumCellsToConvert / select_rate / column_count / block.nrows();
+    FillRowBlockForBenchmark(&block);
+    SelectRandomRowsWithRate(&block, select_rate);
+
+    RowwiseRowBlockPB pb;
+    faststring direct, indirect;
+    int64_t cycle_start = CycleClock::Now();
+    for (int i = 0; i < kNumTrials; ++i) {
+      pb.Clear();
+      direct.clear();
+      indirect.clear();
+      SerializeRowBlock(block, &pb, nullptr, &direct, &indirect);
+    }
+    int64_t cycle_end = CycleClock::Now();
+    LOG(INFO) << Substitute(
+        "Converting to PB with column count $0 and row select rate $1: $2 cycles/cell",
+        column_count, select_rate,
+        static_cast<double>(cycle_end - cycle_start) / kNumCellsToConvert);
+  }
  protected:
   Schema schema_;
+  Schema benchmark_schema_;
   Arena test_data_arena_;
 };
 
@@ -221,7 +314,7 @@ TEST_F(WireProtocolTest, TestBadSchema_DuplicateColumnName) {
 // converted to and from protobuf.
 TEST_F(WireProtocolTest, TestColumnarRowBlockToPB) {
   Arena arena(1024);
-  RowBlock block(schema_, 10, &arena);
+  RowBlock block(&schema_, 10, &arena);
   FillRowBlockWithTestRows(&block);
 
   // Convert to PB.
@@ -258,7 +351,7 @@ TEST_F(WireProtocolTest, TestColumnarRowBlockToPBWithPadding) {
                          ColumnSchema("col2", UNIXTIME_MICROS),
                          ColumnSchema("col3", INT32, true /* nullable */),
                          ColumnSchema("col4", UNIXTIME_MICROS, true /* nullable */)}, 1);
-  RowBlock block(tablet_schema, kNumRows, &arena);
+  RowBlock block(&tablet_schema, kNumRows, &arena);
   block.selection_vector()->SetAllTrue();
 
   for (int i = 0; i < block.nrows(); i++) {
@@ -338,24 +431,15 @@ TEST_F(WireProtocolTest, TestColumnarRowBlockToPBWithPadding) {
   }
 }
 
-#ifdef NDEBUG
-TEST_F(WireProtocolTest, TestColumnarRowBlockToPBBenchmark) {
-  Arena arena(1024);
-  const int kNumTrials = AllowSlowTests() ? 100 : 10;
-  RowBlock block(schema_, 10000 * kNumTrials, &arena);
-  FillRowBlockWithTestRows(&block);
-
-  RowwiseRowBlockPB pb;
-
-  LOG_TIMING(INFO, "Converting to PB") {
-    for (int i = 0; i < kNumTrials; i++) {
-      pb.Clear();
-      faststring direct, indirect;
-      SerializeRowBlock(block, &pb, NULL, &direct, &indirect);
-    }
-  }
+TEST_P(WireProtocolTest, TestColumnarRowBlockToPBBenchmark) {
+  int column_count = std::get<0>(GetParam());
+  double select_rate = std::get<1>(GetParam());
+  RunBenchmark(column_count, select_rate);
 }
-#endif
+
+INSTANTIATE_TEST_CASE_P(ColumnarRowBlockToPBBenchmarkParams, WireProtocolTest,
+                        testing::Combine(testing::Values(3, 30, 300),
+                                         testing::Values(1.0, 0.8, 0.5, 0.2)));
 
 // Test that trying to extract rows from an invalid block correctly returns
 // Corruption statuses.
@@ -386,7 +470,7 @@ TEST_F(WireProtocolTest, TestInvalidRowBlock) {
 TEST_F(WireProtocolTest, TestBlockWithNoColumns) {
   Schema empty(std::vector<ColumnSchema>(), 0);
   Arena arena(1024);
-  RowBlock block(empty, 1000, &arena);
+  RowBlock block(&empty, 1000, &arena);
   block.selection_vector()->SetAllTrue();
   // Unselect 100 rows
   for (int i = 0; i < 100; i++) {
@@ -410,42 +494,47 @@ TEST_F(WireProtocolTest, TestColumnDefaultValue) {
 
   ColumnSchema col1("col1", STRING);
   ColumnSchemaToPB(col1, &pb);
-  ColumnSchema col1fpb = ColumnSchemaFromPB(pb);
-  ASSERT_FALSE(col1fpb.has_read_default());
-  ASSERT_FALSE(col1fpb.has_write_default());
-  ASSERT_TRUE(col1fpb.read_default_value() == nullptr);
+  boost::optional<ColumnSchema> col1fpb;
+  ASSERT_OK(ColumnSchemaFromPB(pb, &col1fpb));
+  ASSERT_FALSE(col1fpb->has_read_default());
+  ASSERT_FALSE(col1fpb->has_write_default());
+  ASSERT_TRUE(col1fpb->read_default_value() == nullptr);
 
   ColumnSchema col2("col2", STRING, false, &read_default_str);
   ColumnSchemaToPB(col2, &pb);
-  ColumnSchema col2fpb = ColumnSchemaFromPB(pb);
-  ASSERT_TRUE(col2fpb.has_read_default());
-  ASSERT_FALSE(col2fpb.has_write_default());
-  ASSERT_EQ(read_default_str, *static_cast<const Slice *>(col2fpb.read_default_value()));
-  ASSERT_EQ(nullptr, static_cast<const Slice *>(col2fpb.write_default_value()));
+  boost::optional<ColumnSchema> col2fpb;
+  ASSERT_OK(ColumnSchemaFromPB(pb, &col2fpb));
+  ASSERT_TRUE(col2fpb->has_read_default());
+  ASSERT_FALSE(col2fpb->has_write_default());
+  ASSERT_EQ(read_default_str, *static_cast<const Slice *>(col2fpb->read_default_value()));
+  ASSERT_EQ(nullptr, static_cast<const Slice *>(col2fpb->write_default_value()));
 
   ColumnSchema col3("col3", STRING, false, &read_default_str, &write_default_str);
   ColumnSchemaToPB(col3, &pb);
-  ColumnSchema col3fpb = ColumnSchemaFromPB(pb);
-  ASSERT_TRUE(col3fpb.has_read_default());
-  ASSERT_TRUE(col3fpb.has_write_default());
-  ASSERT_EQ(read_default_str, *static_cast<const Slice *>(col3fpb.read_default_value()));
-  ASSERT_EQ(write_default_str, *static_cast<const Slice *>(col3fpb.write_default_value()));
+  boost::optional<ColumnSchema> col3fpb;
+  ASSERT_OK(ColumnSchemaFromPB(pb, &col3fpb));
+  ASSERT_TRUE(col3fpb->has_read_default());
+  ASSERT_TRUE(col3fpb->has_write_default());
+  ASSERT_EQ(read_default_str, *static_cast<const Slice *>(col3fpb->read_default_value()));
+  ASSERT_EQ(write_default_str, *static_cast<const Slice *>(col3fpb->write_default_value()));
 
   ColumnSchema col4("col4", UINT32, false, &read_default_u32);
   ColumnSchemaToPB(col4, &pb);
-  ColumnSchema col4fpb = ColumnSchemaFromPB(pb);
-  ASSERT_TRUE(col4fpb.has_read_default());
-  ASSERT_FALSE(col4fpb.has_write_default());
-  ASSERT_EQ(read_default_u32, *static_cast<const uint32_t *>(col4fpb.read_default_value()));
-  ASSERT_EQ(nullptr, static_cast<const uint32_t *>(col4fpb.write_default_value()));
+  boost::optional<ColumnSchema> col4fpb;
+  ASSERT_OK(ColumnSchemaFromPB(pb, &col4fpb));
+  ASSERT_TRUE(col4fpb->has_read_default());
+  ASSERT_FALSE(col4fpb->has_write_default());
+  ASSERT_EQ(read_default_u32, *static_cast<const uint32_t *>(col4fpb->read_default_value()));
+  ASSERT_EQ(nullptr, static_cast<const uint32_t *>(col4fpb->write_default_value()));
 
   ColumnSchema col5("col5", UINT32, false, &read_default_u32, &write_default_u32);
   ColumnSchemaToPB(col5, &pb);
-  ColumnSchema col5fpb = ColumnSchemaFromPB(pb);
-  ASSERT_TRUE(col5fpb.has_read_default());
-  ASSERT_TRUE(col5fpb.has_write_default());
-  ASSERT_EQ(read_default_u32, *static_cast<const uint32_t *>(col5fpb.read_default_value()));
-  ASSERT_EQ(write_default_u32, *static_cast<const uint32_t *>(col5fpb.write_default_value()));
+  boost::optional<ColumnSchema> col5fpb;
+  ASSERT_OK(ColumnSchemaFromPB(pb, &col5fpb));
+  ASSERT_TRUE(col5fpb->has_read_default());
+  ASSERT_TRUE(col5fpb->has_write_default());
+  ASSERT_EQ(read_default_u32, *static_cast<const uint32_t *>(col5fpb->read_default_value()));
+  ASSERT_EQ(write_default_u32, *static_cast<const uint32_t *>(col5fpb->write_default_value()));
 }
 
 // Regression test for KUDU-2378; the call to ColumnSchemaFromPB yielded a crash.
@@ -454,7 +543,32 @@ TEST_F(WireProtocolTest, TestCrashOnAlignedLoadOf128BitReadDefault) {
   pb.set_name("col");
   pb.set_type(DECIMAL128);
   pb.set_read_default_value(string(16, 'a'));
-  ColumnSchemaFromPB(pb);
+  boost::optional<ColumnSchema> col;
+  ASSERT_OK(ColumnSchemaFromPB(pb, &col));
+}
+
+// Regression test for KUDU-2622; Validate read and write default value sizes.
+TEST_F(WireProtocolTest, TestInvalidReadAndWriteDefault) {
+  {
+    ColumnSchemaPB pb;
+    pb.set_name("col");
+    pb.set_type(DECIMAL128);
+    pb.set_read_default_value(string(8, 'a'));
+    boost::optional<ColumnSchema> col;
+    Status s = ColumnSchemaFromPB(pb, &col);
+    EXPECT_TRUE(s.IsCorruption());
+    ASSERT_STR_CONTAINS(s.ToString(), "Corruption: Not enough bytes for decimal: read default");
+  }
+  {
+    ColumnSchemaPB pb;
+    pb.set_name("col");
+    pb.set_type(DECIMAL128);
+    pb.set_write_default_value(string(8, 'a'));
+    boost::optional<ColumnSchema> col;
+    Status s = ColumnSchemaFromPB(pb, &col);
+    EXPECT_TRUE(s.IsCorruption());
+    ASSERT_STR_CONTAINS(s.ToString(), "Corruption: Not enough bytes for decimal: write default");
+  }
 }
 
 TEST_F(WireProtocolTest, TestColumnPredicateInList) {
@@ -472,7 +586,7 @@ TEST_F(WireProtocolTest, TestColumnPredicateInList) {
 
     kudu::ColumnPredicate cp = kudu::ColumnPredicate::InList(col1, &values);
     ColumnPredicatePB pb;
-    ASSERT_NO_FATAL_FAILURE(ColumnPredicateToPB(cp, &pb));
+    NO_FATALS(ColumnPredicateToPB(cp, &pb));
 
     ASSERT_OK(ColumnPredicateFromPB(schema, &arena, pb, &predicate));
     ASSERT_EQ(predicate->predicate_type(), PredicateType::InList);

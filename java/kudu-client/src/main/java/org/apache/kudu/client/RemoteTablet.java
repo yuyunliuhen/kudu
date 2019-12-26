@@ -24,12 +24,14 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ComparisonChain;
 import com.google.common.collect.ImmutableList;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -38,7 +40,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.kudu.consensus.Metadata;
-import org.apache.kudu.master.Master;
 
 /**
  * This class encapsulates the information regarding a tablet and its locations.
@@ -56,24 +57,29 @@ import org.apache.kudu.master.Master;
 public class RemoteTablet implements Comparable<RemoteTablet> {
 
   private static final Logger LOG = LoggerFactory.getLogger(RemoteTablet.class);
+  private static final int randomInt = new Random().nextInt(Integer.MAX_VALUE);
 
   private final String tableId;
   private final String tabletId;
   @GuardedBy("tabletServers")
   private final Map<String, ServerInfo> tabletServers;
   private final AtomicReference<List<LocatedTablet.Replica>> replicas =
-      new AtomicReference(ImmutableList.of());
+      new AtomicReference<>(ImmutableList.of());
   private final Partition partition;
 
   @GuardedBy("tabletServers")
   private String leaderUuid;
 
   RemoteTablet(String tableId,
-               Master.TabletLocationsPB tabletLocations,
+               String tabletId,
+               Partition partition,
+               List<LocatedTablet.Replica> replicas,
                List<ServerInfo> serverInfos) {
-    this.tabletId = tabletLocations.getTabletId().toStringUtf8();
+    Preconditions.checkArgument(replicas.size() == serverInfos.size(),
+                                "the number of replicas does not equal the number of servers");
+    this.tabletId = tabletId;
     this.tableId = tableId;
-    this.partition = ProtobufHelper.pbToPartition(tabletLocations.getPartition());
+    this.partition = partition;
     this.tabletServers = new HashMap<>(serverInfos.size());
 
     for (ServerInfo serverInfo : serverInfos) {
@@ -81,18 +87,17 @@ public class RemoteTablet implements Comparable<RemoteTablet> {
     }
 
     ImmutableList.Builder<LocatedTablet.Replica> replicasBuilder = new ImmutableList.Builder<>();
-    for (Master.TabletLocationsPB.ReplicaPB replica : tabletLocations.getReplicasList()) {
-      String uuid = replica.getTsInfo().getPermanentUuid().toStringUtf8();
-      replicasBuilder.add(new LocatedTablet.Replica(replica));
-      if (replica.getRole().equals(Metadata.RaftPeerPB.Role.LEADER)) {
-        leaderUuid = uuid;
+    for (int i = 0; i < replicas.size(); ++i) {
+      replicasBuilder.add(replicas.get(i));
+      if (replicas.get(i).getRoleAsEnum().equals(Metadata.RaftPeerPB.Role.LEADER)) {
+        this.leaderUuid = serverInfos.get(i).getUuid();
       }
     }
 
     if (leaderUuid == null) {
       LOG.warn("No leader provided for tablet {}", getTabletId());
     }
-    replicas.set(replicasBuilder.build());
+    this.replicas.set(replicasBuilder.build());
   }
 
   @Override
@@ -172,26 +177,51 @@ public class RemoteTablet implements Comparable<RemoteTablet> {
   }
 
   /**
-   * Get the information on the closest server. If none is closer than the others,
-   * return the information on a randomly picked server.
+   * Get the information on the closest server. Servers are ranked from closest to furthest as
+   * follows:
+   * - Local servers
+   * - Servers in the same location as the client
+   * - All other servers
    *
-   * @return the information on the closest server, which might be any if none is closer, or null
-   *   if this cache doesn't know any servers.
+   * @param location the location of the client
+   * @return the information for a closest server, or null if this cache doesn't know any servers.
    */
   @Nullable
-  ServerInfo getClosestServerInfo() {
+  ServerInfo getClosestServerInfo(String location) {
+    // This method returns
+    // 1. a randomly picked server among local servers, if there is a local server, or
+    // 2. a randomly picked server in the same location, if there is a server in the
+    //    same location, or, finally,
+    // 3. a randomly picked server among all tablet servers.
+    // TODO(wdberkeley): Eventually, the client might use the hierarchical
+    // structure of a location to determine proximity.
     synchronized (tabletServers) {
-      ServerInfo last = null;
+      ServerInfo result = null;
+      List<ServerInfo> localServers = new ArrayList<>();
+      List<ServerInfo> serversInSameLocation = new ArrayList<>();
+      int randomIndex = randomInt % tabletServers.size();
+      int index = 0;
       for (ServerInfo e : tabletServers.values()) {
-        last = e;
         if (e.isLocal()) {
-          return e;
+          localServers.add(e);
         }
+        if (e.inSameLocation(location)) {
+          serversInSameLocation.add(e);
+        }
+        if (index == randomIndex) {
+          result = e;
+        }
+        index++;
       }
-      // TODO(KUDU-2348) this doesn't return a random server, but rather returns
-      // whichever one's hashcode places it last. That might be the same
-      // "random" choice across all clients, which is not so good.
-      return last;
+      if (!localServers.isEmpty()) {
+        randomIndex = randomInt % localServers.size();
+        return localServers.get(randomIndex);
+      }
+      if (!serversInSameLocation.isEmpty()) {
+        randomIndex = randomInt % serversInSameLocation.size();
+        return serversInSameLocation.get(randomIndex);
+      }
+      return result;
     }
   }
 
@@ -200,15 +230,16 @@ public class RemoteTablet implements Comparable<RemoteTablet> {
    * mechanism.
    *
    * @param replicaSelection replica selection mechanism to use
+   * @param location the location of the client
    * @return information on the server that matches the selection, can be null
    */
   @Nullable
-  ServerInfo getReplicaSelectedServerInfo(ReplicaSelection replicaSelection) {
+  ServerInfo getReplicaSelectedServerInfo(ReplicaSelection replicaSelection, String location) {
     switch (replicaSelection) {
       case LEADER_ONLY:
         return getLeaderServerInfo();
       case CLOSEST_REPLICA:
-        return getClosestServerInfo();
+        return getClosestServerInfo(location);
       default:
         throw new RuntimeException("unknown replica selection mechanism " + replicaSelection);
     }
@@ -255,7 +286,7 @@ public class RemoteTablet implements Comparable<RemoteTablet> {
     if (this == o) {
       return true;
     }
-    if (o == null || getClass() != o.getClass()) {
+    if (!(o instanceof RemoteTablet)) {
       return false;
     }
 

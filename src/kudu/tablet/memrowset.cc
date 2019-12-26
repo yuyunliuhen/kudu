@@ -53,6 +53,7 @@ TAG_FLAG(mrs_use_codegen, hidden);
 
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 namespace kudu { namespace tablet {
@@ -65,25 +66,18 @@ using strings::Substitute;
 static const int kInitialArenaSize = 16;
 
 bool MRSRow::IsGhost() const {
-  bool is_ghost = false;
-  for (const Mutation *mut = header_->redo_head;
-       mut != nullptr;
-       mut = mut->next()) {
-    RowChangeListDecoder decoder(mut->changelist());
-    Status s = decoder.Init();
-    if (!PREDICT_TRUE(s.ok())) {
-      LOG(FATAL) << "Failed to decode: " << mut->changelist().ToString(*schema())
-                  << " (" << s.ToString() << ")";
-    }
-    if (decoder.is_delete()) {
-      DCHECK(!is_ghost);
-      is_ghost = true;
-    } else if (decoder.is_reinsert()) {
-      DCHECK(is_ghost);
-      is_ghost = false;
-    }
+  const Mutation *mut_tail = header_->redo_tail;
+  if (mut_tail == nullptr) {
+    return false;
   }
-  return is_ghost;
+  RowChangeListDecoder decoder(mut_tail->changelist());
+  Status s = decoder.Init();
+  if (!PREDICT_TRUE(s.ok())) {
+    LOG(FATAL) << Substitute("Failed to decode: $0 ($1)",
+                             mut_tail->changelist().ToString(*schema()),
+                             s.ToString());
+  }
+  return decoder.is_delete();
 }
 
 namespace {
@@ -122,7 +116,8 @@ MemRowSet::MemRowSet(int64_t id,
     debug_insert_count_(0),
     debug_update_count_(0),
     anchorer_(log_anchor_registry, Substitute("MemRowSet-$0", id_)),
-    has_been_compacted_(false) {
+    has_been_compacted_(false),
+    live_row_count_(0) {
   CHECK(schema.has_column_ids());
   ANNOTATE_BENIGN_RACE(&debug_insert_count_, "insert count isnt accurate");
   ANNOTATE_BENIGN_RACE(&debug_update_count_, "update count isnt accurate");
@@ -132,8 +127,8 @@ MemRowSet::~MemRowSet() {
 }
 
 Status MemRowSet::DebugDump(vector<string> *lines) {
-  gscoped_ptr<Iterator> iter(NewIterator());
-  RETURN_NOT_OK(iter->Init(NULL));
+  unique_ptr<Iterator> iter(NewIterator());
+  RETURN_NOT_OK(iter->Init(nullptr));
   while (iter->HasNext()) {
     MRSRow row = iter->GetCurrentRow();
     LOG_STRING(INFO, lines)
@@ -184,6 +179,7 @@ Status MemRowSet::Insert(Timestamp timestamp,
     DEFINE_MRSROW_ON_STACK(this, mrsrow, mrsrow_slice);
     mrsrow.header_->insertion_timestamp = timestamp;
     mrsrow.header_->redo_head = nullptr;
+    mrsrow.header_->redo_tail = nullptr;
     RETURN_NOT_OK(mrsrow.CopyRow(row, arena_.get()));
 
     CHECK(mutation.Insert(mrsrow_slice))
@@ -194,6 +190,7 @@ Status MemRowSet::Insert(Timestamp timestamp,
   anchorer_.AnchorIfMinimum(op_id.index());
 
   debug_insert_count_++;
+  live_row_count_.Increment();
   return Status::OK();
 }
 
@@ -212,7 +209,9 @@ Status MemRowSet::Reinsert(Timestamp timestamp, const ConstContiguousRow& row, M
   // This function has "release" semantics which ensures that the memory writes
   // for the mutation are fully published before any concurrent reader sees
   // the appended mutation.
-  mut->AppendToListAtomic(&ms_row->header_->redo_head);
+  mut->AppendToListAtomic(&ms_row->header_->redo_head, &ms_row->header_->redo_tail);
+
+  live_row_count_.Increment();
   return Status::OK();
 }
 
@@ -246,7 +245,7 @@ Status MemRowSet::MutateRow(Timestamp timestamp,
     // This function has "release" semantics which ensures that the memory writes
     // for the mutation are fully published before any concurrent reader sees
     // the appended mutation.
-    mut->AppendToListAtomic(&row.header_->redo_head);
+    mut->AppendToListAtomic(&row.header_->redo_head, &row.header_->redo_tail);
 
     MemStoreTargetPB* target = result->add_mutated_stores();
     target->set_mrs_id(id_);
@@ -256,6 +255,9 @@ Status MemRowSet::MutateRow(Timestamp timestamp,
 
   anchorer_.AnchorIfMinimum(op_id.index());
   debug_update_count_++;
+  if (delta.is_delete()) {
+    live_row_count_.IncrementBy(-1);
+  }
   return Status::OK();
 }
 
@@ -300,7 +302,7 @@ MemRowSet::Iterator *MemRowSet::NewIterator() const {
 }
 
 Status MemRowSet::NewRowIterator(const RowIteratorOptions& opts,
-                                 gscoped_ptr<RowwiseIterator>* out) const {
+                                 unique_ptr<RowwiseIterator>* out) const {
   out->reset(NewIterator(opts));
   return Status::OK();
 }
@@ -394,7 +396,7 @@ MemRowSet::Iterator::Iterator(const std::shared_ptr<const MemRowSet>& mrs,
       projector_(
           GenerateAppropriateProjector(&mrs->schema_nonvirtual(), opts_.projection)),
       delta_projector_(&mrs->schema_nonvirtual(), opts_.projection),
-      projection_vc_is_deleted_idx_(opts_.projection->find_first_is_deleted_virtual_column()),
+      projection_vc_is_deleted_idx_(opts_.projection->first_is_deleted_virtual_column_idx()),
       state_(kUninitialized) {
   // TODO(todd): various code assumes that a newly constructed iterator
   // is pointed at the beginning of the dataset. This causes a redundant
@@ -529,9 +531,10 @@ Status MemRowSet::Iterator::FetchRows(RowBlock* dst, size_t* fetched) {
       Mutation* redo_head = reinterpret_cast<Mutation*>(
           base::subtle::Acquire_Load(reinterpret_cast<AtomicWord*>(&row.header_->redo_head)));
       RETURN_NOT_OK(ApplyMutationsToProjectedRow(
-          redo_head, &dst_row, dst->arena(), &apply_status));
+          redo_head, &dst_row, dst->arena(), insert_excluded, &apply_status));
       unset_in_sel_vector = (apply_status == APPLIED_AND_DELETED && !opts_.include_deleted_rows) ||
-                            (apply_status == NONE_APPLIED && insert_excluded);
+                            (apply_status == NONE_APPLIED && insert_excluded) ||
+                            (apply_status == APPLIED_AND_UNOBSERVABLE);
     } else {
       // The insertion is too new; the entire row should be omitted.
       unset_in_sel_vector = true;
@@ -561,7 +564,7 @@ Status MemRowSet::Iterator::FetchRows(RowBlock* dst, size_t* fetched) {
 
 Status MemRowSet::Iterator::ApplyMutationsToProjectedRow(
     const Mutation* mutation_head, RowBlockRow* dst_row, Arena* dst_arena,
-    ApplyStatus* apply_status) {
+    bool insert_excluded, ApplyStatus* apply_status) {
   ApplyStatus local_apply_status = NONE_APPLIED;
 
   // Fast short-circuit the likely case of a row which was inserted and never
@@ -571,14 +574,33 @@ Status MemRowSet::Iterator::ApplyMutationsToProjectedRow(
     return Status::OK();
   }
 
-  bool is_deleted = false;
+  // In order to find unobservable rows, we need to track row liveness at the
+  // start and end of the time range. If a row was dead at both ends, its
+  // lifespan must have been a subset of the time range and it should be
+  // excluded from the results.
+  //
+  // Finding 'is_deleted_end' is relatively straight-forward: we use each
+  // relevant mutation to drive a liveness state machine, and after we're done
+  // applying, 'is_deleted_end' is just the final value of that state machine.
+  //
+  // Finding 'is_deleted_start' is trickier. If the insertion was inside the
+  // time range, we know the value is true because the row was dead prior to the
+  // insertion and the insertion happened after the start of the time range.
+  // However, if the insertion was excluded from the time range, the value is
+  // going to be whatever the value of the liveness state machine was at the
+  // start of the time range.
+  bool is_deleted_start = !insert_excluded;
+  bool is_deleted_end = false;
 
   for (const Mutation *mut = mutation_head;
        mut != nullptr;
        mut = mut->acquire_next()) {
     if (!opts_.snap_to_include.IsCommitted(mut->timestamp_)) {
-      // This mutation is too new; it should be omitted.
-      continue;
+      // This mutation is too new and should be omitted.
+      //
+      // All subsequent mutations are also too new because their timestamps are
+      // guaranteed to be equal to or greater than this mutation's timestamp.
+      break;
     }
 
     // If the mutation is too old, we still need to apply it (so that the column
@@ -586,6 +608,12 @@ Status MemRowSet::Iterator::ApplyMutationsToProjectedRow(
     // count towards the overall "application status".
     if (!opts_.snap_to_exclude ||
         !opts_.snap_to_exclude->IsCommitted(mut->timestamp_)) {
+
+      // This is the first mutation within the time range, so we may use it to
+      // initialize 'is_deleted_start'.
+      if (local_apply_status == NONE_APPLIED && insert_excluded) {
+        is_deleted_start = is_deleted_end;
+      }
       local_apply_status = APPLIED_AND_PRESENT;
     }
 
@@ -595,11 +623,11 @@ Status MemRowSet::Iterator::ApplyMutationsToProjectedRow(
     RowChangeListDecoder decoder(mut->changelist());
     RETURN_NOT_OK(decoder.Init());
     if (decoder.is_delete()) {
-      decoder.TwiddleDeleteStatus(&is_deleted);
+      decoder.TwiddleDeleteStatus(&is_deleted_end);
     } else {
       DCHECK(decoder.is_update() || decoder.is_reinsert());
       if (decoder.is_reinsert()) {
-        decoder.TwiddleDeleteStatus(&is_deleted);
+        decoder.TwiddleDeleteStatus(&is_deleted_end);
       }
 
       // TODO(todd): this is slow, since it makes multiple passes through the rowchangelist.
@@ -615,9 +643,17 @@ Status MemRowSet::Iterator::ApplyMutationsToProjectedRow(
     }
   }
 
-  // If the most recent mutation seen for the row was a DELETE, then set the selection
-  // vector bit to 0, so it doesn't show up in the results.
-  if (is_deleted && local_apply_status == APPLIED_AND_PRESENT) {
+  if (opts_.snap_to_exclude && is_deleted_start && is_deleted_end) {
+    // The row's lifespan was a subset of the time range. It can't be observed,
+    // so it should definitely not show up in the results.
+    //
+    // Note: we condition on 'snap_to_exclude' because although insert_excluded
+    // is false on some closed time range scans, it's also false in all open
+    // time range scans, and we don't want this heuristic to fire in the latter case.
+    local_apply_status = APPLIED_AND_UNOBSERVABLE;
+  } else if (is_deleted_end && local_apply_status == APPLIED_AND_PRESENT) {
+    // The row was selected and deleted. It may be omitted from the results,
+    // depending on whether the results should include deleted rows or not.
     local_apply_status = APPLIED_AND_DELETED;
   }
 

@@ -30,6 +30,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLPeerUnverifiedException;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -75,8 +76,6 @@ import org.apache.kudu.rpc.RpcHeader.RpcFeatureFlag;
  * Acquiring the monitor on an object of this class will prevent it from
  * accepting write requests as well as buffering requests if the underlying
  * channel isn't connected.
- *
- * TODO(aserbin) clarify on the socketReadTimeoutMs and using per-RPC timeout settings.
  */
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
@@ -106,9 +105,6 @@ class Connection extends SimpleChannelUpstreamHandler {
   /** Security context to use for connection negotiation. */
   private final SecurityContext securityContext;
 
-  /** Read timeout for the connection (used by Netty's ReadTimeoutHandler). */
-  private final long socketReadTimeoutMs;
-
   /** Timer to monitor read timeouts for the connection (used by Netty's ReadTimeoutHandler). */
   private final HashedWheelTimer timer;
 
@@ -135,6 +131,9 @@ class Connection extends SimpleChannelUpstreamHandler {
       0,
       0
   };
+
+  private static final String NEGOTIATION_TIMEOUT_HANDLER = "negotiation-timeout-handler";
+  private static final long NEGOTIATION_TIMEOUT_MS = 10000;
 
   /** Lock to guard access to some of the fields below. */
   private final ReentrantLock lock = new ReentrantLock();
@@ -178,7 +177,6 @@ class Connection extends SimpleChannelUpstreamHandler {
    *
    * @param serverInfo the destination server
    * @param securityContext security context to use for connection negotiation
-   * @param socketReadTimeoutMs timeout for the read operations on the socket
    * @param timer timer to set up read timeout on the corresponding Netty channel
    * @param channelFactory Netty factory to create corresponding Netty channel
    * @param credentialsPolicy policy controlling which credentials to use while negotiating on the
@@ -188,14 +186,12 @@ class Connection extends SimpleChannelUpstreamHandler {
    */
   Connection(ServerInfo serverInfo,
              SecurityContext securityContext,
-             long socketReadTimeoutMs,
              HashedWheelTimer timer,
              ClientSocketChannelFactory channelFactory,
              CredentialsPolicy credentialsPolicy) {
     this.serverInfo = serverInfo;
     this.securityContext = securityContext;
     this.state = State.NEW;
-    this.socketReadTimeoutMs = socketReadTimeoutMs;
     this.timer = timer;
     this.credentialsPolicy = credentialsPolicy;
 
@@ -319,6 +315,10 @@ class Connection extends SimpleChannelUpstreamHandler {
         Preconditions.checkState(state == State.NEGOTIATING);
 
         queuedMessages = null;
+
+        // Drop the negotiation timeout handler from the pipeline.
+        ctx.getPipeline().remove(NEGOTIATION_TIMEOUT_HANDLER);
+
         // Set the state to READY -- that means the incoming messages should be no longer put into
         // the queuedMessages, but sent to wire right away (see the enqueueMessage() for details).
         state = State.READY;
@@ -395,10 +395,16 @@ class Connection extends SimpleChannelUpstreamHandler {
     final RpcHeader.ErrorStatusPB.Builder errorBuilder = RpcHeader.ErrorStatusPB.newBuilder();
     KuduRpc.readProtobuf(response.getPBMessage(), errorBuilder);
     final RpcHeader.ErrorStatusPB error = errorBuilder.build();
-    if (error.getCode().equals(RpcHeader.ErrorStatusPB.RpcErrorCodePB.ERROR_SERVER_TOO_BUSY) ||
-        error.getCode().equals(RpcHeader.ErrorStatusPB.RpcErrorCodePB.ERROR_UNAVAILABLE)) {
+    RpcHeader.ErrorStatusPB.RpcErrorCodePB code = error.getCode();
+    if (code.equals(RpcHeader.ErrorStatusPB.RpcErrorCodePB.ERROR_SERVER_TOO_BUSY) ||
+        code.equals(RpcHeader.ErrorStatusPB.RpcErrorCodePB.ERROR_UNAVAILABLE)) {
       responseCbk.call(new CallResponseInfo(
           response, new RecoverableException(Status.ServiceUnavailable(error.getMessage()))));
+      return;
+    }
+    if (code.equals(RpcHeader.ErrorStatusPB.RpcErrorCodePB.ERROR_INVALID_AUTHORIZATION_TOKEN)) {
+      responseCbk.call(new CallResponseInfo(
+          response, new InvalidAuthzTokenException(Status.NotAuthorized(error.getMessage()))));
       return;
     }
 
@@ -446,6 +452,11 @@ class Connection extends SimpleChannelUpstreamHandler {
       // SSLException if we've already attempted to close, otherwise log the error.
       error = new RecoverableException(Status.NetworkError(
           String.format("%s disconnected from peer", getLogPrefix())));
+    } else if (e instanceof SSLPeerUnverifiedException) {
+      String m = String.format("unable to verify identity of peer %s: %s",
+          serverInfo, e.getMessage());
+      error = new NonRecoverableException(Status.NetworkError(m), e);
+      LOG.error(m, e);
     } else {
       // If the connection was explicitly disconnected via a call to disconnect(), we should
       // have either gotten a ClosedChannelException or an SSLException.
@@ -532,11 +543,9 @@ class Connection extends SimpleChannelUpstreamHandler {
       headerBuilder.setCallId(callId);
 
       // Amend the timeout for the call, if necessary.
-      if (socketReadTimeoutMs > 0) {
-        final int timeoutMs = headerBuilder.getTimeoutMillis();
-        if (timeoutMs > 0) {
-          headerBuilder.setTimeoutMillis((int) Math.min(timeoutMs, socketReadTimeoutMs));
-        }
+      final int timeoutMs = headerBuilder.getTimeoutMillis();
+      if (timeoutMs > 0) {
+        headerBuilder.setTimeoutMillis(timeoutMs);
       }
 
       // If the connection hasn't been negotiated yet, add the message into the queuedMessages list.
@@ -587,23 +596,35 @@ class Connection extends SimpleChannelUpstreamHandler {
   Deferred<Void> shutdown() {
     final ChannelFuture disconnectFuture = disconnect();
     final Deferred<Void> d = new Deferred<>();
-    disconnectFuture.addListener(new ChannelFutureListener() {
-      @Override
-      public void operationComplete(final ChannelFuture future) {
-        if (future.isSuccess()) {
-          d.callback(null);
-          return;
-        }
-        final Throwable t = future.getCause();
-        if (t instanceof Exception) {
-          d.callback(t);
-        } else {
-          d.callback(new NonRecoverableException(
-              Status.IllegalState("failed to shutdown: " + this), t));
-        }
-      }
-    });
+    disconnectFuture.addListener(new ShutdownListener(d));
     return d;
+  }
+
+  /**
+   * A ChannelFutureListener that completes the passed deferred on completion.
+   */
+  private static class ShutdownListener implements ChannelFutureListener {
+
+    private final Deferred<Void> deferred;
+
+    public ShutdownListener(Deferred<Void> deferred) {
+      this.deferred = deferred;
+    }
+
+    @Override
+    public void operationComplete(final ChannelFuture future) {
+      if (future.isSuccess()) {
+        deferred.callback(null);
+        return;
+      }
+      final Throwable t = future.getCause();
+      if (t instanceof Exception) {
+        deferred.callback(t);
+      } else {
+        deferred.callback(new NonRecoverableException(
+            Status.IllegalState("failed to shutdown: " + this), t));
+      }
+    }
   }
 
   /** @return string representation of this object (suitable for printing into the logs, etc.) */
@@ -801,10 +822,10 @@ class Connection extends SimpleChannelUpstreamHandler {
           4 /* strip the length prefix */));
       super.addLast("decode-inbound", new CallResponse.Decoder());
       super.addLast("encode-outbound", new RpcOutboundMessage.Encoder());
-      if (Connection.this.socketReadTimeoutMs > 0) {
-        super.addLast("timeout-handler", new ReadTimeoutHandler(
-            Connection.this.timer, Connection.this.socketReadTimeoutMs, TimeUnit.MILLISECONDS));
-      }
+      // Add a socket read timeout handler to function as a timeout for negotiation.
+      // The handler will be removed once the connection is negotiated.
+      super.addLast(NEGOTIATION_TIMEOUT_HANDLER, new ReadTimeoutHandler(
+          Connection.this.timer, NEGOTIATION_TIMEOUT_MS, TimeUnit.MILLISECONDS));
       super.addLast("kudu-handler", Connection.this);
     }
   }

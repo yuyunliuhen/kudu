@@ -20,9 +20,10 @@
 
 rootProject.name = "kudu-parent"
 include "kudu-backup"
+include "kudu-backup-common"
+include "kudu-backup-tools"
 include "kudu-client"
 include "kudu-client-tools"
-include "kudu-flume-sink"
 include "kudu-hive"
 include "kudu-jepsen"
 include "kudu-mapreduce"

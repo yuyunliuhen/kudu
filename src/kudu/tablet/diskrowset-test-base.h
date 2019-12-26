@@ -59,7 +59,8 @@ class TestRowSet : public KuduRowSetTest {
     : KuduRowSetTest(CreateTestSchema()),
       n_rows_(FLAGS_roundtrip_num_rows),
       op_id_(consensus::MaximumOpId()),
-      clock_(clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)) {
+      clock_(clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)),
+      log_anchor_registry_(new log::LogAnchorRegistry()) {
     CHECK_GT(n_rows_, 0);
   }
 
@@ -114,7 +115,7 @@ class TestRowSet : public KuduRowSetTest {
       CHECK_OK(writer->Open());
 
       char buf[256];
-      RowBuilder rb(schema_);
+      RowBuilder rb(&schema_);
       for (int i = 0; i < n_rows; i++) {
         CHECK_OK(writer->RollIfNecessary());
         rb.Reset();
@@ -179,7 +180,8 @@ class TestRowSet : public KuduRowSetTest {
                    uint32_t row_idx,
                    const RowChangeList &mutation,
                    OperationResultPB* result) {
-    RowBuilder rb(schema_.CreateKeyProjection());
+    Schema proj_key = schema_.CreateKeyProjection();
+    RowBuilder rb(&proj_key);
     BuildRowKey(&rb, row_idx);
     RowSetKeyProbe probe(rb.row());
 
@@ -192,7 +194,8 @@ class TestRowSet : public KuduRowSetTest {
   }
 
   Status CheckRowPresent(const DiskRowSet &rs, uint32_t row_idx, bool *present) {
-    RowBuilder rb(schema_.CreateKeyProjection());
+    Schema proj_key = schema_.CreateKeyProjection();
+    RowBuilder rb(&proj_key);
     BuildRowKey(&rb, row_idx);
     RowSetKeyProbe probe(rb.row());
     ProbeStats stats;
@@ -214,12 +217,12 @@ class TestRowSet : public KuduRowSetTest {
     Schema proj_val = CreateProjection(schema_, { "val" });
     RowIteratorOptions opts;
     opts.projection = &proj_val;
-    gscoped_ptr<RowwiseIterator> row_iter;
+    std::unique_ptr<RowwiseIterator> row_iter;
     CHECK_OK(rs.NewRowIterator(opts, &row_iter));
     CHECK_OK(row_iter->Init(nullptr));
     Arena arena(1024);
     int batch_size = 10000;
-    RowBlock dst(proj_val, batch_size, &arena);
+    RowBlock dst(&proj_val, batch_size, &arena);
 
     int i = 0;
     while (row_iter->HasNext()) {
@@ -262,7 +265,7 @@ class TestRowSet : public KuduRowSetTest {
 
     RowIteratorOptions opts;
     opts.projection = &schema_;
-    gscoped_ptr<RowwiseIterator> row_iter;
+    std::unique_ptr<RowwiseIterator> row_iter;
     CHECK_OK(rs.NewRowIterator(opts, &row_iter));
     CHECK_OK(row_iter->Init(&spec));
     std::vector<std::string> rows;
@@ -277,13 +280,13 @@ class TestRowSet : public KuduRowSetTest {
                                 int expected_rows, bool do_log = true) {
     RowIteratorOptions opts;
     opts.projection = &schema;
-    gscoped_ptr<RowwiseIterator> row_iter;
+    std::unique_ptr<RowwiseIterator> row_iter;
     CHECK_OK(rs.NewRowIterator(opts, &row_iter));
     CHECK_OK(row_iter->Init(nullptr));
 
     int batch_size = 1000;
     Arena arena(1024);
-    RowBlock dst(schema, batch_size, &arena);
+    RowBlock dst(&schema, batch_size, &arena);
 
     int i = 0;
     int log_interval = expected_rows/20 / batch_size;
@@ -325,7 +328,7 @@ class TestRowSet : public KuduRowSetTest {
 
   Status OpenTestRowSet(std::shared_ptr<DiskRowSet> *rowset) {
     return DiskRowSet::Open(rowset_meta_,
-                            new log::LogAnchorRegistry(),
+                            log_anchor_registry_.get(),
                             TabletMemTrackers(),
                             nullptr,
                             rowset);
@@ -339,6 +342,7 @@ class TestRowSet : public KuduRowSetTest {
   consensus::OpId op_id_; // Generally a "fake" OpId for these tests.
   scoped_refptr<clock::Clock> clock_;
   MvccManager mvcc_;
+  scoped_refptr<log::LogAnchorRegistry> log_anchor_registry_;
 };
 
 } // namespace tablet

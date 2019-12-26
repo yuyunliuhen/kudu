@@ -28,6 +28,7 @@ import java.util.List;
 import com.google.common.collect.ImmutableList;
 import com.google.protobuf.Message;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.jboss.netty.util.Timer;
 
 import org.apache.kudu.util.Pair;
 
@@ -43,13 +44,17 @@ class AlterTableRequest extends KuduRpc<AlterTableResponse> {
   private final AlterTableRequestPB.Builder builder;
   private final List<Integer> requiredFeatures;
 
-  AlterTableRequest(KuduTable masterTable, String name, AlterTableOptions ato) {
-    super(masterTable);
+  AlterTableRequest(KuduTable masterTable,
+                    String name,
+                    AlterTableOptions ato,
+                    Timer timer,
+                    long timeoutMillis) {
+    super(masterTable, timer, timeoutMillis);
     this.name = name;
     this.builder = ato.getProtobuf();
     this.requiredFeatures = ato.hasAddDropRangePartitions() ?
         ImmutableList.of(MasterFeatures.RANGE_PARTITION_BOUNDS_VALUE) :
-        ImmutableList.<Integer>of();
+        ImmutableList.of();
   }
 
   @Override
@@ -75,7 +80,8 @@ class AlterTableRequest extends KuduRpc<AlterTableResponse> {
     final AlterTableResponsePB.Builder respBuilder = AlterTableResponsePB.newBuilder();
     readProtobuf(callResponse.getPBMessage(), respBuilder);
     AlterTableResponse response = new AlterTableResponse(
-        deadlineTracker.getElapsedMillis(), tsUUID,
+        timeoutTracker.getElapsedMillis(),
+        tsUUID,
         respBuilder.hasTableId() ? respBuilder.getTableId().toStringUtf8() : null);
 
     return new Pair<AlterTableResponse, Object>(

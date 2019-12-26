@@ -174,7 +174,6 @@ namespace kudu {
 namespace log {
 
 using consensus::CommitMsg;
-using consensus::OpId;
 using consensus::ReplicateRefPtr;
 using env_util::OpenFileForRandom;
 using std::shared_ptr;
@@ -182,6 +181,10 @@ using std::string;
 using std::vector;
 using std::unique_ptr;
 using strings::Substitute;
+
+string LogContext::LogPrefix() const {
+  return Substitute("T $0 P $1: ", tablet_id, fs_manager->uuid());
+}
 
 // Manages the thread which drains groups of batches from the log's queue and
 // appends them to the underlying log instance.
@@ -193,16 +196,18 @@ using strings::Substitute;
 //
 // The design of submitting tasks to the threadpool is slightly tricky in order
 // to achieve group commit and not have to submit one task per appended batch.
-// Instead, a generic 'DoWork()' task is used which loops collecting work until
-// it finds that it has been idle for a while, at which point the task finishes.
+// Instead, a generic 'ProcessQueue()' task is used which loops collecting
+// batches to write until it finds that the queue has been empty for a while,
+// at which point the task finishes.
 //
 // The trick, then, lies in two areas:
 //
-// 1) after appending a batch, we need to ensure that a task is already running,
-//    and if not, start one. This is done in Wake().
+// 1) After adding a batch to the queue, we need to ensure that a task is
+//    already running, and if not, start one. This is done in Wake().
 //
-// 2) when the task finds no more work to do and wants to go idle, it needs to
-//    ensure that it doesn't miss a concurrent wake-up. This is done in GoIdle().
+// 2) When the task finds no more batches to write and wants to go idle, it
+//    needs to ensure that it doesn't miss a concurrent additions to the queue.
+//    This is done in GoIdle().
 //
 // See the implementation comments in Wake() and GoIdle() for details.
 class Log::AppendThread {
@@ -224,15 +229,15 @@ class Log::AppendThread {
   void Wake();
 
   bool active() const {
-    return base::subtle::NoBarrier_Load(&worker_state_) == WORKER_ACTIVE;
+    return base::subtle::NoBarrier_Load(&thread_state_) == ACTIVE;
   }
 
  private:
   // The task submitted to the threadpool which collects batches from the queue
   // and appends them, until it determines that the queue is idle.
-  void DoWork();
+  void ProcessQueue();
 
-  // Tries to transition back to WORKER_STOPPED state. If successful, returns true.
+  // Tries to transition back to IDLE state. If successful, returns true.
   //
   // Otherwise, returns false to indicate that the task should keep running because
   // a new task was enqueued just as we were trying to go idle.
@@ -240,25 +245,25 @@ class Log::AppendThread {
 
   // Handle the actual appending of a group of entries. Responsible for deleting the
   // LogEntryBatch* pointers.
-  void HandleGroup(vector<LogEntryBatch*> entry_batches);
+  void HandleBatches(vector<LogEntryBatch*> entry_batches);
 
   string LogPrefix() const;
 
   Log* const log_;
 
-  // Atomic state machine for whether there is any worker task currently
-  // queued or running on append_pool_. See Wake() and GoIdle() for more details.
-  enum WorkerState {
-    // No worker task is queued or running.
-    WORKER_STOPPED,
-    // A worker task is queued or running.
-    WORKER_ACTIVE
+  // Atomic state machine for whether there is any task currently queued or
+  // running on append_pool_. See Wake() and GoIdle() for more details.
+  enum ThreadState {
+    // No task is queued or running.
+    IDLE,
+    // A task is queued or running.
+    ACTIVE
   };
-  Atomic32 worker_state_ = WORKER_STOPPED;
+  Atomic32 thread_state_ = IDLE;
 
   // Pool with a single thread, which handles shutting down the thread
   // when idle.
-  gscoped_ptr<ThreadPool> append_pool_;
+  unique_ptr<ThreadPool> append_pool_;
 };
 
 
@@ -284,10 +289,15 @@ Status Log::AppendThread::Init() {
 void Log::AppendThread::Wake() {
   DCHECK(append_pool_);
   auto old_status = base::subtle::NoBarrier_CompareAndSwap(
-      &worker_state_, WORKER_STOPPED, WORKER_ACTIVE);
-  if (old_status == WORKER_STOPPED) {
-    CHECK_OK(append_pool_->SubmitClosure(Bind(&Log::AppendThread::DoWork, Unretained(this))));
+      &thread_state_, IDLE, ACTIVE);
+  if (old_status == IDLE) {
+    CHECK_OK(append_pool_->SubmitClosure(Bind(&Log::AppendThread::ProcessQueue, Unretained(this))));
   }
+}
+
+void Log::SetActiveSegmentIdle() {
+  std::lock_guard<rw_spinlock> l(segment_idle_lock_);
+  segment_allocator_.active_segment_->GoIdle();
 }
 
 bool Log::AppendThread::GoIdle() {
@@ -306,19 +316,19 @@ bool Log::AppendThread::GoIdle() {
 
   // So, we first transition back to STOPPED state, and then re-check to see
   // if there has been something enqueued in the meantime.
-  auto old_state = base::subtle::NoBarrier_AtomicExchange(&worker_state_, WORKER_STOPPED);
-  DCHECK_EQ(old_state, WORKER_ACTIVE);
+  auto old_state = base::subtle::NoBarrier_AtomicExchange(&thread_state_, IDLE);
+  DCHECK_EQ(old_state, ACTIVE);
   if (log_->entry_queue()->empty()) {
     // Nothing got enqueued, which means there must not have been any missed wakeup.
-    // We are now in WORKER_STOPPED state.
+    // We are now in IDLE state.
     return true;
   }
 
   MAYBE_INJECT_RANDOM_LATENCY(FLAGS_log_inject_thread_lifecycle_latency_ms);
   // Someone enqueued something. We don't know whether their wakeup was successful
   // or not, but we can just try to transition back to ACTIVE mode here.
-  if (base::subtle::NoBarrier_CompareAndSwap(&worker_state_, WORKER_STOPPED, WORKER_ACTIVE)
-      == WORKER_STOPPED) {
+  if (base::subtle::NoBarrier_CompareAndSwap(&thread_state_, IDLE, ACTIVE)
+      == IDLE) {
     // Their wake-up was lost, but we've now marked ourselves as running.
     MAYBE_INJECT_RANDOM_LATENCY(FLAGS_log_inject_thread_lifecycle_latency_ms);
     return false;
@@ -330,8 +340,8 @@ bool Log::AppendThread::GoIdle() {
   return true;
 }
 
-void Log::AppendThread::DoWork() {
-  DCHECK_EQ(ANNOTATE_UNPROTECTED_READ(worker_state_), WORKER_ACTIVE);
+void Log::AppendThread::ProcessQueue() {
+  DCHECK_EQ(ANNOTATE_UNPROTECTED_READ(thread_state_), ACTIVE);
   VLOG_WITH_PREFIX(2) << "WAL Appender going active";
   while (true) {
     MonoTime deadline = MonoTime::Now() +
@@ -344,23 +354,24 @@ void Log::AppendThread::DoWork() {
       if (GoIdle()) break;
       continue;
     }
-    HandleGroup(std::move(entry_batches));
+    HandleBatches(std::move(entry_batches));
   }
+  log_->SetActiveSegmentIdle();
   VLOG_WITH_PREFIX(2) << "WAL Appender going idle";
 }
 
-void Log::AppendThread::HandleGroup(vector<LogEntryBatch*> entry_batches) {
-  if (log_->metrics_) {
-    log_->metrics_->entry_batches_per_group->Increment(entry_batches.size());
+void Log::AppendThread::HandleBatches(vector<LogEntryBatch*> entry_batches) {
+  if (log_->ctx_.metrics) {
+    log_->ctx_.metrics->entry_batches_per_group->Increment(entry_batches.size());
   }
   TRACE_EVENT1("log", "batch", "batch_size", entry_batches.size());
 
-  SCOPED_LATENCY_METRIC(log_->metrics_, group_commit_latency);
+  SCOPED_LATENCY_METRIC(log_->ctx_.metrics, group_commit_latency);
 
   bool is_all_commits = true;
   for (LogEntryBatch* entry_batch : entry_batches) {
     TRACE_EVENT_FLOW_END0("log", "Batch", entry_batch);
-    Status s = log_->DoAppend(entry_batch);
+    Status s = log_->WriteBatch(entry_batch);
     if (PREDICT_FALSE(!s.ok())) {
       LOG_WITH_PREFIX(ERROR) << "Error appending to the log: " << s.ToString();
       // TODO(af): If a single transaction fails to append, should we
@@ -423,71 +434,20 @@ bool Log::append_thread_active_for_tests() const {
 }
 
 
-// This task is submitted to allocation_pool_ in order to
-// asynchronously pre-allocate new log segments.
-void Log::SegmentAllocationTask() {
-  allocation_status_.Set(PreAllocateNewSegment());
-}
-
-const Status Log::kLogShutdownStatus(
-    Status::ServiceUnavailable("WAL is shutting down", "", ESHUTDOWN));
-
-const uint64_t Log::kInitialLogSegmentSequenceNumber = 0L;
-
-Status Log::Open(const LogOptions &options,
-                 FsManager *fs_manager,
-                 const std::string& tablet_id,
-                 const Schema& schema,
-                 uint32_t schema_version,
-                 const scoped_refptr<MetricEntity>& metric_entity,
-                 scoped_refptr<Log>* log) {
-
-  string tablet_wal_path = fs_manager->GetTabletWalDir(tablet_id);
-  RETURN_NOT_OK(env_util::CreateDirIfMissing(
-      fs_manager->env(), tablet_wal_path));
-
-  scoped_refptr<Log> new_log(new Log(options,
-                                     fs_manager,
-                                     tablet_wal_path,
-                                     tablet_id,
-                                     schema,
-                                     schema_version,
-                                     metric_entity));
-  RETURN_NOT_OK(new_log->Init());
-  log->swap(new_log);
-  return Status::OK();
-}
-
-Log::Log(LogOptions options, FsManager* fs_manager, string log_path,
-         string tablet_id, const Schema& schema, uint32_t schema_version,
-         scoped_refptr<MetricEntity> metric_entity)
-    : options_(options),
-      fs_manager_(fs_manager),
-      log_dir_(std::move(log_path)),
-      tablet_id_(std::move(tablet_id)),
-      schema_(schema),
+SegmentAllocator::SegmentAllocator(const LogOptions* opts,
+                                   const LogContext* ctx,
+                                   Schema schema,
+                                   uint32_t schema_version)
+    : opts_(opts),
+      ctx_(ctx),
+      max_segment_size_(opts_->segment_size_mb * 1024 * 1024),
+      schema_(std::move(schema)),
       schema_version_(schema_version),
-      active_segment_sequence_number_(0),
-      log_state_(kLogInitialized),
-      max_segment_size_(options_.segment_size_mb * 1024 * 1024),
-      entry_batch_queue_(FLAGS_group_commit_queue_size_bytes),
-      append_thread_(new AppendThread(this)),
-      force_sync_all_(options_.force_fsync_all),
-      sync_disabled_(false),
-      allocation_state_(kAllocationNotStarted),
-      codec_(nullptr),
-      metric_entity_(std::move(metric_entity)),
-      on_disk_size_(0) {
-  CHECK_OK(ThreadPoolBuilder("log-alloc").set_max_threads(1).Build(&allocation_pool_));
-  if (metric_entity_) {
-    metrics_.reset(new LogMetrics(metric_entity_));
-  }
-}
+      sync_disabled_(false) {}
 
-Status Log::Init() {
-  std::lock_guard<percpu_rwlock> write_lock(state_lock_);
-  CHECK_EQ(kLogInitialized, log_state_);
-
+Status SegmentAllocator::Init(
+    uint64_t sequence_number,
+    scoped_refptr<ReadableLogSegment>* new_readable_segment) {
   // Init the compression codec.
   if (!FLAGS_log_compression_codec.empty()) {
     auto codec_type = GetCompressionCodecType(FLAGS_log_compression_codec);
@@ -496,30 +456,361 @@ Status Log::Init() {
                             "could not instantiate compression codec");
     }
   }
+  active_segment_sequence_number_ = sequence_number;
+  RETURN_NOT_OK(ThreadPoolBuilder("log-alloc")
+      .set_max_threads(1)
+      .Build(&allocation_pool_));
+
+  scoped_refptr<ReadableLogSegment> finished_segment;
+  RETURN_NOT_OK(AllocateSegmentAndRollOver(&finished_segment, new_readable_segment));
+  DCHECK(!finished_segment); // There was no previously active segment.
+  return Status::OK();
+}
+
+Status SegmentAllocator::AllocateOrRollOverIfNecessary(
+    uint32_t write_size_bytes,
+    scoped_refptr<ReadableLogSegment>* finished_segment,
+    scoped_refptr<ReadableLogSegment>* new_readable_segment) {
+  bool should_rollover = false;
+  // if the size of this entry overflows the current segment, get a new one
+  {
+    std::lock_guard<RWMutex> l(allocation_lock_);
+    if (allocation_state_ == kAllocationNotStarted) {
+      if ((active_segment_->written_offset() + write_size_bytes + 4) > max_segment_size_) {
+        VLOG_WITH_PREFIX(1) << "Max segment size reached. Starting new segment allocation";
+        RETURN_NOT_OK(AsyncAllocateSegmentUnlocked());
+        if (!opts_->async_preallocate_segments) {
+          should_rollover = true;
+        }
+      }
+    } else if (allocation_state_ == kAllocationFinished) {
+      should_rollover = true;
+    } else {
+      DCHECK(opts_->async_preallocate_segments);
+      VLOG_WITH_PREFIX(1) << "Segment allocation already in progress...";
+    }
+  }
+  if (should_rollover) {
+    TRACE_COUNTER_SCOPE_LATENCY_US("log_roll");
+    LOG_SLOW_EXECUTION(WARNING, 50, Substitute("$0Log roll took a long time", LogPrefix())) {
+      RETURN_NOT_OK(RollOver(finished_segment, new_readable_segment));
+    }
+  }
+  return Status::OK();
+}
+
+Status SegmentAllocator::Sync() {
+  TRACE_EVENT0("log", "Sync");
+  SCOPED_LATENCY_METRIC(ctx_->metrics, sync_latency);
+
+  if (PREDICT_FALSE(FLAGS_log_inject_latency && !sync_disabled_)) {
+    Random r(GetCurrentTimeMicros());
+    int sleep_ms = r.Normal(FLAGS_log_inject_latency_ms_mean,
+                            FLAGS_log_inject_latency_ms_stddev);
+    if (sleep_ms > 0) {
+      LOG_WITH_PREFIX(WARNING) << "Injecting " << sleep_ms
+                               << "ms of latency in SegmentAllocator::Sync()";
+      SleepFor(MonoDelta::FromMilliseconds(sleep_ms));
+    }
+  }
+
+  if (opts_->force_fsync_all && !false) {
+    LOG_SLOW_EXECUTION(WARNING, 50, Substitute("$0Fsync log took a long time", LogPrefix())) {
+      RETURN_NOT_OK(active_segment_->Sync());
+
+      if (hooks_) {
+        RETURN_NOT_OK_PREPEND(hooks_->PostSyncIfFsyncEnabled(),
+                              "PostSyncIfFsyncEnabled hook failed");
+      }
+    }
+  }
+
+  if (hooks_) {
+    RETURN_NOT_OK_PREPEND(hooks_->PostSync(), "PostSync hook failed");
+  }
+  return Status::OK();
+}
+
+Status SegmentAllocator::FinishCurrentSegment(
+    scoped_refptr<ReadableLogSegment>* finished_segment) {
+  if (hooks_) {
+    RETURN_NOT_OK_PREPEND(hooks_->PreClose(), "PreClose hook failed");
+  }
+  if (!footer_.has_min_replicate_index()) {
+    VLOG_WITH_PREFIX(1) << "Writing a segment without any REPLICATE message. Segment: "
+                        << active_segment_->path();
+  }
+  VLOG_WITH_PREFIX(2) << "Segment footer for " << active_segment_->path()
+                      << ": " << pb_util::SecureShortDebugString(footer_);
+
+  footer_.set_close_timestamp_micros(GetCurrentTimeMicros());
+  RETURN_NOT_OK(active_segment_->WriteFooter(footer_));
+
+  // max_segment_size_ defines the (soft) limit of a segment. When preallocation
+  // is enabled, max_segment_size also defines the amount of space that is
+  // preallocated at segment creation time.
+  //
+  // We finish a segment when the next write would exceed max_segment_size_, at
+  // which point all of the segment's preallocated space has been consumed. In
+  // some cases (e.g. Log::Close), a segment may be finished prematurely. If we
+  // detect that, let's return any excess preallocated space back to the
+  // filesystem by truncating off the end of the segment.
+  if (opts_->preallocate_segments &&
+      active_segment_->written_offset() < max_segment_size_) {
+    RETURN_NOT_OK(active_segment_->file()->Truncate(
+        active_segment_->written_offset()));
+  }
+  RETURN_NOT_OK(Sync());
+
+  if (hooks_) {
+    RETURN_NOT_OK_PREPEND(hooks_->PostClose(), "PostClose hook failed");
+  }
+
+  if (finished_segment) {
+    scoped_refptr<ReadableLogSegment> segment(
+        new ReadableLogSegment(active_segment_->path(), active_segment_->file()));
+    RETURN_NOT_OK(segment->Init(active_segment_->header(),
+                                active_segment_->footer(),
+                                active_segment_->first_entry_offset()));
+    *finished_segment = std::move(segment);
+  }
+
+  return Status::OK();
+}
+
+void SegmentAllocator::UpdateFooterForBatch(const LogEntryBatch& batch) {
+  footer_.set_num_entries(footer_.num_entries() + batch.count());
+
+  // We keep track of the last-written OpId here.
+  // This is needed to initialize Consensus on startup.
+  // We also retrieve the opid of the first operation in the batch so that, if
+  // we roll over to a new segment, we set the first operation in the footer
+  // immediately.
+  if (batch.type_ == REPLICATE) {
+    // Update the index bounds for the current segment.
+    for (const LogEntryPB& entry_pb : batch.entry_batch_pb_->entry()) {
+      UpdateFooterForReplicateEntry(entry_pb, &footer_);
+    }
+  }
+}
+
+void SegmentAllocator::StopAllocationThread() {
+  allocation_pool_->Shutdown();
+}
+
+Status SegmentAllocator::AllocateSegmentAndRollOver(
+    scoped_refptr<ReadableLogSegment>* finished_segment,
+    scoped_refptr<ReadableLogSegment>* new_readable_segment) {
+  {
+    std::lock_guard<RWMutex> l(allocation_lock_);
+    RETURN_NOT_OK(AsyncAllocateSegmentUnlocked());
+  }
+  return RollOver(finished_segment, new_readable_segment);
+}
+
+void SegmentAllocator::SetSchemaForNextSegment(Schema schema,
+                                               uint32_t version) {
+  VLOG_WITH_PREFIX(2) << Substitute("Setting schema version $0 for next log segment $1",
+                                    version, schema.ToString());
+  std::lock_guard<rw_spinlock> l(schema_lock_);
+  schema_ = std::move(schema);
+  schema_version_ = version;
+}
+
+Status SegmentAllocator::AsyncAllocateSegmentUnlocked() {
+  allocation_lock_.AssertAcquiredForWriting();
+  DCHECK_EQ(kAllocationNotStarted, allocation_state_);
+  allocation_status_.Reset();
+  allocation_state_ = kAllocationInProgress;
+  return allocation_pool_->SubmitClosure(
+      Bind(&SegmentAllocator::AllocationTask, Unretained(this)));
+}
+
+void SegmentAllocator::AllocationTask() {
+  allocation_status_.Set(AllocateNewSegment());
+}
+
+Status SegmentAllocator::AllocateNewSegment() {
+  TRACE_EVENT1("log", "AllocateNewSegment", "file", next_segment_path_);
+  CHECK_EQ(kAllocationInProgress, allocation_state());
+
+  // We must mark allocation as finished when returning from this method.
+  auto alloc_finished = MakeScopedCleanup([&] () {
+    std::lock_guard<RWMutex> l(allocation_lock_);
+    allocation_state_ = kAllocationFinished;
+  });
+
+  string tmp_suffix = Substitute("$0$1", kTmpInfix, ".newsegmentXXXXXX");
+  string path_tmpl = JoinPathSegments(ctx_->log_dir, tmp_suffix);
+  VLOG_WITH_PREFIX(2) << "Creating temp. file for place holder segment, template: " << path_tmpl;
+  unique_ptr<RWFile> segment_file;
+  Env* env = ctx_->fs_manager->env();
+  RETURN_NOT_OK_PREPEND(env->NewTempRWFile(
+      RWFileOptions(), path_tmpl, &next_segment_path_, &segment_file),
+                        "could not create next WAL segment");
+  next_segment_file_.reset(segment_file.release());
+  VLOG_WITH_PREFIX(1) << "Created next WAL segment, placeholder path: " << next_segment_path_;
+
+  MAYBE_RETURN_FAILURE(FLAGS_log_inject_io_error_on_preallocate_fraction,
+      Status::IOError("Injected IOError in SegmentAllocator::AllocateNewSegment()"));
+
+  if (opts_->preallocate_segments) {
+    RETURN_NOT_OK(env_util::VerifySufficientDiskSpace(env,
+                                                      next_segment_path_,
+                                                      max_segment_size_,
+                                                      FLAGS_fs_wal_dir_reserved_bytes));
+    // TODO (perf) zero the new segments -- this could result in
+    // additional performance improvements.
+    RETURN_NOT_OK_PREPEND(next_segment_file_->PreAllocate(
+        0, max_segment_size_, RWFile::CHANGE_FILE_SIZE),
+                          "could not preallocate next WAL segment");
+  }
+  return Status::OK();
+}
+
+Status SegmentAllocator::SwitchToAllocatedSegment(
+    scoped_refptr<ReadableLogSegment>* new_readable_segment) {
+  // Increment "next" log segment seqno.
+  active_segment_sequence_number_++;
+  const auto& tablet_id = ctx_->tablet_id;
+  string new_segment_path = ctx_->fs_manager->GetWalSegmentFileName(
+      tablet_id, active_segment_sequence_number_);
+  Env* env = ctx_->fs_manager->env();
+  RETURN_NOT_OK_PREPEND(env->RenameFile(next_segment_path_, new_segment_path),
+                        "could not rename next WAL segment");
+  if (opts_->force_fsync_all) {
+    RETURN_NOT_OK(env->SyncDir(ctx_->log_dir));
+  }
+
+  // Create a new segment in memory.
+  unique_ptr<WritableLogSegment> new_segment(
+      new WritableLogSegment(new_segment_path, next_segment_file_));
+
+  // Set up the new header and footer.
+  LogSegmentHeaderPB header;
+  header.set_sequence_number(active_segment_sequence_number_);
+  header.set_tablet_id(tablet_id);
+  if (codec_) {
+    header.set_compression_codec(codec_->type());
+  }
+
+  // Set up the new footer. This will be maintained as the segment is written.
+  footer_.Clear();
+  footer_.set_num_entries(0);
+
+  // Set the new segment's schema.
+  {
+    shared_lock<rw_spinlock> l(schema_lock_);
+    RETURN_NOT_OK(SchemaToPB(schema_, header.mutable_schema()));
+    header.set_schema_version(schema_version_);
+  }
+  RETURN_NOT_OK_PREPEND(new_segment->WriteHeader(header), "Failed to write header");
+
+  // Open the segment we just created in readable form; it is the caller's
+  // responsibility to add it to the reader.
+  //
+  // TODO(todd): consider using a global FileCache here? With short log segments and
+  // lots of tablets, this file descriptor usage may add up.
+  {
+    scoped_refptr<ReadableLogSegment> readable_segment(
+        new ReadableLogSegment(new_segment_path, std::move(next_segment_file_)));
+    RETURN_NOT_OK(readable_segment->Init(header, new_segment->first_entry_offset()));
+    *new_readable_segment = std::move(readable_segment);
+  }
+
+  // Now set 'active_segment_' to the new segment.
+  active_segment_ = std::move(new_segment);
+
+  std::lock_guard<RWMutex> l(allocation_lock_);
+  allocation_state_ = kAllocationNotStarted;
+  return Status::OK();
+}
+
+Status SegmentAllocator::RollOver(
+    scoped_refptr<ReadableLogSegment>* finished_segment,
+    scoped_refptr<ReadableLogSegment>* new_readable_segment) {
+  SCOPED_LATENCY_METRIC(ctx_->metrics, roll_latency);
+
+  // Wait for any on-going allocations to finish.
+  RETURN_NOT_OK(allocation_status_.Get());
+  DCHECK_EQ(kAllocationFinished, allocation_state());
+
+  // If this isn't the first active segment, close it and return a reopened
+  // segment reader so that the caller can update its log reader.
+  if (active_segment_) {
+    RETURN_NOT_OK(FinishCurrentSegment(finished_segment));
+  }
+  RETURN_NOT_OK(SwitchToAllocatedSegment(new_readable_segment));
+
+  VLOG_WITH_PREFIX(1) << "Rolled over to a new log segment at "
+                      << active_segment_->path();
+  return Status::OK();
+}
+
+const Status Log::kLogShutdownStatus(
+    Status::ServiceUnavailable("WAL is shutting down", "", ESHUTDOWN));
+
+const uint64_t Log::kInitialLogSegmentSequenceNumber = 0L;
+
+Status Log::Open(LogOptions options,
+                 FsManager* fs_manager,
+                 const string& tablet_id,
+                 Schema schema,
+                 uint32_t schema_version,
+                 const scoped_refptr<MetricEntity>& metric_entity,
+                 scoped_refptr<Log>* log) {
+
+  string tablet_wal_path = fs_manager->GetTabletWalDir(tablet_id);
+  RETURN_NOT_OK(env_util::CreateDirIfMissing(fs_manager->env(), tablet_wal_path));
+
+  LogContext ctx({ tablet_id, std::move(tablet_wal_path) });
+  ctx.metric_entity = metric_entity;
+  ctx.metrics.reset(metric_entity ? new LogMetrics(metric_entity) : nullptr);
+  ctx.fs_manager = fs_manager;
+  scoped_refptr<Log> new_log(new Log(std::move(options), std::move(ctx), std::move(schema),
+                                     schema_version));
+  RETURN_NOT_OK(new_log->Init());
+  log->swap(new_log);
+  return Status::OK();
+}
+
+Log::Log(LogOptions options, LogContext ctx, Schema schema, uint32_t schema_version)
+    : options_(std::move(options)),
+      ctx_(std::move(ctx)),
+      log_state_(kLogInitialized),
+      entry_batch_queue_(FLAGS_group_commit_queue_size_bytes),
+      append_thread_(new AppendThread(this)),
+      segment_allocator_(&options_, &ctx_, std::move(schema), schema_version),
+      on_disk_size_(0) {
+}
+
+Status Log::Init() {
+  CHECK_EQ(kLogInitialized, log_state_);
 
   // Init the index
-  log_index_.reset(new LogIndex(log_dir_));
+  log_index_.reset(new LogIndex(ctx_.fs_manager->env(), ctx_.log_dir));
 
   // Reader for previous segments.
-  RETURN_NOT_OK(LogReader::Open(fs_manager_,
+  RETURN_NOT_OK(LogReader::Open(ctx_.fs_manager,
                                 log_index_,
-                                tablet_id_,
-                                metric_entity_.get(),
+                                ctx_.tablet_id,
+                                ctx_.metric_entity.get(),
                                 &reader_));
 
   // The case where we are continuing an existing log.
   // We must pick up where the previous WAL left off in terms of
   // sequence numbers.
+  uint64_t active_seg_seq_num = 0;
   if (reader_->num_segments() != 0) {
     VLOG_WITH_PREFIX(1) << "Using existing " << reader_->num_segments()
-                        << " segments from path: " << fs_manager_->GetWalsRootDir();
+                        << " segments from path: " << ctx_.fs_manager->GetWalsRootDir();
 
     vector<scoped_refptr<ReadableLogSegment> > segments;
-    RETURN_NOT_OK(reader_->GetSegmentsSnapshot(&segments));
-    active_segment_sequence_number_ = segments.back()->header().sequence_number();
+    reader_->GetSegmentsSnapshot(&segments);
+    active_seg_seq_num = segments.back()->header().sequence_number();
   }
 
-  if (force_sync_all_) {
+  if (options_.force_fsync_all) {
     KLOG_FIRST_N(INFO, 1) << LogPrefix() << "Log is configured to fsync() on all Append() calls";
   } else {
     KLOG_FIRST_N(INFO, 1) << LogPrefix()
@@ -527,53 +818,11 @@ Status Log::Init() {
   }
 
   // We always create a new segment when the log starts.
-  RETURN_NOT_OK(AsyncAllocateSegment());
-  RETURN_NOT_OK(allocation_status_.Get());
-  RETURN_NOT_OK(SwitchToAllocatedSegment());
-
+  scoped_refptr<ReadableLogSegment> new_readable_segment;
+  RETURN_NOT_OK(segment_allocator_.Init(active_seg_seq_num, &new_readable_segment));
+  reader_->AppendEmptySegment(std::move(new_readable_segment));
   RETURN_NOT_OK(append_thread_->Init());
   log_state_ = kLogWriting;
-  return Status::OK();
-}
-
-Status Log::AsyncAllocateSegment() {
-  std::lock_guard<RWMutex> l(allocation_lock_);
-  CHECK_EQ(allocation_state_, kAllocationNotStarted);
-  allocation_status_.Reset();
-  allocation_state_ = kAllocationInProgress;
-  RETURN_NOT_OK(allocation_pool_->SubmitClosure(
-                  Bind(&Log::SegmentAllocationTask, Unretained(this))));
-  return Status::OK();
-}
-
-Status Log::CloseCurrentSegment() {
-  if (!footer_builder_.has_min_replicate_index()) {
-    VLOG_WITH_PREFIX(1) << "Writing a segment without any REPLICATE message. Segment: "
-                        << active_segment_->path();
-  }
-  VLOG_WITH_PREFIX(2) << "Segment footer for " << active_segment_->path()
-                      << ": " << pb_util::SecureShortDebugString(footer_builder_);
-
-  footer_builder_.set_close_timestamp_micros(GetCurrentTimeMicros());
-  RETURN_NOT_OK(active_segment_->WriteFooterAndClose(footer_builder_));
-
-  return Status::OK();
-}
-
-Status Log::RollOver() {
-  SCOPED_LATENCY_METRIC(metrics_, roll_latency);
-
-  // Check if any errors have occurred during allocation
-  RETURN_NOT_OK(allocation_status_.Get());
-
-  DCHECK_EQ(allocation_state(), kAllocationFinished);
-
-  RETURN_NOT_OK(Sync());
-  RETURN_NOT_OK(CloseCurrentSegment());
-
-  RETURN_NOT_OK(SwitchToAllocatedSegment());
-
-  LOG_WITH_PREFIX(INFO) << "Rolled over to a new log segment at " << active_segment_->path();
   return Status::OK();
 }
 
@@ -629,12 +878,12 @@ Status Log::AsyncAppendCommit(gscoped_ptr<consensus::CommitMsg> commit_msg,
   return Status::OK();
 }
 
-Status Log::DoAppend(LogEntryBatch* entry_batch) {
+Status Log::WriteBatch(LogEntryBatch* entry_batch) {
   size_t num_entries = entry_batch->count();
-  DCHECK_GT(num_entries, 0) << "Cannot call DoAppend() with zero entries reserved";
+  DCHECK_GT(num_entries, 0) << "Cannot call WriteBatch() with zero entries reserved";
 
   MAYBE_RETURN_FAILURE(FLAGS_log_inject_io_error_on_append_fraction,
-                       Status::IOError("Injected IOError in Log::DoAppend()"));
+                       Status::IOError("Injected IOError in Log::WriteBatch()"));
 
   Slice entry_batch_data = entry_batch->data();
   uint32_t entry_batch_bytes = entry_batch->total_size_bytes();
@@ -643,47 +892,40 @@ Status Log::DoAppend(LogEntryBatch* entry_batch) {
     return Status::OK();
   }
 
-  // if the size of this entry overflows the current segment, get a new one
-  if (allocation_state() == kAllocationNotStarted) {
-    if ((active_segment_->Size() + entry_batch_bytes + 4) > max_segment_size_) {
-      LOG_WITH_PREFIX(INFO) << "Max segment size reached. Starting new segment allocation";
-      RETURN_NOT_OK(AsyncAllocateSegment());
-      if (!options_.async_preallocate_segments) {
-        LOG_SLOW_EXECUTION(WARNING, 50, Substitute("$0Log roll took a long time", LogPrefix())) {
-          RETURN_NOT_OK(RollOver());
-        }
-      }
-    }
-  } else if (allocation_state() == kAllocationFinished) {
-    LOG_SLOW_EXECUTION(WARNING, 50, Substitute("$0Log roll took a long time", LogPrefix())) {
-      RETURN_NOT_OK(RollOver());
-    }
-  } else {
-    VLOG_WITH_PREFIX(1) << "Segment allocation already in progress...";
+  scoped_refptr<ReadableLogSegment> finished_segment;
+  scoped_refptr<ReadableLogSegment> new_readable_segment;
+  RETURN_NOT_OK(segment_allocator_.AllocateOrRollOverIfNecessary(
+      entry_batch_bytes, &finished_segment, &new_readable_segment));
+  if (finished_segment) {
+    // Must be done before a new segment is appended.
+    reader_->ReplaceLastSegment(std::move(finished_segment));
   }
-
-  int64_t start_offset = active_segment_->written_offset();
+  if (new_readable_segment) {
+    reader_->AppendEmptySegment(std::move(new_readable_segment));
+  }
+  auto* active_segment = segment_allocator_.active_segment_.get();
+  int64_t start_offset = active_segment->written_offset();
 
   LOG_SLOW_EXECUTION(WARNING, 50, Substitute("$0Append to log took a long time", LogPrefix())) {
-    SCOPED_LATENCY_METRIC(metrics_, append_latency);
+    SCOPED_LATENCY_METRIC(ctx_.metrics, append_latency);
     SCOPED_WATCH_STACK(500);
 
-    RETURN_NOT_OK(active_segment_->WriteEntryBatch(entry_batch_data, codec_));
+    RETURN_NOT_OK(active_segment->WriteEntryBatch(entry_batch_data, segment_allocator_.codec_));
 
     // Update the reader on how far it can read the active segment.
-    reader_->UpdateLastSegmentOffset(active_segment_->written_offset());
+    reader_->UpdateLastSegmentOffset(active_segment->written_offset());
 
-    if (log_hooks_) {
-      RETURN_NOT_OK_PREPEND(log_hooks_->PostAppend(), "PostAppend hook failed");
+    if (segment_allocator_.hooks_) {
+      RETURN_NOT_OK(segment_allocator_.hooks_->PostAppend());
     }
   }
 
-  if (metrics_) {
-    metrics_->bytes_logged->IncrementBy(entry_batch_bytes);
+  if (ctx_.metrics) {
+    ctx_.metrics->bytes_logged->IncrementBy(entry_batch_bytes);
   }
 
   CHECK_OK(UpdateIndexForBatch(*entry_batch, start_offset));
-  UpdateFooterForBatch(entry_batch);
+  segment_allocator_.UpdateFooterForBatch(*entry_batch);
 
   return Status::OK();
 }
@@ -698,67 +940,28 @@ Status Log::UpdateIndexForBatch(const LogEntryBatch& batch,
     LogIndexEntry index_entry;
 
     index_entry.op_id = entry_pb.replicate().id();
-    index_entry.segment_sequence_number = active_segment_sequence_number_;
+    index_entry.segment_sequence_number = segment_allocator_.active_segment_sequence_number();
     index_entry.offset_in_segment = start_offset;
     RETURN_NOT_OK(log_index_->AddEntry(index_entry));
   }
   return Status::OK();
 }
 
-void Log::UpdateFooterForBatch(LogEntryBatch* batch) {
-  footer_builder_.set_num_entries(footer_builder_.num_entries() + batch->count());
-
-  // We keep track of the last-written OpId here.
-  // This is needed to initialize Consensus on startup.
-  // We also retrieve the opid of the first operation in the batch so that, if
-  // we roll over to a new segment, we set the first operation in the footer
-  // immediately.
-  if (batch->type_ == REPLICATE) {
-    // Update the index bounds for the current segment.
-    for (const LogEntryPB& entry_pb : batch->entry_batch_pb_->entry()) {
-      UpdateFooterForReplicateEntry(entry_pb, &footer_builder_);
-    }
+Status Log::AllocateSegmentAndRollOverForTests() {
+  std::lock_guard<rw_spinlock> l(segment_idle_lock_);
+  scoped_refptr<ReadableLogSegment> finished_segment;
+  scoped_refptr<ReadableLogSegment> new_readable_segment;
+  RETURN_NOT_OK(segment_allocator_.AllocateSegmentAndRollOver(
+      &finished_segment, &new_readable_segment));
+  if (finished_segment) {
+    reader_->ReplaceLastSegment(std::move(finished_segment));
   }
-}
-
-Status Log::AllocateSegmentAndRollOver() {
-  RETURN_NOT_OK(AsyncAllocateSegment());
-  return RollOver();
-}
-
-FsManager* Log::GetFsManager() {
-  return fs_manager_;
+  reader_->AppendEmptySegment(std::move(new_readable_segment));
+  return Status::OK();
 }
 
 Status Log::Sync() {
-  TRACE_EVENT0("log", "Sync");
-  SCOPED_LATENCY_METRIC(metrics_, sync_latency);
-
-  if (PREDICT_FALSE(FLAGS_log_inject_latency && !sync_disabled_)) {
-    Random r(GetCurrentTimeMicros());
-    int sleep_ms = r.Normal(FLAGS_log_inject_latency_ms_mean,
-                            FLAGS_log_inject_latency_ms_stddev);
-    if (sleep_ms > 0) {
-      LOG_WITH_PREFIX(WARNING) << "Injecting " << sleep_ms << "ms of latency in Log::Sync()";
-      SleepFor(MonoDelta::FromMilliseconds(sleep_ms));
-    }
-  }
-
-  if (force_sync_all_ && !sync_disabled_) {
-    LOG_SLOW_EXECUTION(WARNING, 50, Substitute("$0Fsync log took a long time", LogPrefix())) {
-      RETURN_NOT_OK(active_segment_->Sync());
-
-      if (log_hooks_) {
-        RETURN_NOT_OK_PREPEND(log_hooks_->PostSyncIfFsyncEnabled(),
-                              "PostSyncIfFsyncEnabled hook failed");
-      }
-    }
-  }
-
-  if (log_hooks_) {
-    RETURN_NOT_OK_PREPEND(log_hooks_->PostSync(), "PostSync hook failed");
-  }
-  return Status::OK();
+  return segment_allocator_.Sync();
 }
 
 int GetPrefixSizeToGC(RetentionIndexes retention_indexes, const SegmentSequence& segments) {
@@ -790,11 +993,10 @@ int GetPrefixSizeToGC(RetentionIndexes retention_indexes, const SegmentSequence&
   return prefix_size;
 }
 
-Status Log::GetSegmentsToGCUnlocked(RetentionIndexes retention_indexes,
+void Log::GetSegmentsToGCUnlocked(RetentionIndexes retention_indexes,
                                     SegmentSequence* segments_to_gc) const {
-  RETURN_NOT_OK(reader_->GetSegmentsSnapshot(segments_to_gc));
+  reader_->GetSegmentsSnapshot(segments_to_gc);
   segments_to_gc->resize(GetPrefixSizeToGC(retention_indexes, *segments_to_gc));
-  return Status::OK();
 }
 
 Status Log::Append(LogEntryPB* entry) {
@@ -802,7 +1004,7 @@ Status Log::Append(LogEntryPB* entry) {
   entry_batch_pb->mutable_entry()->AddAllocated(entry);
   LogEntryBatch entry_batch(entry->type(), std::move(entry_batch_pb), 1);
   entry_batch.Serialize();
-  Status s = DoAppend(&entry_batch);
+  Status s = WriteBatch(&entry_batch);
   if (s.ok()) {
     s = Sync();
   }
@@ -825,7 +1027,7 @@ Status Log::WaitUntilAllFlushed() {
 Status Log::GC(RetentionIndexes retention_indexes, int32_t* num_gced) {
   CHECK_GE(retention_indexes.for_durability, 0);
 
-  VLOG_WITH_PREFIX(1) << "Running Log GC on " << log_dir_ << ": retaining "
+  VLOG_WITH_PREFIX(1) << "Running Log GC on " << ctx_.log_dir << ": retaining "
       "ops >= " << retention_indexes.for_durability << " for durability, "
       "ops >= " << retention_indexes.for_peers << " for peers";
   VLOG_TIMING(1, Substitute("$0Log GC", LogPrefix())) {
@@ -835,7 +1037,7 @@ Status Log::GC(RetentionIndexes retention_indexes, int32_t* num_gced) {
       std::lock_guard<percpu_rwlock> l(state_lock_);
       CHECK_EQ(kLogWriting, log_state_);
 
-      RETURN_NOT_OK(GetSegmentsToGCUnlocked(retention_indexes, &segments_to_delete));
+      GetSegmentsToGCUnlocked(retention_indexes, &segments_to_delete);
 
       if (segments_to_delete.empty()) {
         VLOG_WITH_PREFIX(1) << "No segments to delete.";
@@ -844,8 +1046,8 @@ Status Log::GC(RetentionIndexes retention_indexes, int32_t* num_gced) {
       }
       // Trim the prefix of segments from the reader so that they are no longer
       // referenced by the log.
-      RETURN_NOT_OK(reader_->TrimSegmentsUpToAndIncluding(
-          segments_to_delete[segments_to_delete.size() - 1]->header().sequence_number()));
+      reader_->TrimSegmentsUpToAndIncluding(
+          segments_to_delete[segments_to_delete.size() - 1]->header().sequence_number());
     }
 
     // Now that they are no longer referenced by the Log, delete the files.
@@ -859,7 +1061,7 @@ Status Log::GC(RetentionIndexes retention_indexes, int32_t* num_gced) {
                              segment->footer().max_replicate_index());
       }
       LOG_WITH_PREFIX(INFO) << "Deleting log segment in path: " << segment->path() << ops_str;
-      RETURN_NOT_OK(fs_manager_->env()->DeleteFile(segment->path()));
+      RETURN_NOT_OK(ctx_.fs_manager->env()->DeleteFile(segment->path()));
       (*num_gced)++;
     }
 
@@ -879,14 +1081,10 @@ int64_t Log::GetGCableDataSize(RetentionIndexes retention_indexes) const {
   {
     shared_lock<rw_spinlock> l(state_lock_.get_lock());
     CHECK_EQ(kLogWriting, log_state_);
-    Status s = GetSegmentsToGCUnlocked(retention_indexes, &segments_to_delete);
-
-    if (!s.ok() || segments_to_delete.empty()) {
-      return 0;
-    }
+    GetSegmentsToGCUnlocked(retention_indexes, &segments_to_delete);
   }
   int64_t total_size = 0;
-  for (const scoped_refptr<ReadableLogSegment>& segment : segments_to_delete) {
+  for (const auto& segment : segments_to_delete) {
     total_size += segment->file_size();
   }
   return total_size;
@@ -898,7 +1096,7 @@ void Log::GetReplaySizeMap(std::map<int64_t, int64_t>* replay_size) const {
   {
     shared_lock<rw_spinlock> l(state_lock_.get_lock());
     CHECK_EQ(kLogWriting, log_state_);
-    CHECK_OK(reader_->GetSegmentsSnapshot(&segments));
+    reader_->GetSegmentsSnapshot(&segments);
   }
 
   int64_t cumulative_size = 0;
@@ -916,9 +1114,10 @@ int64_t Log::OnDiskSize() {
     shared_lock<rw_spinlock> l(state_lock_.get_lock());
     // If the log is closed, the tablet is either being deleted or tombstoned,
     // so we don't count the size of its log anymore as it should be deleted.
-    if (log_state_ == kLogClosed || !reader_->GetSegmentsSnapshot(&segments).ok()) {
+    if (log_state_ == kLogClosed) {
       return on_disk_size_.load();
     }
+    reader_->GetSegmentsSnapshot(&segments);
   }
   int64_t ret = 0;
   for (const auto& segment : segments) {
@@ -929,51 +1128,43 @@ int64_t Log::OnDiskSize() {
   return ret;
 }
 
-void Log::SetSchemaForNextLogSegment(const Schema& schema,
+void Log::SetSchemaForNextLogSegment(Schema schema,
                                      uint32_t version) {
-  std::lock_guard<rw_spinlock> l(schema_lock_);
-  schema_ = schema;
-  schema_version_ = version;
+  segment_allocator_.SetSchemaForNextSegment(std::move(schema), version);
 }
 
 Status Log::Close() {
-  allocation_pool_->Shutdown();
+  segment_allocator_.StopAllocationThread();
   append_thread_->Shutdown();
 
-  std::lock_guard<percpu_rwlock> l(state_lock_);
-  switch (log_state_) {
-    case kLogWriting:
-      if (log_hooks_) {
-        RETURN_NOT_OK_PREPEND(log_hooks_->PreClose(),
-                              "PreClose hook failed");
-      }
-      RETURN_NOT_OK(Sync());
-      RETURN_NOT_OK(CloseCurrentSegment());
-      RETURN_NOT_OK(ReplaceSegmentInReaderUnlocked());
-      log_state_ = kLogClosed;
-      VLOG_WITH_PREFIX(1) << "Log closed";
-
-      // Release FDs held by these objects.
-      log_index_.reset();
-      reader_.reset();
-
-      if (log_hooks_) {
-        RETURN_NOT_OK_PREPEND(log_hooks_->PostClose(),
-                              "PostClose hook failed");
-      }
-      return Status::OK();
-
-    case kLogClosed:
-      VLOG_WITH_PREFIX(1) << "Log already closed";
-      return Status::OK();
-
-    default:
-      return Status::IllegalState(Substitute("Log not open. State: $0", log_state_));
+  {
+    std::lock_guard<percpu_rwlock> l(state_lock_);
+    switch (log_state_) {
+      case kLogWriting:
+        log_state_ = kLogClosed;
+        break;
+      case kLogClosed:
+        VLOG_WITH_PREFIX(1) << "Log already closed";
+        return Status::OK();
+      default:
+        return Status::IllegalState(Substitute(
+            "Log not open. State: $0", log_state_));
+    }
   }
+
+  RETURN_NOT_OK(segment_allocator_.FinishCurrentSegment(
+      /*finished_segment=*/ nullptr));
+  VLOG_WITH_PREFIX(1) << "Log closed";
+
+  // Release FDs held by these objects.
+  segment_allocator_.active_segment_.reset();
+  log_index_.reset();
+  reader_.reset();
+  return Status::OK();
 }
 
 bool Log::HasOnDiskData(FsManager* fs_manager, const string& tablet_id) {
-  string wal_dir = fs_manager->GetTabletWalDir(tablet_id);
+  const string wal_dir = fs_manager->GetTabletWalDir(tablet_id);
   return fs_manager->env()->FileExists(wal_dir);
 }
 
@@ -1020,144 +1211,7 @@ Status Log::RemoveRecoveryDirIfExists(FsManager* fs_manager, const string& table
   return Status::OK();
 }
 
-Status Log::PreAllocateNewSegment() {
-  TRACE_EVENT1("log", "PreAllocateNewSegment", "file", next_segment_path_);
-  CHECK_EQ(allocation_state(), kAllocationInProgress);
-
-  // We must mark allocation as finished when returning from this method.
-  auto alloc_finished = MakeScopedCleanup([&] () {
-    std::lock_guard<RWMutex> l(allocation_lock_);
-    allocation_state_ = kAllocationFinished;
-  });
-
-  WritableFileOptions opts;
-  opts.sync_on_close = force_sync_all_;
-  RETURN_NOT_OK(CreatePlaceholderSegment(opts, &next_segment_path_, &next_segment_file_));
-
-  MAYBE_RETURN_FAILURE(FLAGS_log_inject_io_error_on_preallocate_fraction,
-                       Status::IOError("Injected IOError in Log::PreAllocateNewSegment()"));
-
-  if (options_.preallocate_segments) {
-    TRACE("Preallocating $0 byte segment in $1", max_segment_size_, next_segment_path_);
-    RETURN_NOT_OK(env_util::VerifySufficientDiskSpace(fs_manager_->env(),
-                                                      next_segment_path_,
-                                                      max_segment_size_,
-                                                      FLAGS_fs_wal_dir_reserved_bytes));
-    // TODO (perf) zero the new segments -- this could result in
-    // additional performance improvements.
-    RETURN_NOT_OK(next_segment_file_->PreAllocate(max_segment_size_));
-  }
-
-  return Status::OK();
-}
-
-Status Log::SwitchToAllocatedSegment() {
-  CHECK_EQ(allocation_state(), kAllocationFinished);
-
-  // Increment "next" log segment seqno.
-  active_segment_sequence_number_++;
-
-  string new_segment_path = fs_manager_->GetWalSegmentFileName(tablet_id_,
-                                                               active_segment_sequence_number_);
-
-  RETURN_NOT_OK(fs_manager_->env()->RenameFile(next_segment_path_, new_segment_path));
-  if (force_sync_all_) {
-    RETURN_NOT_OK(fs_manager_->env()->SyncDir(log_dir_));
-  }
-
-  // Create a new segment.
-  gscoped_ptr<WritableLogSegment> new_segment(
-      new WritableLogSegment(new_segment_path, next_segment_file_));
-
-  // Set up the new header and footer.
-  LogSegmentHeaderPB header;
-  header.set_sequence_number(active_segment_sequence_number_);
-  header.set_tablet_id(tablet_id_);
-
-  if (codec_) {
-    header.set_compression_codec(codec_->type());
-  }
-
-  // Set up the new footer. This will be maintained as the segment is written.
-  footer_builder_.Clear();
-  footer_builder_.set_num_entries(0);
-
-
-  // Set the new segment's schema.
-  {
-    shared_lock<rw_spinlock> l(schema_lock_);
-    RETURN_NOT_OK(SchemaToPB(schema_, header.mutable_schema()));
-    header.set_schema_version(schema_version_);
-  }
-
-  RETURN_NOT_OK(new_segment->WriteHeaderAndOpen(header));
-
-  // Transform the currently-active segment into a readable one, since we
-  // need to be able to replay the segments for other peers.
-  {
-    if (active_segment_.get() != nullptr) {
-      std::lock_guard<percpu_rwlock> l(state_lock_);
-      CHECK_OK(ReplaceSegmentInReaderUnlocked());
-    }
-  }
-
-  // Open the segment we just created in readable form and add it to the reader.
-  // TODO(todd): consider using a global FileCache here? With short log segments and
-  // lots of tablets, this file descriptor usage may add up.
-  unique_ptr<RandomAccessFile> readable_file;
-
-  RandomAccessFileOptions opts;
-  RETURN_NOT_OK(fs_manager_->env()->NewRandomAccessFile(opts, new_segment_path, &readable_file));
-  scoped_refptr<ReadableLogSegment> readable_segment(
-    new ReadableLogSegment(new_segment_path,
-                           shared_ptr<RandomAccessFile>(readable_file.release())));
-  RETURN_NOT_OK(readable_segment->Init(header, new_segment->first_entry_offset()));
-  RETURN_NOT_OK(reader_->AppendEmptySegment(readable_segment));
-
-  // Now set 'active_segment_' to the new segment.
-  active_segment_.reset(new_segment.release());
-
-  allocation_state_ = kAllocationNotStarted;
-
-  return Status::OK();
-}
-
-Status Log::ReplaceSegmentInReaderUnlocked() {
-  // We should never switch to a new segment if we wrote nothing to the old one.
-  CHECK(active_segment_->IsClosed());
-  shared_ptr<RandomAccessFile> readable_file;
-  RETURN_NOT_OK(OpenFileForRandom(fs_manager_->env(), active_segment_->path(), &readable_file));
-  scoped_refptr<ReadableLogSegment> readable_segment(
-      new ReadableLogSegment(active_segment_->path(),
-                             readable_file));
-  // Note: active_segment_->header() will only contain an initialized PB if we
-  // wrote the header out.
-  RETURN_NOT_OK(readable_segment->Init(active_segment_->header(),
-                                       active_segment_->footer(),
-                                       active_segment_->first_entry_offset()));
-
-  return reader_->ReplaceLastSegment(readable_segment);
-}
-
-Status Log::CreatePlaceholderSegment(const WritableFileOptions& opts,
-                                     string* result_path,
-                                     shared_ptr<WritableFile>* out) {
-  string tmp_suffix = strings::Substitute("$0$1", kTmpInfix, ".newsegmentXXXXXX");
-  string path_tmpl = JoinPathSegments(log_dir_, tmp_suffix);
-  VLOG_WITH_PREFIX(2) << "Creating temp. file for place holder segment, template: " << path_tmpl;
-  unique_ptr<WritableFile> segment_file;
-  RETURN_NOT_OK(fs_manager_->env()->NewTempWritableFile(opts,
-                                                        path_tmpl,
-                                                        result_path,
-                                                        &segment_file));
-  VLOG_WITH_PREFIX(1) << "Created next WAL segment, placeholder path: " << *result_path;
-  out->reset(segment_file.release());
-  return Status::OK();
-}
-
-std::string Log::LogPrefix() const {
-  return Substitute("T $0 P $1: ", tablet_id_, fs_manager_->uuid());
-}
+std::string Log::LogPrefix() const { return ctx_.LogPrefix(); }
 
 Log::~Log() {
   WARN_NOT_OK(Close(), "Error closing log");

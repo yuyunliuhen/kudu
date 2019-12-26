@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -91,6 +92,7 @@ DEFINE_int32(test_delete_leader_payload_bytes, 16 * 1024,
 DEFINE_int32(test_delete_leader_num_writer_threads, 1,
              "Number of writer threads in TestDeleteLeaderDuringTabletCopyStressTest.");
 
+using boost::none;
 using kudu::client::KuduSchema;
 using kudu::client::KuduTableCreator;
 using kudu::cluster::ExternalMiniClusterOptions;
@@ -638,6 +640,8 @@ TEST_F(TabletCopyITest, TestConcurrentTabletCopys) {
     ASSERT_OK(row->SetInt32(0, std::numeric_limits<int32_t>::max() / kNumTablets * (i + 1)));
     splits.push_back(row);
   }
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
   ASSERT_OK(table_creator->table_name(TestWorkload::kDefaultTableName)
                           .split_rows(splits)
@@ -645,6 +649,7 @@ TEST_F(TabletCopyITest, TestConcurrentTabletCopys) {
                           .set_range_partition_columns({ "key" })
                           .num_replicas(3)
                           .Create());
+#pragma GCC diagnostic pop
 
   const int kTsIndex = 0; // We'll test with the first TS.
   TServerDetails* target_ts = ts_map_[cluster_->tablet_server(kTsIndex)->uuid()];
@@ -1246,12 +1251,13 @@ TEST_P(TabletCopyFailureITest, TestTabletCopyNewReplicaFailureCanVote) {
   ASSERT_OK(inspect_->WaitForReplicaCount(kNumReplicas));
   master::GetTableLocationsResponsePB table_locations;
   ASSERT_OK(itest::GetTableLocations(cluster_->master_proxy(), TestWorkload::kDefaultTableName,
-                                     kTimeout, master::VOTER_REPLICA, &table_locations));
+                                     kTimeout, master::VOTER_REPLICA, /*table_id=*/none,
+                                     &table_locations));
   ASSERT_EQ(1, table_locations.tablet_locations_size());
   string tablet_id = table_locations.tablet_locations(0).tablet_id();
   set<string> replica_uuids;
-  for (const auto& replica : table_locations.tablet_locations(0).replicas()) {
-    replica_uuids.insert(replica.ts_info().permanent_uuid());
+  for (const auto& replica : table_locations.tablet_locations(0).interned_replicas()) {
+    replica_uuids.insert(table_locations.ts_infos(replica.ts_info_idx()).permanent_uuid());
   }
 
   string new_replica_uuid;

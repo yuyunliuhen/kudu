@@ -21,12 +21,17 @@
 #include <mutex>
 #include <ostream>
 #include <string>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "kudu/common/common.pb.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
@@ -59,24 +64,29 @@ TAG_FLAG(enable_log_gc, unsafe);
 
 DEFINE_int32(flush_threshold_mb, 1024,
              "Size at which MemRowSet flushes are triggered. "
-             "A MRS can still flush below this threshold if it if hasn't flushed in a while, "
+             "A MRS can still flush below this threshold if it hasn't flushed in a while, "
              "or if the server-wide memory limit has been reached.");
 TAG_FLAG(flush_threshold_mb, experimental);
+TAG_FLAG(flush_threshold_mb, runtime);
 
 DEFINE_int32(flush_threshold_secs, 2 * 60,
              "Number of seconds after which a non-empty MemRowSet will become flushable "
              "even if it is not large.");
 TAG_FLAG(flush_threshold_secs, experimental);
+TAG_FLAG(flush_threshold_secs, runtime);
 
 
 METRIC_DEFINE_gauge_uint32(tablet, log_gc_running,
                            "Log GCs Running",
                            kudu::MetricUnit::kOperations,
-                           "Number of log GC operations currently running.");
+                           "Number of log GC operations currently running.",
+                           kudu::MetricLevel::kInfo);
 METRIC_DEFINE_histogram(tablet, log_gc_duration,
                         "Log GC Duration",
                         kudu::MetricUnit::kMilliseconds,
-                        "Time spent garbage collecting the logs.", 60000LU, 1);
+                        "Time spent garbage collecting the logs.",
+                        kudu::MetricLevel::kInfo,
+                        60000LU, 1);
 
 namespace kudu {
 namespace tablet {
@@ -94,14 +104,15 @@ const double kFlushUpperBoundMs = 60 * 60 * 1000;
 void FlushOpPerfImprovementPolicy::SetPerfImprovementForFlush(MaintenanceOpStats* stats,
                                                               double elapsed_ms) {
   double anchored_mb = static_cast<double>(stats->ram_anchored()) / (1024 * 1024);
-  if (anchored_mb > FLAGS_flush_threshold_mb) {
+  const double threshold_mb = FLAGS_flush_threshold_mb;
+  if (anchored_mb > threshold_mb) {
     // If we're over the user-specified flush threshold, then consider the perf
     // improvement to be 1 for every extra MB.  This produces perf_improvement results
     // which are much higher than most compactions would produce, and means that, when
     // there is an MRS over threshold, a flush will almost always be selected instead of
     // a compaction.  That's not necessarily a good thing, but in the absence of better
     // heuristics, it will do for now.
-    double extra_mb = anchored_mb - static_cast<double>(FLAGS_flush_threshold_mb);
+    double extra_mb = anchored_mb - threshold_mb;
     DCHECK_GE(extra_mb, 0);
     stats->set_perf_improvement(extra_mb);
   } else if (elapsed_ms > FLAGS_flush_threshold_secs * 1000) {
@@ -116,6 +127,25 @@ void FlushOpPerfImprovementPolicy::SetPerfImprovementForFlush(MaintenanceOpStats
     }
     stats->set_perf_improvement(perf);
   }
+}
+
+//
+// TabletReplicaOpBase.
+//
+TabletReplicaOpBase::TabletReplicaOpBase(std::string name,
+                                         IOUsage io_usage,
+                                         TabletReplica* tablet_replica)
+    : MaintenanceOp(std::move(name), io_usage),
+      tablet_replica_(tablet_replica) {
+}
+
+int32_t TabletReplicaOpBase::priority() const {
+  int32_t priority = 0;
+  const auto& extra_config = tablet_replica_->tablet_metadata()->extra_config();
+  if (extra_config && extra_config->has_maintenance_priority()) {
+    priority = extra_config->maintenance_priority();
+  }
+  return priority;
 }
 
 //
@@ -257,9 +287,10 @@ scoped_refptr<AtomicGauge<uint32_t> > FlushDeltaMemStoresOp::RunningGauge() cons
 //
 
 LogGCOp::LogGCOp(TabletReplica* tablet_replica)
-    : MaintenanceOp(StringPrintf("LogGCOp(%s)", tablet_replica->tablet()->tablet_id().c_str()),
-                    MaintenanceOp::LOW_IO_USAGE),
-      tablet_replica_(tablet_replica),
+    : TabletReplicaOpBase(StringPrintf("LogGCOp(%s)",
+                                       tablet_replica->tablet()->tablet_id().c_str()),
+                          MaintenanceOp::LOW_IO_USAGE,
+                          tablet_replica),
       log_gc_duration_(METRIC_log_gc_duration.Instantiate(
                            tablet_replica->tablet()->GetMetricEntity())),
       log_gc_running_(METRIC_log_gc_running.Instantiate(

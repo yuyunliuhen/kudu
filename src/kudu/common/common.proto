@@ -56,6 +56,8 @@ enum DataType {
   DECIMAL64 = 16;
   DECIMAL128 = 17;
   IS_DELETED = 18; // virtual column; not a real data type
+  VARCHAR = 19;
+  DATE = 20;
 }
 
 enum EncodingType {
@@ -70,9 +72,21 @@ enum EncodingType {
   BIT_SHUFFLE = 6;
 }
 
+// Enums that specify the HMS-related configurations for a Kudu mini-cluster.
 enum HmsMode {
+  // No HMS will be started.
   NONE = 0;
+
+  // The HMS will be started, but will not be configured to use the Kudu
+  // plugin.
+  DISABLE_HIVE_METASTORE = 3;
+
+  // The HMS will be started and configured to use the Kudu plugin, but the
+  // Kudu mini-cluster will not be configured to synchronize with it.
   ENABLE_HIVE_METASTORE = 1;
+
+  // The HMS will be started and configured to use the Kudu plugin, and the
+  // Kudu mini-cluster will be configured to synchronize with it.
   ENABLE_METASTORE_INTEGRATION = 2;
 };
 
@@ -82,6 +96,8 @@ message ColumnTypeAttributesPB {
   // For decimal columns
   optional int32 precision = 1;
   optional int32 scale = 2;
+  // For varchar columns
+  optional int32 length = 3;
 }
 
 // TODO: Differentiate between the schema attributes
@@ -116,6 +132,9 @@ message ColumnSchemaPB {
   optional int32 cfile_block_size = 10 [default=0];
 
   optional ColumnTypeAttributesPB type_attributes = 11;
+
+  // The comment for the column.
+  optional string comment = 12;
 }
 
 message ColumnSchemaDeltaPB {
@@ -128,6 +147,8 @@ message ColumnSchemaDeltaPB {
   optional EncodingType encoding = 6;
   optional CompressionType compression = 7;
   optional int32 block_size = 8;
+
+  optional string new_comment = 9;
 }
 
 message SchemaPB {
@@ -201,7 +222,7 @@ enum ExternalConsistencyMode {
 // - The earliest snapshot: this corresponds to the earliest kept undo records
 //   in the tablet, meaning the current state (Base) can be undone up to
 //   this snapshot.
-// - The latest snapshot: This corresponds to the instant beyond which no
+// - The latest snapshot: This corresponds to the instant beyond which
 //   no transaction will have an earlier timestamp. Usually this corresponds
 //   to whatever clock->Now() returns, but can be higher if the client propagates
 //   a timestamp (see below).
@@ -420,4 +441,17 @@ message KeyRangePB {
   optional bytes stop_primary_key = 2 [(kudu.REDACT) = true];
   // Number of bytes in chunk.
   required uint64 size_bytes_estimates = 3;
+}
+
+message TableExtraConfigPB {
+  // Number of seconds to retain history for tablets in this table,
+  // including history required to perform diff scans and incremental
+  // backups. Reads initiated at a snapshot that is older than this
+  // age will be rejected. Equivalent to --tablet_history_max_age_sec.
+  optional int32 history_max_age_sec = 1;
+
+  // Priority level of a table for maintenance, it will be clamped into
+  // range [-FLAGS_max_priority_range, FLAGS_max_priority_range] when
+  // calculate maintenance priority score.
+  optional int32 maintenance_priority = 2;
 }

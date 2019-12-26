@@ -16,6 +16,8 @@
 # under the License.
 
 set(CLOCK_SRCS
+  builtin_ntp.cc
+  builtin_ntp-internal.cc
   hybrid_clock.cc
   logical_clock.cc
   mock_ntp.cc
@@ -31,6 +33,45 @@ target_link_libraries(clock
   kudu_common
   kudu_util)
 
+##############################
+# mini_chronyd
+##############################
+
+if (NOT NO_CHRONY)
+  # Link the chrony binaries so that they can be found via
+  # MiniChronyd::GetPath in MiniChronyd::Start.
+  execute_process(COMMAND ln -nsf
+                  "${CMAKE_SOURCE_DIR}/thirdparty/installed/common/bin/chronyc"
+                  "${EXECUTABLE_OUTPUT_PATH}/chronyc")
+  execute_process(COMMAND ln -nsf
+                  "${CMAKE_SOURCE_DIR}/thirdparty/installed/common/sbin/chronyd"
+                  "${EXECUTABLE_OUTPUT_PATH}/chronyd")
+
+  set(MINI_CHRONYD_SRCS test/mini_chronyd.cc)
+
+  add_library(mini_chronyd ${MINI_CHRONYD_SRCS})
+  target_link_libraries(mini_chronyd
+    gutil
+    kudu_test_util
+    kudu_util)
+
+  set(MINI_CHRONYD_TEST_UTIL_SRCS test/mini_chronyd_test_util.cc)
+  add_library(mini_chronyd_test_util ${MINI_CHRONYD_TEST_UTIL_SRCS})
+  target_link_libraries(mini_chronyd_test_util
+    gutil
+    kudu_test_util
+    kudu_util
+    mini_cluster)
+endif() # (NOT NO_CHRONY)
+
 SET_KUDU_TEST_LINK_LIBS(clock)
 ADD_KUDU_TEST(hybrid_clock-test PROCESSORS 3)
 ADD_KUDU_TEST(logical_clock-test)
+
+if (NO_CHRONY)
+  SET_KUDU_TEST_LINK_LIBS(clock)
+else()
+  SET_KUDU_TEST_LINK_LIBS(clock mini_chronyd mini_chronyd_test_util)
+  ADD_KUDU_TEST(test/mini_chronyd-test)
+endif()
+ADD_KUDU_TEST(ntp-test)

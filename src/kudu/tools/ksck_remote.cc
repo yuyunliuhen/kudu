@@ -19,7 +19,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
+#include <mutex>
 #include <ostream>
 #include <unordered_map>
 
@@ -29,6 +31,7 @@
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
+#include "kudu/client/client-internal.h"
 #include "kudu/client/client.h"
 #include "kudu/client/replica_controller-internal.h"
 #include "kudu/client/schema.h"
@@ -45,7 +48,9 @@
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.h"
+#include "kudu/master/master.pb.h"
 #include "kudu/master/sys_catalog.h"
+#include "kudu/rebalance/cluster_status.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/rpc_controller.h"
@@ -55,38 +60,45 @@
 #include "kudu/tools/ksck.h"
 #include "kudu/tools/ksck_checksum.h"
 #include "kudu/tools/ksck_results.h"
+#include "kudu/tools/tool_action_common.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_service.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
+#include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/threadpool.h"
 #include "kudu/util/version_info.pb.h"
 
 DECLARE_int64(timeout_ms); // defined in tool_action_common
+DECLARE_int32(fetch_info_concurrency);
+
 DEFINE_bool(checksum_cache_blocks, false, "Should the checksum scanners cache the read blocks");
+
+using kudu::client::KuduClientBuilder;
+using kudu::client::KuduScanToken;
+using kudu::client::KuduScanTokenBuilder;
+using kudu::client::KuduSchema;
+using kudu::client::KuduTable;
+using kudu::client::internal::ReplicaController;
+using kudu::cluster_summary::ServerHealth;
+using kudu::master::ListTabletServersRequestPB;
+using kudu::master::ListTabletServersResponsePB;
+using kudu::master::TServerStatePB;
+using kudu::rpc::Messenger;
+using kudu::rpc::MessengerBuilder;
+using kudu::rpc::RpcController;
+using std::shared_ptr;
+using std::string;
+using std::vector;
+using strings::Substitute;
 
 namespace kudu {
 namespace tools {
 
 static const std::string kMessengerName = "ksck";
-
-using client::KuduClient;
-using client::KuduClientBuilder;
-using client::KuduReplica;
-using client::KuduScanToken;
-using client::KuduScanTokenBuilder;
-using client::KuduTable;
-using client::KuduTabletServer;
-using client::internal::ReplicaController;
-using rpc::Messenger;
-using rpc::MessengerBuilder;
-using rpc::RpcController;
-using std::shared_ptr;
-using std::string;
-using std::vector;
-using strings::Substitute;
 
 namespace {
 MonoDelta GetDefaultTimeout() {
@@ -181,10 +193,10 @@ Status RemoteKsckTabletServer::Init() {
   return Status::OK();
 }
 
-Status RemoteKsckTabletServer::FetchInfo(KsckServerHealth* health) {
+Status RemoteKsckTabletServer::FetchInfo(ServerHealth* health) {
   DCHECK(health);
   state_ = KsckFetchState::FETCH_FAILED;
-  *health = KsckServerHealth::UNAVAILABLE;
+  *health = ServerHealth::UNAVAILABLE;
   {
     server::GetStatusRequestPB req;
     server::GetStatusResponsePB resp;
@@ -195,7 +207,7 @@ Status RemoteKsckTabletServer::FetchInfo(KsckServerHealth* health) {
     version_ = resp.status().version_info().version_string();
     string response_uuid = resp.status().node_instance().permanent_uuid();
     if (response_uuid != uuid()) {
-      *health = KsckServerHealth::WRONG_SERVER_UUID;
+      *health = ServerHealth::WRONG_SERVER_UUID;
       return Status::RemoteError(Substitute("ID reported by tablet server ($0) doesn't "
                                  "match the expected ID: $1",
                                  response_uuid, uuid()));
@@ -222,7 +234,7 @@ Status RemoteKsckTabletServer::FetchInfo(KsckServerHealth* health) {
   RETURN_NOT_OK(FetchCurrentTimestamp());
 
   state_ = KsckFetchState::FETCHED;
-  *health = KsckServerHealth::HEALTHY;
+  *health = ServerHealth::HEALTHY;
   return Status::OK();
 }
 
@@ -256,9 +268,9 @@ Status RemoteKsckTabletServer::FetchCurrentTimestamp() {
   return Status::OK();
 }
 
-Status RemoteKsckTabletServer::FetchConsensusState(KsckServerHealth* health) {
+Status RemoteKsckTabletServer::FetchConsensusState(ServerHealth* health) {
   DCHECK(health);
-  *health = KsckServerHealth::UNAVAILABLE;
+  *health = ServerHealth::UNAVAILABLE;
   tablet_consensus_state_map_.clear();
   consensus::GetConsensusStateRequestPB req;
   consensus::GetConsensusStateResponsePB resp;
@@ -277,7 +289,7 @@ Status RemoteKsckTabletServer::FetchConsensusState(KsckServerHealth* health) {
     }
   }
 
-  *health = KsckServerHealth::HEALTHY;
+  *health = ServerHealth::HEALTHY;
   return Status::OK();
 }
 
@@ -450,6 +462,19 @@ void RemoteKsckTabletServer::RunTabletChecksumScanAsync(
   ignore_result(stepper.release()); // Deletes self on callback.
 }
 
+RemoteKsckCluster::RemoteKsckCluster(std::vector<std::string> master_addresses,
+                                     std::shared_ptr<rpc::Messenger> messenger)
+    : master_addresses_(std::move(master_addresses)),
+      messenger_(std::move(messenger)) {
+  for (const std::string& master_addr : master_addresses_) {
+    masters_.emplace_back(new RemoteKsckMaster(master_addr, messenger_));
+  }
+  CHECK_OK(ThreadPoolBuilder("RemoteKsckCluster-fetch")
+               .set_max_threads(FLAGS_fetch_info_concurrency)
+               .set_idle_timeout(MonoDelta::FromMilliseconds(10))
+               .Build(&pool_));
+}
+
 Status RemoteKsckCluster::Connect() {
   KuduClientBuilder builder;
   builder.default_rpc_timeout(GetDefaultTimeout());
@@ -474,21 +499,38 @@ Status RemoteKsckCluster::Build(const vector<string>& master_addresses,
 }
 
 Status RemoteKsckCluster::RetrieveTabletServers() {
-  vector<KuduTabletServer*> servers;
-  ElementDeleter deleter(&servers);
-  RETURN_NOT_OK(client_->ListTabletServers(&servers));
+  // Request that the tablet server states also be reported. This may include
+  // information about tablet servers that have not yet registered with the
+  // Masters.
+  ListTabletServersRequestPB req;
+  req.set_include_states(true);
+  ListTabletServersResponsePB resp;
+  RETURN_NOT_OK(client_->data_->ListTabletServers(
+      client_.get(), MonoTime::Now() + client_->default_admin_operation_timeout(), req, &resp));
 
   TSMap tablet_servers;
-  for (const auto* s : servers) {
-    auto ts = std::make_shared<RemoteKsckTabletServer>(
-        s->uuid(),
-        HostPort(s->hostname(), s->port()),
-        messenger_,
-        s->location());
+  KsckTServerStateMap ts_states;
+  for (int i = 0; i < resp.servers_size(); i++) {
+    const auto& ts_pb = resp.servers(i);
+    const auto& uuid = ts_pb.instance_id().permanent_uuid();
+    if (ts_pb.has_state() && ts_pb.state() != TServerStatePB::NONE) {
+      // We don't expect updates, but it's straightforward to handle, so let's
+      // update instead of die just in case.
+      EmplaceOrUpdate(&ts_states, uuid, ts_pb.state());
+    }
+    // If there's no registration for the tablet server, all we can really get
+    // is the state, so move on.
+    if (!ts_pb.has_registration()) {
+      continue;
+    }
+    HostPort hp;
+    RETURN_NOT_OK(HostPortFromPB(ts_pb.registration().rpc_addresses(0), &hp));
+    auto ts = std::make_shared<RemoteKsckTabletServer>(uuid, hp, messenger_, ts_pb.location());
     RETURN_NOT_OK(ts->Init());
-    InsertOrDie(&tablet_servers, ts->uuid(), ts);
+    EmplaceOrUpdate(&tablet_servers, uuid, std::move(ts));
   }
-  tablet_servers_.swap(tablet_servers);
+  tablet_servers_ = std::move(tablet_servers);
+  ts_states_ = std::move(ts_states);
   return Status::OK();
 }
 
@@ -496,24 +538,70 @@ Status RemoteKsckCluster::RetrieveTablesList() {
   vector<string> table_names;
   RETURN_NOT_OK(client_->ListTables(&table_names));
 
-  vector<shared_ptr<KsckTable>> tables_temp;
-  for (const auto& n : table_names) {
-    client::sp::shared_ptr<KuduTable> t;
-    RETURN_NOT_OK(client_->OpenTable(n, &t));
-
-    shared_ptr<KsckTable> table(new KsckTable(t->id(),
-                                              n,
-                                              *t->schema().schema_,
-                                              t->num_replicas()));
-    tables_temp.push_back(table);
+  if (table_names.empty()) {
+    return Status::OK();
   }
-  tables_.swap(tables_temp);
+
+  vector<shared_ptr<KsckTable>> tables;
+  tables.reserve(table_names.size());
+  simple_spinlock tables_lock;
+  int tables_count = 0;
+  filtered_tables_count_ = 0;
+  filtered_tablets_count_ = 0;
+
+  for (const auto& table_name : table_names) {
+    if (!MatchesAnyPattern(table_filters_, table_name)) {
+      filtered_tables_count_++;
+      VLOG(1) << "Skipping table " << table_name;
+      continue;
+    }
+    tables_count++;
+    RETURN_NOT_OK(pool_->SubmitFunc([&]() {
+      client::sp::shared_ptr<KuduTable> t;
+      Status s = client_->OpenTable(table_name, &t);
+      if (!s.ok()) {
+        LOG(ERROR) << Substitute("unable to open table $0: $1",
+                                 table_name, s.ToString());
+        return;
+      }
+      shared_ptr<KsckTable> table(new KsckTable(t->id(),
+                                                table_name,
+                                                KuduSchema::ToSchema(t->schema()),
+                                                t->num_replicas()));
+      {
+        std::lock_guard<simple_spinlock> l(tables_lock);
+        tables.emplace_back(std::move(table));
+      }
+    }));
+  }
+  pool_->Wait();
+
+  tables_.swap(tables);
+
+  if (tables_.size() < tables_count) {
+    return Status::NetworkError(
+        Substitute("failed to gather info from all filtered tables: $0 of $1 had errors",
+                   tables_count - tables_.size(), tables_count));
+  }
+
+  return Status::OK();
+}
+
+Status RemoteKsckCluster::RetrieveAllTablets() {
+  if (tables_.empty()) {
+    return Status::OK();
+  }
+
+  for (const auto& table : tables_) {
+    RETURN_NOT_OK(pool_->SubmitFunc(
+        std::bind(&KsckCluster::RetrieveTabletsList, this, table)));
+  }
+  pool_->Wait();
+
   return Status::OK();
 }
 
 Status RemoteKsckCluster::RetrieveTabletsList(const shared_ptr<KsckTable>& table) {
-  vector<shared_ptr<KsckTablet>> tablets;
-
   client::sp::shared_ptr<KuduTable> client_table;
   RETURN_NOT_OK(client_->OpenTable(table->name(), &client_table));
 
@@ -522,7 +610,14 @@ Status RemoteKsckCluster::RetrieveTabletsList(const shared_ptr<KsckTable>& table
 
   KuduScanTokenBuilder builder(client_table.get());
   RETURN_NOT_OK(builder.Build(&tokens));
+
+  vector<shared_ptr<KsckTablet>> tablets;
   for (const auto* t : tokens) {
+    if (!MatchesAnyPattern(tablet_id_filters_, t->tablet().id())) {
+      filtered_tablets_count_++;
+      VLOG(1) << "Skipping tablet " << t->tablet().id();
+      continue;
+    }
     shared_ptr<KsckTablet> tablet(
         new KsckTablet(table.get(), t->tablet().id()));
     vector<shared_ptr<KsckTabletReplica>> replicas;

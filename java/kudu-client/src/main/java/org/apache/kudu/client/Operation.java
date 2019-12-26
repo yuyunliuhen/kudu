@@ -20,22 +20,28 @@ package org.apache.kudu.client;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.EnumSet;
 import java.util.List;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
 import com.google.protobuf.UnsafeByteOperations;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
+import org.jboss.netty.util.Timer;
 
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
-import org.apache.kudu.WireProtocol;
+import org.apache.kudu.WireProtocol.AppStatusPB.ErrorCode;
 import org.apache.kudu.WireProtocol.RowOperationsPB;
+import org.apache.kudu.client.ProtobufHelper.SchemaPBConversionFlags;
 import org.apache.kudu.client.Statistics.Statistic;
 import org.apache.kudu.client.Statistics.TabletStatistics;
+import org.apache.kudu.security.Token;
 import org.apache.kudu.tserver.Tserver;
 import org.apache.kudu.util.Pair;
 
@@ -82,23 +88,49 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
 
   static final String METHOD = "Write";
 
-  private final PartialRow row;
+  private PartialRow row;
+
+  private Token.SignedTokenPB authzToken;
 
   /** See {@link SessionConfiguration#setIgnoreAllDuplicateRows(boolean)} */
   boolean ignoreAllDuplicateRows = false;
+  /** See {@link SessionConfiguration#setIgnoreAllNotFoundRows(boolean)} */
+  boolean ignoreAllNotFoundRows = false;
 
   /**
    * Package-private constructor. Subclasses need to be instantiated via AsyncKuduSession
    * @param table table with the schema to use for this operation
    */
   Operation(KuduTable table) {
-    super(table);
+    super(table, null, 0);
     this.row = table.getSchema().newPartialRow();
+  }
+
+  /**
+   * Reset the timeout of this batch.
+   *
+   * TODO(wdberkeley): The fact we have to do this is a sign an Operation should not subclass
+   * KuduRpc.
+   *
+   * @param timeoutMillis the new timeout of the batch in milliseconds
+   */
+  void resetTimeoutMillis(Timer timer, long timeoutMillis) {
+    timeoutTracker.reset();
+    timeoutTracker.setTimeout(timeoutMillis);
+    if (timeoutTask != null) {
+      timeoutTask.cancel();
+    }
+    timeoutTask = AsyncKuduClient.newTimeout(timer, new RpcTimeoutTask(), timeoutMillis);
   }
 
   /** See {@link SessionConfiguration#setIgnoreAllDuplicateRows(boolean)} */
   void setIgnoreAllDuplicateRows(boolean ignoreAllDuplicateRows) {
     this.ignoreAllDuplicateRows = ignoreAllDuplicateRows;
+  }
+
+  /** See {@link SessionConfiguration#setIgnoreAllNotFoundRows(boolean)} */
+  void setIgnoreAllNotFoundRows(boolean ignoreAllNotFoundRows) {
+    this.ignoreAllNotFoundRows = ignoreAllNotFoundRows;
   }
 
   /**
@@ -130,6 +162,16 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
   }
 
   @Override
+  boolean needsAuthzToken() {
+    return true;
+  }
+
+  @Override
+  void bindAuthzToken(Token.SignedTokenPB token) {
+    authzToken = token;
+  }
+
+  @Override
   Message createRequestPB() {
     final Tserver.WriteRequestPB.Builder builder =
         createAndFillWriteRequestPB(ImmutableList.of(this));
@@ -139,6 +181,9 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
     builder.setExternalConsistencyMode(this.externalConsistencyMode.pbVersion());
     if (this.propagatedTimestamp != AsyncKuduClient.NO_TIMESTAMP) {
       builder.setPropagatedTimestamp(this.propagatedTimestamp);
+    }
+    if (authzToken != null) {
+      builder.setAuthzToken(authzToken);
     }
     return builder.build();
   }
@@ -151,15 +196,18 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
     Tserver.WriteResponsePB.PerRowErrorPB error = null;
     if (builder.getPerRowErrorsCount() != 0) {
       error = builder.getPerRowErrors(0);
-      if (ignoreAllDuplicateRows &&
-          error.getError().getCode() == WireProtocol.AppStatusPB.ErrorCode.ALREADY_PRESENT) {
+      ErrorCode errorCode = error.getError().getCode();
+      if ((ignoreAllDuplicateRows && errorCode == ErrorCode.ALREADY_PRESENT) ||
+          (ignoreAllNotFoundRows && errorCode == ErrorCode.NOT_FOUND)) {
         error = null;
       }
     }
-    OperationResponse response = new OperationResponse(deadlineTracker.getElapsedMillis(), tsUUID,
-                                                       builder.getTimestamp(), this, error);
-    return new Pair<OperationResponse, Object>(
-        response, builder.hasError() ? builder.getError() : null);
+    OperationResponse response = new OperationResponse(timeoutTracker.getElapsedMillis(),
+                                                       tsUUID,
+                                                       builder.getTimestamp(),
+                                                       this,
+                                                       error);
+    return new Pair<>(response, builder.hasError() ? builder.getError() : null);
   }
 
   @Override
@@ -178,6 +226,28 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
    */
   public PartialRow getRow() {
     return this.row;
+  }
+
+  /**
+   * Set the underlying row.
+   *
+   * Note: The schema of the underlying row and the table must be equal by reference.
+   * To ensure they are equal, create the partial row from the table's schema.
+   *
+   * <pre>{@code
+   *   KuduTable table = client.openTable("my-table");
+   *   PartialRow row = table.getSchema().newPartialRow();
+   *   ...
+   *   Operation op = table.newInsert();
+   *   op.setRow(row);
+   * }</pre>
+   *
+   * @param row the row to set
+   */
+  public void setRow(PartialRow row) {
+    Preconditions.checkArgument(row.getSchema() == table.getSchema(),
+        "The row's schema must be equal by reference to the table schema");
+    this.row = row;
   }
 
   @Override
@@ -218,7 +288,9 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
     }
 
     Tserver.WriteRequestPB.Builder requestBuilder = Tserver.WriteRequestPB.newBuilder();
-    requestBuilder.setSchema(ProtobufHelper.schemaToPb(schema));
+    requestBuilder.setSchema(ProtobufHelper.schemaToPb(schema,
+        EnumSet.of(SchemaPBConversionFlags.SCHEMA_PB_WITHOUT_COMMENT,
+                   SchemaPBConversionFlags.SCHEMA_PB_WITHOUT_ID)));
     requestBuilder.setRowOperations(rowOps);
     return requestBuilder;
   }
@@ -285,18 +357,34 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
     }
 
     private void encodeRow(PartialRow row, ChangeType type) {
-      rows.put(type.toEncodedByte());
-      rows.put(Bytes.fromBitSet(row.getColumnsBitSet(), schema.getColumnCount()));
-      if (schema.hasNullableColumns()) {
-        rows.put(Bytes.fromBitSet(row.getNullsBitSet(), schema.getColumnCount()));
+      int columnCount = row.getSchema().getColumnCount();
+      BitSet columnsBitSet = row.getColumnsBitSet();
+      BitSet nullsBitSet = row.getNullsBitSet();
+
+      // If this is a DELETE operation only the key columns should to be set.
+      if (type == ChangeType.DELETE) {
+        columnCount = row.getSchema().getPrimaryKeyColumnCount();
+        // Clear the bits indicating any non-key fields are set.
+        columnsBitSet.clear(schema.getPrimaryKeyColumnCount(), columnsBitSet.size() - 1);
+        if (schema.hasNullableColumns()) {
+          nullsBitSet.clear(schema.getPrimaryKeyColumnCount(), nullsBitSet.size() - 1);
+        }
       }
-      int colIdx = 0;
+
+      rows.put(type.toEncodedByte());
+      rows.put(Bytes.fromBitSet(columnsBitSet, schema.getColumnCount()));
+      if (schema.hasNullableColumns()) {
+        rows.put(Bytes.fromBitSet(nullsBitSet, schema.getColumnCount()));
+      }
+
       byte[] rowData = row.getRowAlloc();
       int currentRowOffset = 0;
-      for (ColumnSchema col : row.getSchema().getColumns()) {
+      for (int colIdx = 0; colIdx < columnCount; colIdx++) {
+        ColumnSchema col = schema.getColumnByIndex(colIdx);
         // Keys should always be specified, maybe check?
         if (row.isSet(colIdx) && !row.isSetToNull(colIdx)) {
-          if (col.getType() == Type.STRING || col.getType() == Type.BINARY) {
+          if (col.getType() == Type.STRING || col.getType() == Type.BINARY ||
+              col.getType() == Type.VARCHAR) {
             ByteBuffer varLengthData = row.getVarLengthData().get(colIdx);
             varLengthData.reset();
             rows.putLong(indirectWrittenBytes);
@@ -310,7 +398,6 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
           }
         }
         currentRowOffset += col.getTypeSize();
-        colIdx++;
       }
     }
 

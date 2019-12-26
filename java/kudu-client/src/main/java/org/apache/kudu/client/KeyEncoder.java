@@ -21,6 +21,7 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
@@ -97,7 +98,7 @@ class KeyEncoder {
       }
     }
 
-    encodeColumns(row, partitionSchema.getRangeSchema().getColumns(), buf);
+    encodeColumns(row, partitionSchema.getRangeSchema().getColumnIds(), buf);
     return buf.toArray();
   }
 
@@ -111,7 +112,7 @@ class KeyEncoder {
   public static byte[] encodeRangePartitionKey(PartialRow row,
                                                PartitionSchema.RangeSchema rangeSchema) {
     ByteVec buf = ByteVec.create();
-    encodeColumns(row, rangeSchema.getColumns(), buf);
+    encodeColumns(row, rangeSchema.getColumnIds(), buf);
     return buf.toArray();
   }
 
@@ -144,7 +145,8 @@ class KeyEncoder {
                                                     column.getName()));
     }
     final Type type = column.getType();
-    if (type == Type.STRING || type == Type.BINARY) {
+    if (type == Type.STRING || type == Type.BINARY ||
+        type == Type.VARCHAR) {
       encodeBinary(row.getVarLengthData().get(columnIdx), isLast, buf);
     } else {
       encodeSignedInt(row.getRowAlloc(),
@@ -252,7 +254,7 @@ class KeyEncoder {
 
     List<Integer> buckets = new ArrayList<>();
 
-    for (HashBucketSchema hashSchema : partitionSchema.getHashBucketSchemas()) {
+    for (int i = 0; i < partitionSchema.getHashBucketSchemas().size(); i++) {
       if (buf.hasRemaining()) {
         buckets.add(buf.getInt());
       } else {
@@ -291,7 +293,7 @@ class KeyEncoder {
                                                     PartitionSchema partitionSchema,
                                                     ByteBuffer buf) {
     PartialRow row = schema.newPartialRow();
-    Iterator<Integer> rangeIds = partitionSchema.getRangeSchema().getColumns().iterator();
+    Iterator<Integer> rangeIds = partitionSchema.getRangeSchema().getColumnIds().iterator();
     while (rangeIds.hasNext()) {
       int idx = schema.getColumnIndex(rangeIds.next());
       if (buf.hasRemaining()) {
@@ -335,6 +337,11 @@ class KeyEncoder {
       case BINARY: {
         byte[] binary = decodeBinaryColumn(buf, isLast);
         row.addBinary(idx, binary);
+        break;
+      }
+      case VARCHAR: {
+        byte[] binary = decodeBinaryColumn(buf, isLast);
+        row.addVarchar(idx, new String(binary, StandardCharsets.UTF_8));
         break;
       }
       case STRING: {
@@ -435,7 +442,7 @@ class KeyEncoder {
                                                PartitionSchema partitionSchema,
                                                byte[] lowerBound,
                                                byte[] upperBound) {
-    if (partitionSchema.getRangeSchema().getColumns().isEmpty() &&
+    if (partitionSchema.getRangeSchema().getColumnIds().isEmpty() &&
         partitionSchema.getHashBucketSchemas().isEmpty()) {
       assert lowerBound.length == 0 && upperBound.length == 0;
       return "<no-partitioning>";
@@ -456,13 +463,13 @@ class KeyEncoder {
       sb.append(hashBuckets);
     }
 
-    if (partitionSchema.getRangeSchema().getColumns().size() > 0) {
+    if (partitionSchema.getRangeSchema().getColumnIds().size() > 0) {
       if (!hashBuckets.isEmpty()) {
         sb.append(", ");
       }
 
       List<Integer> idxs = new ArrayList<>();
-      for (int id : partitionSchema.getRangeSchema().getColumns()) {
+      for (int id : partitionSchema.getRangeSchema().getColumnIds()) {
         idxs.add(schema.getColumnIndex(id));
       }
 

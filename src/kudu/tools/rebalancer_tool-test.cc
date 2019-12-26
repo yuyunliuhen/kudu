@@ -21,6 +21,8 @@
 #include <cstdlib>
 #include <iterator>
 #include <memory>
+#include <map>
+#include <numeric>
 #include <ostream>
 #include <string>
 #include <thread>
@@ -29,6 +31,7 @@
 #include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -42,6 +45,7 @@
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/stl_util.h"
+#include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/cluster_verifier.h"
@@ -70,6 +74,7 @@ class Schema;
 DECLARE_int32(num_replicas);
 DECLARE_int32(num_tablet_servers);
 
+using boost::none;
 using kudu::client::KuduClient;
 using kudu::client::KuduColumnSchema;
 using kudu::client::KuduSchema;
@@ -83,6 +88,7 @@ using std::atomic;
 using std::back_inserter;
 using std::copy;
 using std::endl;
+using std::ostream;
 using std::ostringstream;
 using std::string;
 using std::thread;
@@ -123,7 +129,7 @@ static string ToolRunInfo(const Status& s, const string& out, const string& err)
   } else { \
     FAIL() << ToolRunInfo(_s, _out, _err); \
   } \
-} while (0);
+} while (0)
 
 class AdminCliTest : public tserver::TabletServerIntegrationTestBase {
 };
@@ -167,6 +173,8 @@ Per-table replica distribution summary:
 }
 
 // Make sure the rebalancer doesn't start if a tablet server is down.
+// The rebalancer starts only when the dead tablet server is in the
+// list of ignored_tservers.
 class RebalanceStartCriteriaTest :
     public AdminCliTest,
     public ::testing::WithParamInterface<Kudu1097> {
@@ -194,19 +202,200 @@ TEST_P(RebalanceStartCriteriaTest, TabletServerIsDown) {
     ts->Shutdown();
   }
 
-  string out;
-  string err;
-  Status s = RunKuduTool({
-    "cluster",
-    "rebalance",
-    cluster_->master()->bound_rpc_addr().ToString()
-  }, &out, &err);
-  ASSERT_TRUE(s.IsRuntimeError()) << ToolRunInfo(s, out, err);
-  const auto err_msg_pattern = Substitute(
-      "Illegal state: tablet server .* \\($0\\): "
-      "unacceptable health status UNAVAILABLE",
-      ts_host_port.ToString());
-  ASSERT_STR_MATCHES(err, err_msg_pattern);
+  // Rebalancer doesn't start if a tablet server is down.
+  {
+    string out;
+    string err;
+    Status s = RunKuduTool({
+      "cluster",
+      "rebalance",
+      cluster_->master()->bound_rpc_addr().ToString()
+    }, &out, &err);
+    ASSERT_TRUE(s.IsRuntimeError()) << ToolRunInfo(s, out, err);
+    const auto err_msg_pattern = Substitute(
+        "Illegal state: tablet server .* \\($0\\): "
+        "unacceptable health status UNAVAILABLE",
+        ts_host_port.ToString());
+    ASSERT_STR_MATCHES(err, err_msg_pattern);
+  }
+
+  // Rebalancer starts when specifying the dead tablet server in 'ignored_tservers'.
+  {
+    string out;
+    string err;
+    Status s = RunKuduTool({
+      "cluster",
+      "rebalance",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      "--ignored_tservers=" + cluster_->tablet_server(0)->uuid()
+    }, &out, &err);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
+    ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced (moved 0 replicas)")
+        << "stderr: " << err;
+  }
+}
+
+// Make sure the rebalancer doesn't start if specified too many ignored tservers.
+class RebalanceStartSafetyTest :
+    public AdminCliTest,
+    public ::testing::WithParamInterface<Kudu1097> {
+};
+INSTANTIATE_TEST_CASE_P(, RebalanceStartSafetyTest,
+                        ::testing::Values(Kudu1097::Disable, Kudu1097::Enable));
+TEST_P(RebalanceStartSafetyTest, TooManyIgnoredTservers) {
+  const bool is_343_scheme = (GetParam() == Kudu1097::Enable);
+  const vector<string> kMasterFlags = {
+    Substitute("--raft_prepare_replacement_before_eviction=$0", is_343_scheme),
+  };
+  const vector<string> kTserverFlags = {
+    Substitute("--raft_prepare_replacement_before_eviction=$0", is_343_scheme),
+  };
+
+  FLAGS_num_tablet_servers = 5;
+  NO_FATALS(BuildAndStart(kTserverFlags, kMasterFlags));
+
+  // Assign 3 ignored tservers.
+  vector<string> ignored_tservers;
+  for (int i = 0; i < 3; i++) {
+    auto* ts = cluster_->tablet_server(i);
+    ASSERT_NE(nullptr, ts);
+    ignored_tservers.emplace_back(ts->uuid());
+  }
+
+  // Assign move_replicas_from_ignored_tservers=false.
+  {
+    string out;
+    string err;
+    Status s = RunKuduTool({
+      "cluster",
+      "rebalance",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      "--ignored_tservers=" + JoinStrings(ignored_tservers, ","),
+      "--move_replicas_from_ignored_tservers=false"
+    }, &out, &err);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
+    ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced (moved 0 replicas)")
+        << "stderr: " << err;
+  }
+
+  // Assign move_replicas_from_ignored_tservers=true.
+  {
+    string out;
+    string err;
+    Status s = RunKuduTool({
+      "cluster",
+      "rebalance",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      "--ignored_tservers=" + JoinStrings(ignored_tservers, ","),
+      "--move_replicas_from_ignored_tservers=true"
+    }, &out, &err);
+    ASSERT_TRUE(s.IsRuntimeError()) << ToolRunInfo(s, out, err);
+    ASSERT_STR_CONTAINS(err,
+        "Too many ignored tservers; 2 healthy non-ignored servers exist but 3 are required")
+        << "stderr: " << err;
+  }
+}
+
+class RebalanceIgnoredTserversTest :
+    public AdminCliTest {
+};
+TEST_F(RebalanceIgnoredTserversTest, Basic) {
+  if (!AllowSlowTests()) {
+    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
+    return;
+  }
+
+  FLAGS_num_tablet_servers = 5;
+  // Start a cluster with a single tablet.
+  NO_FATALS(BuildAndStart());
+
+  // Pre-condition: all replicas on ignored tservers should be healthy or recovering.
+  // Here we just ensure the cluster is healthy.
+  ASSERT_EVENTUALLY([&]() {
+    ASSERT_TOOL_OK(
+      "cluster",
+      "ksck",
+      cluster_->master()->bound_rpc_addr().ToString()
+    );
+  });
+
+  // Assign one ignored tserver and move_replicas_from_ignored_tservers=true
+  // without setting it into maintenance mode.
+  {
+    string out;
+    string err;
+    Status s = RunKuduTool({
+      "cluster",
+      "rebalance",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      "--ignored_tservers=" + cluster_->tablet_server(0)->uuid(),
+      "--move_replicas_from_ignored_tservers"
+    }, &out, &err);
+    ASSERT_TRUE(s.IsRuntimeError()) << ToolRunInfo(s, out, err);
+    ASSERT_STR_MATCHES(err, "You should set maintenance mode for tablet server");
+  }
+
+  // Set the ignored tserver into maintenance mode.
+  {
+    string out;
+    string err;
+    Status s = RunKuduTool({
+      "tserver",
+      "state",
+      "enter_maintenance",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      cluster_->tablet_server(0)->uuid()
+    }, &out, &err);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
+  }
+
+  // Run the rebalance again.
+  {
+    string out;
+    string err;
+    Status s = RunKuduTool({
+      "cluster",
+      "rebalance",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      "--ignored_tservers=" + cluster_->tablet_server(0)->uuid(),
+      "--move_replicas_from_ignored_tservers"
+    }, &out, &err);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
+
+    // There would be no replica on the ignored tserver after rebalancing.
+    ASSERT_STR_CONTAINS(out, Substitute("$0 | 0", cluster_->tablet_server(0)->uuid()))
+        << "stderr: " << err;
+    ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced")
+        << "stderr: " << err;
+  }
+
+  // Assign two ignored tservers, one of which is unhealthy,
+  // '-move_replicas_from_ignored_tservers' and
+  // '-output_replica_distribution_details' are both enabled.
+  auto* ts = cluster_->tablet_server(1);
+  ASSERT_NE(nullptr, ts);
+  ts->Shutdown();
+  {
+    string out;
+    string err;
+    Status s = RunKuduTool({
+      "cluster",
+      "rebalance",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      "--ignored_tservers=" + cluster_->tablet_server(0)->uuid() + "," + ts->uuid(),
+      "--move_replicas_from_ignored_tservers",
+      "--output_replica_distribution_details"
+    }, &out, &err);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
+
+    // The output info would not contain the unhealthy server.
+    ASSERT_STR_NOT_CONTAINS(out, ts->uuid());
+    // There would be no replica on the healthy ignored terver after rebalaning.
+    ASSERT_STR_CONTAINS(out, Substitute("$0 | 0", cluster_->tablet_server(0)->uuid()))
+        << "stderr: " << err;
+    ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced")
+        << "stderr: " << err;
+  }
 }
 
 static Status CreateTables(
@@ -387,13 +576,16 @@ TEST_P(RebalanceParamTest, Rebalance) {
     ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
     ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced")
         << "stderr: " << err;
-    // The cluster was un-balanced, so many replicas should have been moved.
+    // The cluster was unbalanced, so many replicas should have been moved.
     ASSERT_STR_NOT_CONTAINS(out, "(moved 0 replicas)");
   }
 
   NO_FATALS(cluster_->AssertNoCrashes());
   NO_FATALS(ClusterVerifier(cluster_.get()).CheckCluster());
 }
+
+// Working around limitations of older libstdc++.
+static const unordered_set<string> kEmptySet = unordered_set<string>();
 
 // Common base for the rebalancer-related test below.
 class RebalancingTest : public tserver::TabletServerIntegrationTestBase {
@@ -417,9 +609,6 @@ class RebalancingTest : public tserver::TabletServerIntegrationTestBase {
  protected:
   static const char* const kExitOnSignalStr;
   static const char* const kTableNamePattern;
-
-  // Working around limitations of older libstdc++.
-  static const unordered_set<string> kEmptySet;
 
   void Prepare(const vector<string>& extra_tserver_flags = {},
                const vector<string>& extra_master_flags = {},
@@ -448,6 +637,7 @@ class RebalancingTest : public tserver::TabletServerIntegrationTestBase {
           tserver_unresponsive_ms_, created_tables_names));
     } else {
       ASSERT_OK(CreateTablesExcludingLocations(empty_locations,
+                                               kTableNamePattern,
                                                created_tables_names));
     }
   }
@@ -456,8 +646,13 @@ class RebalancingTest : public tserver::TabletServerIntegrationTestBase {
   // tablet servers in the specified locations. This is similar to
   // CreateUnbalancedTables() but the set of tablet servers to avoid is defined
   // by the set of the specified locations.
+  //
+  // Note: 'table_name_pattern' is used to describe the table names created by this
+  // function. Each call to this function can create different batch of tables with
+  // this parameter set.
   Status CreateTablesExcludingLocations(
       const unordered_set<string>& excluded_locations,
+      const string& table_name_pattern = kTableNamePattern,
       vector<string>* table_names = nullptr) {
     // Shutdown all tablet servers in the specified locations so no tablet
     // replicas would be hosted by those servers.
@@ -479,7 +674,7 @@ class RebalancingTest : public tserver::TabletServerIntegrationTestBase {
     // are available.
     SleepFor(MonoDelta::FromMilliseconds(5 * tserver_unresponsive_ms_ / 4));
     RETURN_NOT_OK(CreateTables(cluster_.get(), client_.get(), schema_,
-                               kTableNamePattern, num_tables_, rep_factor_,
+                               table_name_pattern, num_tables_, rep_factor_,
                                table_names));
     // Start tablet servers at the excluded locations.
     if (!excluded_locations.empty()) {
@@ -491,6 +686,44 @@ class RebalancingTest : public tserver::TabletServerIntegrationTestBase {
       }
     }
 
+    return Status::OK();
+  }
+
+  // Create tables placing their tablet replicas elsewhere but not at the specified
+  // number of tservers in the specified locations.
+  Status CreateTablesExcludingTserversInLocations(
+      const unordered_map<string, int>& excluded_tserver_by_location,
+      const string& table_name_pattern = kTableNamePattern,
+      vector<string>* table_names = nullptr) {
+    unordered_map<string, int> excluded_tservers = excluded_tserver_by_location;
+    vector<string> excluded_tserver_uuids;
+    // Shutdown some tablet servers in the specified locations so no tablet
+    // replicas would be hosted by those servers.
+    if (!excluded_tservers.empty()) {
+      for (const auto& elem : tablet_servers_) {
+        auto* ts = elem.second;
+        if (ContainsKey(excluded_tservers, ts->location)
+            && excluded_tservers[ts->location] > 0) {
+          excluded_tserver_uuids.push_back(ts->uuid());
+          --excluded_tservers[ts->location];
+          cluster_->tablet_server_by_uuid(ts->uuid())->Shutdown();
+        }
+      }
+    }
+
+    for (const auto& elem : excluded_tservers) {
+      CHECK_EQ(0, elem.second);
+    }
+    // Wait for the catalog manager to understand that not all tablet servers
+    // are available.
+    SleepFor(MonoDelta::FromMilliseconds(5 * tserver_unresponsive_ms_ / 4));
+    RETURN_NOT_OK(CreateTables(cluster_.get(), client_.get(), schema_,
+                               table_name_pattern, num_tables_, rep_factor_,
+                               table_names));
+    // Start tablet servers at the excluded locations.
+    for (const auto& uuid : excluded_tserver_uuids) {
+      RETURN_NOT_OK(cluster_->tablet_server_by_uuid(uuid)->Restart());
+    }
     return Status::OK();
   }
 
@@ -520,9 +753,130 @@ class RebalancingTest : public tserver::TabletServerIntegrationTestBase {
 };
 const char* const RebalancingTest::kExitOnSignalStr = "kudu: process exited on signal";
 const char* const RebalancingTest::kTableNamePattern = "rebalance_test_table_$0";
-const unordered_set<string> RebalancingTest::kEmptySet = unordered_set<string>();
 
 typedef testing::WithParamInterface<Kudu1097> Kudu1097ParamTest;
+
+// If an ignored tablet server went down during the process of copying data,
+// the rebalancer would ignore the health state of the ignored tablet server,
+// and replicas on it, run the rebalancing on the other tablet servers and
+// exit normally.
+class IgnoredTserverGoesDownDuringRebalancingTest : public RebalancingTest {
+ public:
+  IgnoredTserverGoesDownDuringRebalancingTest()
+      : RebalancingTest(/*num_tables=*/ 5) {
+  }
+  bool is_343_scheme() const override {
+    return true;
+  }
+};
+TEST_F(IgnoredTserverGoesDownDuringRebalancingTest, TserverDown) {
+  if (!AllowSlowTests()) {
+    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
+    return;
+  }
+
+  const vector<string> kTserverExtraFlags = {
+    // Slow down tablet copy to make rebalancing step running longer
+    // and become observable via tablet data states output by ksck.
+    "--tablet_copy_download_file_inject_latency_ms=1500",
+
+    "--follower_unavailable_considered_failed_sec=30",
+  };
+  NO_FATALS(Prepare(kTserverExtraFlags));
+
+  // Pre-condition: 'kudu cluster ksck' should be happy with the cluster state
+  // shortly after initial setup.
+  ASSERT_EVENTUALLY([&]() {
+    ASSERT_TOOL_OK(
+      "cluster",
+      "ksck",
+      cluster_->master()->bound_rpc_addr().ToString()
+    );
+  });
+
+  const uint32_t ignored_tserver_idx = 0;
+
+  // Set the ignored tserver into maintenance mode.
+  {
+    string out;
+    string err;
+    Status s = RunKuduTool({
+      "tserver",
+      "state",
+      "enter_maintenance",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      cluster_->tablet_server(ignored_tserver_idx)->uuid()
+    }, &out, &err);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
+  }
+
+  atomic<bool> run(true);
+  // The thread that shuts down the ignored tserver.
+  thread stopper([&]() {
+    while (run && !IsRebalancingInProgress()) {
+      SleepFor(MonoDelta::FromMilliseconds(10));
+    }
+    // All right, it's time to stop the ignored tserver.
+    cluster_->tablet_server(ignored_tserver_idx)->Shutdown();
+  });
+  auto stopper_cleanup = MakeScopedCleanup([&]() {
+    run = false;
+    stopper.join();
+  });
+
+  {
+    string out;
+    string err;
+    const auto s = RunKuduTool({
+      "cluster",
+      "rebalance",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      "--ignored_tservers=" + cluster_->tablet_server(ignored_tserver_idx)->uuid(),
+      "--move_replicas_from_ignored_tservers",
+      // Limiting the number of replicas to move. This is to make the rebalancer
+      // run longer, making sure the rebalancing is in progress when the tablet
+      // server goes down.
+      "--max_moves_per_server=1",
+    }, &out, &err);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
+
+    // The rebalancer tool should not crash.
+    ASSERT_STR_NOT_CONTAINS(s.ToString(), kExitOnSignalStr);
+    // The rebalancer tool would log some information of the unhealthy server.
+    ASSERT_STR_CONTAINS(err, Substitute("ignoring unhealthy tablet server $0",
+                                       cluster_->tablet_server(ignored_tserver_idx)->uuid()));
+
+    // Restart the ignored tablet server
+    ASSERT_OK(cluster_->tablet_server(ignored_tserver_idx)->Restart());
+    NO_FATALS(cluster_->AssertNoCrashes());
+
+    // Report replica distribution.
+    {
+      string out;
+      string err;
+      const auto s = RunKuduTool({
+        "cluster",
+        "rebalance",
+        cluster_->master()->bound_rpc_addr().ToString(),
+        "--output_replica_distribution_details",
+        "--report_only",
+      }, &out, &err);
+      ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
+      // There would be some replicas on the ignored tablet server,
+      // they hasn't been moved to other tablet servers by the rebalancer tool.
+      ASSERT_STR_NOT_CONTAINS(out,
+          Substitute("$0 | $1 | 0",
+                     cluster_->tablet_server(ignored_tserver_idx)->uuid(),
+                     cluster_->tablet_server(ignored_tserver_idx)->bound_rpc_addr().ToString()));
+    }
+  }
+
+  run = false;
+  stopper.join();
+  stopper_cleanup.cancel();
+
+  NO_FATALS(cluster_->AssertNoCrashes());
+}
 
 // Make sure the rebalancer is able to do its job if running concurrently
 // with DDL activity on the cluster.
@@ -814,8 +1168,8 @@ TEST_P(ConcurrentRebalancersTest, TwoConcurrentRebalancers) {
 class TserverGoesDownDuringRebalancingTest : public RebalancingTest,
                                              public Kudu1097ParamTest {
  public:
-  TserverGoesDownDuringRebalancingTest() :
-      RebalancingTest(/*num_tables=*/ 5) {
+  TserverGoesDownDuringRebalancingTest()
+      : RebalancingTest(/*num_tables=*/ 5) {
   }
 
   bool is_343_scheme() const override {
@@ -846,7 +1200,7 @@ TEST_P(TserverGoesDownDuringRebalancingTest, TserverDown) {
       "cluster",
       "ksck",
       cluster_->master()->bound_rpc_addr().ToString()
-    )
+    );
   });
 
   Random r(SeedRandom());
@@ -1106,7 +1460,7 @@ TEST_P(RebalancingDuringElectionStormTest, RoundRobin) {
       "cluster",
       "ksck",
       cluster_->master()->bound_rpc_addr().ToString()
-    )
+    );
   });
 
   // The rebalancer should successfully rebalance the cluster after ksck
@@ -1288,6 +1642,7 @@ TEST_F(LocationAwareRebalancingBasicTest, Basic) {
     ASSERT_OK(itest::GetTableLocations(cluster_->master_proxy(),
                                        table_name, MonoDelta::FromSeconds(30),
                                        master::ANY_REPLICA,
+                                       /*table_id=*/none,
                                        &table_locations));
     const auto tablet_num = table_locations.tablet_locations_size();
     auto total_table_replica_count = 0;
@@ -1296,8 +1651,8 @@ TEST_F(LocationAwareRebalancingBasicTest, Basic) {
       const auto& location = table_locations.tablet_locations(i);
       const auto& tablet_id = location.tablet_id();
       unordered_map<string, int> count_per_location;
-      for (const auto& replica : location.replicas()) {
-        const auto& ts_id = replica.ts_info().permanent_uuid();
+      for (const auto& replica : location.interned_replicas()) {
+        const auto& ts_id = table_locations.ts_infos(replica.ts_info_idx()).permanent_uuid();
         const auto& location = FindOrDie(location_by_ts_id, ts_id);
         ++LookupOrEmplace(&count_per_location, location, 0);
         ++LookupOrEmplace(&total_count_per_location, location, 0);
@@ -1425,6 +1780,295 @@ Placement policy violations:
   // The actual rebalancing should not run.
   ASSERT_STR_NOT_CONTAINS(out, "rebalancing is complete:")
       << ToolRunInfo(s, out, err);
+}
+
+// Parameters for the location-aware rebalancing tests.
+typedef struct {
+  int replication_factor;
+  int tables_num;
+
+  // Information on the distribution of tablet servers among locations.
+  LocationInfo location_info;
+
+  // Locations where tablet servers are shutdown during tablet creation
+  // to achieve non-balanced tablet replica distribution.
+  unordered_set<string> excluded_locations;
+} LaRebalancingParams;
+
+const LaRebalancingParams kLaRebalancingParams[] = {
+  // RF=3, 1 table, 1 location, 3 tablet servers.
+  { 3, 1,
+    {
+      { { "/A" }, 3 }
+    },
+    kEmptySet },
+
+  // RF=3, 3 tables, 2 locations, 4 (3 + 1) tablet servers.
+  { 3, 3,
+    {
+      { { "/A" }, 3 },
+      { { "/B" }, 1 },
+    },
+    { "/B" }
+  },
+
+  // RF=3, 3 tables, 2 locations, 5 (3 + 2) tablet servers.
+  { 3, 3,
+    {
+      { { "/A" }, 3 },
+      { { "/B" }, 2 },
+    },
+    { "/B" }
+  },
+
+  // RF=3, 3 tables, 2 locations, 6 (3 + 3) tablet servers.
+  { 3, 3,
+    {
+      { { "/A" }, 3 },
+      { { "/B" }, 3 },
+    },
+    { "/B" }
+  },
+
+  // RF=3, 3 tables, 3 locations, 6 (3 + 2 + 1) tablet servers.
+  { 3, 3,
+    {
+      { { "/A" }, 3 },
+      { { "/B" }, 2 },
+      { { "/C" }, 1 },
+    },
+    { "/B" }
+  },
+
+  // RF=5, 3 locations, 4 tables, 8 (3 + 2 + 3) tablet servers.
+  { 5, 4,
+    {
+      { { "/A" }, 3 },
+      { { "/B" }, 2 },
+      { { "/C" }, 3 },
+    }, { "/C" }
+  },
+
+  // RF=7, 3 locations, 7 tables, 10 (3 + 4 + 3) tablet servers.
+  { 7, 7,
+    {
+      { { "/A" }, 3 },
+      { { "/B" }, 4 },
+      { { "/C" }, 3 },
+    }, { "/C" }
+  },
+  // RF=2, 4 locations, 4 (1 + 2 + 1) tablet servers.
+  { 2, 3,
+    {
+      { { "/A" }, 1 },
+      { { "/B" }, 2 },
+      { { "/C" }, 1 },
+    }, { "/B" }
+  },
+
+  // RF=4, 4 locations, 6 (3 + 1 + 1 + 1) tablet servers.
+  { 4, 8,
+    {
+      { { "/A" }, 3 },
+      { { "/B" }, 1 },
+      { { "/C" }, 1 },
+      { { "/D" }, 1 },
+    }, { "/B", "/D" }
+  },
+};
+
+// Custom name generator for LA rebalancing scenarios described by
+// LaRebalancingParams.
+static string LaRebalancingTestName(
+    const testing::TestParamInfo<LaRebalancingParams>& info) {
+  ostringstream str;
+  const auto& p = info.param;
+  str << "idx" << info.index
+      << "_rf" << p.replication_factor
+      << "_t" << p.tables_num
+      << "_l";
+  for (const auto& elem : p.location_info) {
+    str << "_" << elem.second;
+  }
+  return str.str();
+}
+
+// This is used by 'operator<<(ostream&, const LaRebalancingParams&)' below.
+ostream& operator <<(ostream& out, const LocationInfo& info) {
+  out << "{ ";
+  for (const auto& elem : info) {
+    out << elem.first << ":" << elem.second << " ";
+  }
+  out << "}";
+  return out;
+}
+
+// This is useful to print the configuration of a failed param test.
+ostream& operator <<(ostream& out, const LaRebalancingParams& info) {
+  out << "{ rep_factor: " << info.replication_factor;
+  out << ", num_tables: " << info.tables_num
+      << ", location_info: ";
+  out << info.location_info;
+  out << " }";
+  return out;
+}
+
+class LocationAwareRebalancingParamTest :
+    public RebalancingTest,
+    public ::testing::WithParamInterface<LaRebalancingParams> {
+ public:
+  LocationAwareRebalancingParamTest()
+      : RebalancingTest(GetParam().tables_num,
+                        GetParam().replication_factor,
+                        std::accumulate(GetParam().location_info.begin(),
+                                        GetParam().location_info.end(), 0,
+                                        [](int sum, const LocationInfo::value_type& e) {
+                                          return sum + e.second;
+                                        })) {
+  }
+
+  bool is_343_scheme() const override {
+    // These tests are for the 3-4-3 replica management scheme only.
+    return true;
+  }
+};
+INSTANTIATE_TEST_CASE_P(, LocationAwareRebalancingParamTest,
+                        ::testing::ValuesIn(kLaRebalancingParams),
+                        LaRebalancingTestName);
+TEST_P(LocationAwareRebalancingParamTest, Rebalance) {
+  if (!AllowSlowTests()) {
+    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
+    return;
+  }
+  const auto& param = GetParam();
+  const auto& location_info = param.location_info;
+  const auto& excluded_locations = param.excluded_locations;
+  const vector<string>& extra_master_flags = {
+    // In this test, the only users of the location assignment test script
+    // are the tablet servers: at this sub-class level it's hard to control
+    // when the test client connects to the external minicluster.
+    "--master_client_location_assignment_enabled=false",
+
+    // This test can exercise scenarios with even replication factor for tables.
+    "--allow_unsafe_replication_factor",
+  };
+  NO_FATALS(Prepare({}, extra_master_flags, location_info, excluded_locations));
+
+  const vector<string> tool_args = {
+    "cluster",
+    "rebalance",
+    cluster_->master()->bound_rpc_addr().ToString(),
+    "--output_replica_distribution_details=true",
+  };
+
+  // The run of the location-aware rebalancing tool should report the cluster
+  // as balanced.
+  {
+    string out;
+    string err;
+    const Status s = RunKuduTool(tool_args, &out, &err);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
+    ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced")
+        << "stderr: " << err;
+    if (!param.excluded_locations.empty()) {
+      // In all location-aware cluster configurations where the replica were
+      // initially placed everywhere but some 'excluded locations', the cluster
+      // was unbalanced, so some replicas should have been moved.
+      ASSERT_STR_NOT_CONTAINS(out, "(moved 0 replicas)");
+    }
+    if (param.replication_factor == 2 || param.location_info.size() == 2 ||
+        (param.location_info.size() == 3 && param.replication_factor == 4)) {
+      // In case some cases it's impossible to satisfy the placement policy's
+      // constraints.
+      ASSERT_STR_CONTAINS(out, "Placement policy violations:\n");
+      ASSERT_STR_CONTAINS(out,
+          "Number of non-complying tables | Number of non-complying tablets\n")
+          << "stderr: " << err;
+      // The "--output_replica_distribution_details" flag is set: the tool
+      // should output details on the violations of the placement policy.
+      ASSERT_STR_CONTAINS(out, "Placement policy violation details:\n")
+          << "stderr: " << err;
+    } else if (param.location_info.size() > 1) {
+      // In other cases all the violations of the placement policy should be
+      // corrected (in the case of a single location the rebalancer does not
+      // check against placement policy violations because that case is treated
+      // the same as a location-unaware, whole cluster rebalancing).
+      ASSERT_STR_CONTAINS(out, "Placement policy violations:\n  none\n");
+    }
+  }
+}
+
+// Basic intra location rebalance tests.
+class IntraLocationRebalancingBasicTest : public RebalancingTest {
+public:
+  IntraLocationRebalancingBasicTest()
+      : RebalancingTest(/*num_tables=*/ 1,
+                        /*rep_factor=*/ 3,
+                        /*num_tservers=*/ 11) {
+  }
+
+  bool is_343_scheme() const override {
+    return true;
+  }
+};
+
+TEST_F(IntraLocationRebalancingBasicTest, LocationsWithEmptyTabletServers) {
+  if (!AllowSlowTests()) {
+    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
+    return;
+  }
+  const string first_table_name_pattern = "rebalance_test_first_table_$0";
+  const string second_table_name_pattern = "rebalance_test_second_table_$0";
+  const LocationInfo location_info = { { "/A", 3 }, { "/B", 3 }, { "/C", 3 },
+                                       { "/D", 2 } };
+  const vector<string>& extra_master_flags = {
+    "--master_client_location_assignment_enabled=false",
+  };
+
+  copy(extra_master_flags.begin(), extra_master_flags.end(),
+       back_inserter(master_flags_));
+
+  FLAGS_num_tablet_servers = num_tservers_;
+  FLAGS_num_replicas = rep_factor_;
+  NO_FATALS(BuildAndStart(tserver_flags_, master_flags_, location_info,
+                          /*create_table=*/ false));
+
+  // Create special intra location imbalance in location "/D". Location "/D"
+  // should only contain tablet replicas of one table.
+  //
+  // Note: there are 3 tablets in each table and the replica factor is 3,
+  // so it's 9 tablet replicas per table.
+  //
+  // 1. Create table0 with tablet replicas in locations /A, /B and /C. Because
+  // the per table location load skew is not greater than 1, it won't trigger
+  // cross location rebalance, so no replica of table0 will be moved.
+  ASSERT_OK(CreateTablesExcludingLocations({"/D"}, first_table_name_pattern));
+  // 2. Create table1 in { "/A", 3 }, { "/B", 3 }, { "/C", 3 }, {"/D", 1 }.
+  // There is an imbalance in location "/D" of table1.
+  ASSERT_OK(CreateTablesExcludingTserversInLocations({ {"/D", 1 } },
+      second_table_name_pattern));
+
+  const vector<string> tool_args = {
+    "cluster",
+    "rebalance",
+    cluster_->master()->bound_rpc_addr().ToString(),
+  };
+
+  // Before the fix added in this changelist the rebalancer would simply
+  // crash while running. See KUDU-2987 for detail informations.
+  {
+    string out;
+    string err;
+    const Status s = RunKuduTool(tool_args, &out, &err);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
+    ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced")
+        << "stderr: " << err;
+
+    // Intra location rebalancing in location "/D" should move one replica
+    // to another tserver, so there is at least one move.
+    ASSERT_STR_NOT_CONTAINS(out, "(moved 0 replicas)");
+    ASSERT_STR_CONTAINS(out, "Placement policy violations:\n  none\n");
+  }
 }
 
 } // namespace tools

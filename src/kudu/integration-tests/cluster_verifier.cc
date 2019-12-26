@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/integration-tests/cluster_verifier.h"
+
 #include <memory>
-#include <ostream>
 #include <string>
 #include <vector>
 
@@ -24,10 +25,9 @@
 #include <gtest/gtest.h>
 
 #include "kudu/client/client.h"
+#include "kudu/client/scan_batch.h"
 #include "kudu/client/shared_ptr.h"
-#include "kudu/client/row_result.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/integration-tests/cluster_verifier.h"
 #include "kudu/integration-tests/log_verifier.h"
 #include "kudu/mini-cluster/mini_cluster.h"
 #include "kudu/tools/ksck.h"
@@ -39,16 +39,15 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+using kudu::cluster::MiniCluster;
+using kudu::tools::Ksck;
+using kudu::tools::KsckCluster;
+using kudu::tools::RemoteKsckCluster;
 using std::string;
 using std::vector;
+using strings::Substitute;
 
 namespace kudu {
-
-using cluster::MiniCluster;
-using strings::Substitute;
-using tools::Ksck;
-using tools::KsckCluster;
-using tools::RemoteKsckCluster;
 
 ClusterVerifier::ClusterVerifier(MiniCluster* cluster)
     : cluster_(cluster),
@@ -136,13 +135,13 @@ Status ClusterVerifier::DoCheckRowCount(const std::string& table_name,
   CHECK_OK(scanner.SetFaultTolerant());
   // Allow a long scan timeout for verification.
   CHECK_OK(scanner.SetTimeoutMillis(60 * 1000));
-  CHECK_OK(scanner.SetProjectedColumns({}));
+  CHECK_OK(scanner.SetProjectedColumnNames({}));
   RETURN_NOT_OK_PREPEND(scanner.Open(), "Unable to open scanner");
   int count = 0;
-  vector<client::KuduRowResult> rows;
+  client::KuduScanBatch batch;
   while (scanner.HasMoreRows()) {
-    RETURN_NOT_OK_PREPEND(scanner.NextBatch(&rows), "Unable to read from scanner");
-    count += rows.size();
+    RETURN_NOT_OK_PREPEND(scanner.NextBatch(&batch), "Unable to read from scanner");
+    count += batch.NumRows();
   }
 
   if (mode == AT_LEAST && count < expected_row_count) {
@@ -153,23 +152,6 @@ Status ClusterVerifier::DoCheckRowCount(const std::string& table_name,
                                          count, expected_row_count));
   }
   return Status::OK();
-}
-
-void ClusterVerifier::CheckRowCountWithRetries(const std::string& table_name,
-                                               ComparisonMode mode,
-                                               int expected_row_count,
-                                               const MonoDelta& timeout) {
-  MonoTime deadline = MonoTime::Now() + timeout;
-  Status s;
-  while (true) {
-    s = DoCheckRowCount(table_name, mode, expected_row_count);
-    if (s.ok() || deadline < MonoTime::Now()) break;
-    LOG(WARNING) << "CheckRowCount() has not succeeded yet: " << s.ToString()
-                 << "... will retry";
-    SleepFor(MonoDelta::FromMilliseconds(100));
-  }
-
-  ASSERT_OK(s);
 }
 
 } // namespace kudu

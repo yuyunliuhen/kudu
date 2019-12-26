@@ -26,6 +26,7 @@ import org.gradle.api.internal.tasks.testing.detection.DefaultTestClassScanner;
 import org.gradle.api.internal.tasks.testing.detection.TestFrameworkDetector;
 import org.gradle.api.logging.Logger;
 import org.gradle.api.logging.Logging;
+import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.InputFiles;
 import org.gradle.api.tasks.OutputDirectory;
 import org.gradle.api.tasks.TaskAction;
@@ -70,9 +71,10 @@ public class DistTestTask extends DefaultTask {
 
   private List<Test> testTasks = Lists.newArrayList();
 
+  private boolean collectTmpDir = false;
+
   /**
-   * Called by the build file to add test tasks to be considered for
-   * dist-tests.
+   * Called by build.gradle to add test tasks to be considered for dist-tests.
    */
   public void addTestTask(Test t) {
     testTasks.add(t);
@@ -82,15 +84,32 @@ public class DistTestTask extends DefaultTask {
           description = "Sets test class to be included, '*' is supported.")
   public DistTestTask setClassPattern(List<String> classPattern) {
     for (Test t : testTasks) {
-      // TODO: this is currently requiring a glob like **/*Foo* instead of just *Foo*
+      // TODO: this requires a glob like **/*Foo* instead of just *Foo*
       t.setIncludes(classPattern);
     }
     return this;
   }
 
+  /**
+   * Not actually used, but gradle mandates that the @Input annotation be placed
+   * on a getter, and we need @Input so that the task is rerun if the value of
+   * the 'collect-tmpdir' option changes.
+   */
+  @Input
+  public boolean getCollectTmpDir() {
+    return collectTmpDir;
+  }
+
+  @Option(option = "collect-tmpdir",
+          description = "Archives the test's temp directory as an artifact if the test fails.")
+  public DistTestTask setCollectTmpdir() {
+    collectTmpDir = true;
+    return this;
+  }
+
   @InputFiles
   public FileCollection getInputClasses() {
-    FileCollection fc = getProject().files(); // Create and empty FileCollection.
+    FileCollection fc = getProject().files(); // Create an empty FileCollection.
     for (Test t : testTasks) {
       fc = fc.plus(t.getCandidateClassFiles());
     }
@@ -108,8 +127,7 @@ public class DistTestTask extends DefaultTask {
         File isolateFile = new File(outputDir, c + ".isolate");
         File isolatedFile = new File(outputDir, c + ".isolated");
         File genJsonFile = new File(outputDir, c + ".gen.json");
-
-        Files.write(genIsolate(outputDir.toPath(), t, c, baseDeps), isolateFile, UTF_8);
+        Files.asCharSink(isolateFile, UTF_8).write(genIsolate(outputDir.toPath(), t, c, baseDeps));
 
         // Write the gen.json
         GenJson gen = new GenJson();
@@ -118,7 +136,7 @@ public class DistTestTask extends DefaultTask {
             "-s", isolatedFile.toString());
         gen.dir = outputDir.toString();
         gen.name = c;
-        Files.write(GSON.toJson(gen), genJsonFile, UTF_8);
+        Files.asCharSink(genJsonFile, UTF_8).write(GSON.toJson(gen));
       }
     }
   }
@@ -129,7 +147,7 @@ public class DistTestTask extends DefaultTask {
    *
    * Note: This currently fails OSX because dump_base_deps use ldd.
    */
-  List<String> getBaseDeps() throws IOException {
+  private List<String> getBaseDeps() throws IOException {
     Process proc = new ProcessBuilder(distTestBin,
         "internal",
         "dump_base_deps")
@@ -140,6 +158,35 @@ public class DistTestTask extends DefaultTask {
       return new Gson().fromJson(new InputStreamReader(is, UTF_8),
           new TypeToken<List<String>>(){}.getType());
     }
+  }
+
+  /**
+   * @return all test result reporting environment variables and their values,
+   *         in a format suitable for consumption by run_dist_test.py.
+   */
+  private List<String> getTestResultReportingEnvironmentVariables() {
+    ImmutableList.Builder<String> args = new ImmutableList.Builder<>();
+    String enabled = System.getenv("KUDU_REPORT_TEST_RESULTS");
+    if (enabled != null && Integer.parseInt(enabled) > 0) {
+      for (String ev : ImmutableList.of("KUDU_REPORT_TEST_RESULTS",
+                                        "BUILD_CONFIG",
+                                        "BUILD_TAG",
+                                        "GIT_REVISION",
+                                        "TEST_RESULT_SERVER")) {
+        String evValue = System.getenv(ev);
+        if (evValue == null || evValue.isEmpty()) {
+          if (ev.equals("TEST_RESULT_SERVER")) {
+            // This one is optional.
+            continue;
+          }
+          throw new RuntimeException(
+              String.format("Required env variable %s is missing", ev));
+        }
+        args.add("-e");
+        args.add(String.format("%s=%s", ev, evValue));
+      }
+    }
+    return args.build();
   }
 
   private String genIsolate(Path isolateFileDir, Test test, String testClass,
@@ -176,9 +223,13 @@ public class DistTestTask extends DefaultTask {
 
     // Build up the actual Java command line to run the test.
     ImmutableList.Builder<String> cmd = new ImmutableList.Builder<>();
-    cmd.add(isolateFileDir.relativize(buildSupportDir.resolve("run_dist_test.py")).toString(),
-            "--test-language=java",
-            "--",
+    cmd.add(isolateFileDir.relativize(buildSupportDir.resolve("run_dist_test.py")).toString());
+    if (collectTmpDir) {
+      cmd.add("--collect-tmpdir");
+    }
+    cmd.add("--test-language=java");
+    cmd.addAll(getTestResultReportingEnvironmentVariables());
+    cmd.add("--",
             "-ea",
             "-cp",
             Joiner.on(":").join(classpath));
@@ -232,7 +283,7 @@ public class DistTestTask extends DefaultTask {
   }
 
   private static class ClassNameCollectingProcessor implements TestClassProcessor {
-    public List<String> classNames = new ArrayList<String>();
+    public List<String> classNames = new ArrayList<>();
 
     @Override
     public void startProcessing(TestResultProcessor testResultProcessor) {
@@ -264,7 +315,7 @@ public class DistTestTask extends DefaultTask {
     private static class Variables {
       public List<String> files = new ArrayList<>();
       public List<String> command;
-    };
+    }
     Variables variables = new Variables();
 
     public String toJson() {

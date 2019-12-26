@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.test.cluster;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -25,7 +26,6 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
@@ -36,15 +36,20 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.kudu.Common;
 import org.apache.kudu.client.HostAndPort;
 import org.apache.kudu.client.ProtobufHelper;
 import org.apache.kudu.test.KuduTestHarness;
+import org.apache.kudu.test.TempDirUtils;
 import org.apache.kudu.tools.Tool.ControlShellRequestPB;
 import org.apache.kudu.tools.Tool.ControlShellResponsePB;
-import org.apache.kudu.tools.Tool.CreateClusterRequestPB.MiniKdcOptionsPB;
 import org.apache.kudu.tools.Tool.CreateClusterRequestPB;
+import org.apache.kudu.tools.Tool.CreateClusterRequestPB.MiniKdcOptionsPB;
 import org.apache.kudu.tools.Tool.DaemonIdentifierPB;
 import org.apache.kudu.tools.Tool.DaemonInfoPB;
 import org.apache.kudu.tools.Tool.GetKDCEnvVarsRequestPB;
@@ -52,14 +57,11 @@ import org.apache.kudu.tools.Tool.GetMastersRequestPB;
 import org.apache.kudu.tools.Tool.GetTServersRequestPB;
 import org.apache.kudu.tools.Tool.KdestroyRequestPB;
 import org.apache.kudu.tools.Tool.KinitRequestPB;
+import org.apache.kudu.tools.Tool.SetDaemonFlagRequestPB;
 import org.apache.kudu.tools.Tool.StartClusterRequestPB;
 import org.apache.kudu.tools.Tool.StartDaemonRequestPB;
 import org.apache.kudu.tools.Tool.StopDaemonRequestPB;
 import org.apache.kudu.util.SecurityUtil;
-import org.apache.yetus.audience.InterfaceAudience;
-import org.apache.yetus.audience.InterfaceStability;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Utility class to start and manipulate Kudu clusters. Depends on precompiled
@@ -68,7 +70,7 @@ import org.slf4j.LoggerFactory;
  */
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
-public class MiniKuduCluster implements AutoCloseable {
+public final class MiniKuduCluster implements AutoCloseable {
 
   private static final Logger LOG = LoggerFactory.getLogger(MiniKuduCluster.class);
 
@@ -101,6 +103,7 @@ public class MiniKuduCluster implements AutoCloseable {
   private final int numTservers;
   private final ImmutableList<String> extraTserverFlags;
   private final ImmutableList<String> extraMasterFlags;
+  private final ImmutableList<String> locationInfo;
   private final String clusterRoot;
 
   private MiniKdcOptionsPB kdcOptionsPb;
@@ -111,6 +114,7 @@ public class MiniKuduCluster implements AutoCloseable {
       int numTservers,
       List<String> extraTserverFlags,
       List<String> extraMasterFlags,
+      List<String> locationInfo,
       MiniKdcOptionsPB kdcOptionsPb,
       String clusterRoot,
       Common.HmsMode hmsMode) {
@@ -119,34 +123,22 @@ public class MiniKuduCluster implements AutoCloseable {
     this.numTservers = numTservers;
     this.extraTserverFlags = ImmutableList.copyOf(extraTserverFlags);
     this.extraMasterFlags = ImmutableList.copyOf(extraMasterFlags);
+    this.locationInfo = ImmutableList.copyOf(locationInfo);
     this.kdcOptionsPb = kdcOptionsPb;
     this.hmsMode = hmsMode;
 
     if (clusterRoot == null) {
-      // If a cluster root was not set, create a  unique temp directory to use.
+      // If a cluster root was not set, create a unique temp directory to use.
       // The mini cluster will clean this directory up on exit.
       try {
-        File tempRoot = getTempDirectory("mini-kudu-cluster");
+        File tempRoot = TempDirUtils.makeTempDirectory("mini-kudu-cluster",
+            TempDirUtils.DeleteOnExit.NO_DELETE_ON_EXIT);
         this.clusterRoot = tempRoot.toString();
       } catch (IOException ex) {
         throw new RuntimeException("Could not create cluster root directory", ex);
       }
     } else {
       this.clusterRoot = clusterRoot;
-    }
-  }
-
-  // Match the C++ MiniCluster test functionality for overriding the tmp directory used.
-  // See MakeClusterRoot in src/kudu/tools/tool_action_test.cc.
-  // If the TEST_TMPDIR environment variable is defined that directory will be used
-  // instead of the default temp directory.
-  private File getTempDirectory(String prefix) throws IOException  {
-    String testTmpdir = System.getenv("TEST_TMPDIR");
-    if (testTmpdir != null) {
-      LOG.info("Using the temp directory defined by TEST_TMPDIR: " + testTmpdir);
-      return Files.createTempDirectory(Paths.get(testTmpdir), prefix).toFile();
-    } else {
-      return Files.createTempDirectory(prefix).toFile();
     }
   }
 
@@ -185,17 +177,19 @@ public class MiniKuduCluster implements AutoCloseable {
    * Starts this Kudu cluster.
    * @throws IOException if something went wrong in transit
    */
-  private void start() throws IOException {
+  private synchronized void start() throws IOException {
     Preconditions.checkArgument(numMasters > 0, "Need at least one master");
 
     // Start the control shell and the communication channel to it.
-    List<String> commandLine = Lists.newArrayList(
-        KuduBinaryLocator.findBinary("kudu"),
-        "test",
-        "mini_cluster",
-        "--serialization=pb");
+    KuduBinaryLocator.ExecutableInfo exeInfo = KuduBinaryLocator.findBinary("kudu");
+    List<String> commandLine = Lists.newArrayList(exeInfo.exePath(),
+                                                  "test",
+                                                  "mini_cluster",
+                                                  "--serialization=pb");
     LOG.info("Starting process: {}", commandLine);
     ProcessBuilder processBuilder = new ProcessBuilder(commandLine);
+    processBuilder.environment().putAll(exeInfo.environment());
+
     miniCluster = processBuilder.start();
     miniClusterStdin = new DataOutputStream(miniCluster.getOutputStream());
     miniClusterStdout = new DataInputStream(miniCluster.getInputStream());
@@ -209,19 +203,35 @@ public class MiniKuduCluster implements AutoCloseable {
     miniClusterErrorPrinter.setName("cluster stderr printer");
     miniClusterErrorPrinter.start();
 
+    CreateClusterRequestPB.Builder createClusterRequestBuilder = CreateClusterRequestPB.newBuilder()
+        .setNumMasters(numMasters)
+        .setNumTservers(numTservers)
+        .setEnableKerberos(enableKerberos)
+        .setHmsMode(hmsMode)
+        .addAllExtraMasterFlags(extraMasterFlags)
+        .addAllExtraTserverFlags(extraTserverFlags)
+        .setMiniKdcOptions(kdcOptionsPb)
+        .setClusterRoot(clusterRoot);
+
+    // Set up the location mapping command flag if there is location info.
+    if (!locationInfo.isEmpty()) {
+      List<String> locationMappingCmd = new ArrayList<>();
+      locationMappingCmd.add(getClass().getResource("/assign-location.py").getFile());
+      String locationMappingCmdPath =
+          Paths.get(clusterRoot, "location-assignment.state").toString();
+      locationMappingCmd.add("--state_store=" + locationMappingCmdPath);
+      for (String location : locationInfo) {
+        locationMappingCmd.add("--map " + location);
+      }
+      String locationMappingCmdFlag = "--location_mapping_cmd=" +
+          Joiner.on(" ").join(locationMappingCmd);
+      createClusterRequestBuilder.addExtraMasterFlags(locationMappingCmdFlag);
+    }
+
     // Create and start the cluster.
     sendRequestToCluster(
         ControlShellRequestPB.newBuilder()
-        .setCreateCluster(CreateClusterRequestPB.newBuilder()
-            .setNumMasters(numMasters)
-            .setNumTservers(numTservers)
-            .setEnableKerberos(enableKerberos)
-            .setHmsMode(hmsMode)
-            .addAllExtraMasterFlags(extraMasterFlags)
-            .addAllExtraTserverFlags(extraTserverFlags)
-            .setMiniKdcOptions(kdcOptionsPb)
-            .setClusterRoot(clusterRoot)
-            .build())
+        .setCreateCluster(createClusterRequestBuilder.build())
         .build());
     sendRequestToCluster(
         ControlShellRequestPB.newBuilder()
@@ -278,14 +288,14 @@ public class MiniKuduCluster implements AutoCloseable {
    * @return the list of master servers
    */
   public List<HostAndPort> getMasterServers() {
-    return new ArrayList(masterServers.keySet());
+    return new ArrayList<>(masterServers.keySet());
   }
 
   /**
    * @return the list of tablet servers
    */
   public List<HostAndPort> getTabletServers() {
-    return new ArrayList(tabletServers.keySet());
+    return new ArrayList<>(tabletServers.keySet());
   }
 
   /**
@@ -413,6 +423,44 @@ public class MiniKuduCluster implements AutoCloseable {
   }
 
   /**
+   * Set flag for the specified master.
+   *
+   * @param hp unique host and port identifying the target master
+   * @throws IOException if something went wrong in transit
+   */
+  public void setMasterFlag(HostAndPort hp, String flag, String value)
+      throws IOException {
+    DaemonInfo d = getMasterServer(hp);
+    LOG.info("Setting flag for master at {}", hp);
+    sendRequestToCluster(ControlShellRequestPB.newBuilder()
+        .setSetDaemonFlag(SetDaemonFlagRequestPB.newBuilder()
+            .setId(d.id)
+            .setFlag(flag)
+            .setValue(value)
+            .build())
+        .build());
+  }
+
+  /**
+   * Set flag for the specified tablet server.
+   *
+   * @param hp unique host and port identifying the target tablet server
+   * @throws IOException if something went wrong in transit
+   */
+  public void setTServerFlag(HostAndPort hp, String flag, String value)
+      throws IOException {
+    DaemonInfo d = getTabletServer(hp);
+    LOG.info("Setting flag for tserver at {}", hp);
+    sendRequestToCluster(ControlShellRequestPB.newBuilder()
+        .setSetDaemonFlag(SetDaemonFlagRequestPB.newBuilder()
+            .setId(d.id)
+            .setFlag(flag)
+            .setValue(value)
+            .build())
+        .build());
+  }
+
+  /**
    * Removes all credentials for all principals from the Kerberos credential cache.
    */
   public void kdestroy() throws IOException {
@@ -434,8 +482,6 @@ public class MiniKuduCluster implements AutoCloseable {
         .build());
   }
 
-
-  /** {@override} */
   @Override
   public void close() {
     shutdown();
@@ -444,7 +490,7 @@ public class MiniKuduCluster implements AutoCloseable {
   /**
    * Shuts down a Kudu cluster.
    */
-  public void shutdown() {
+  public synchronized void shutdown() {
     // Closing stdin should cause the control shell process to terminate.
     if (miniClusterStdin != null) {
       try {
@@ -553,6 +599,7 @@ public class MiniKuduCluster implements AutoCloseable {
     private boolean enableKerberos = false;
     private final List<String> extraTabletServerFlags = new ArrayList<>();
     private final List<String> extraMasterServerFlags = new ArrayList<>();
+    private final List<String> locationInfo = new ArrayList<>();
     private String clusterRoot = null;
 
     private MiniKdcOptionsPB.Builder kdcOptionsPb = MiniKdcOptionsPB.newBuilder();
@@ -600,6 +647,21 @@ public class MiniKuduCluster implements AutoCloseable {
       return this;
     }
 
+    /**
+     * Adds one location to the minicluster configuration, consisting of a
+     * location and the total number of tablet servers and clients that
+     * can be assigned to the location. The 'location' string should be
+     * in the form 'location:number'. For example,
+     *     "/L0:2"
+     * will add a location "/L0" that will accept up to two clients or
+     * tablet servers registered in it.
+     * @return this instance
+     */
+    public MiniKuduClusterBuilder addLocation(String location) {
+      locationInfo.add(location);
+      return this;
+    }
+
     public MiniKuduClusterBuilder kdcTicketLifetime(String lifetime) {
       this.kdcOptionsPb.setTicketLifetime(lifetime);
       return this;
@@ -628,7 +690,7 @@ public class MiniKuduCluster implements AutoCloseable {
       MiniKuduCluster cluster =
           new MiniKuduCluster(enableKerberos,
               numMasterServers, numTabletServers,
-              extraTabletServerFlags, extraMasterServerFlags,
+              extraTabletServerFlags, extraMasterServerFlags, locationInfo,
               kdcOptionsPb.build(), clusterRoot, hmsMode);
       try {
         cluster.start();

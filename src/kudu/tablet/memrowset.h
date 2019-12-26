@@ -40,6 +40,7 @@
 #include "kudu/tablet/concurrent_btree.h"
 #include "kudu/tablet/rowset.h"
 #include "kudu/tablet/rowset_metadata.h"
+#include "kudu/util/atomic.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/monotime.h"
@@ -146,12 +147,6 @@ class MRSRow {
 
   // Return true if this row is a "ghost" -- i.e its most recent mutation is
   // a deletion.
-  //
-  // NOTE: this call is O(n) in the number of mutations, since it has to walk
-  // the linked list all the way to the end, checking if each mutation is a
-  // DELETE or REINSERT. We expect the list is usually short (low-update use
-  // cases) but if this becomes a bottleneck, we could cache the 'ghost' status
-  // as a bit inside the row header.
   bool IsGhost() const;
 
  private:
@@ -167,14 +162,15 @@ class MRSRow {
   }
 
   struct Header {
-    // Timestamp for the transaction which inserted this row. If a scanner with an
-    // older snapshot sees this row, it will be ignored.
-    Timestamp insertion_timestamp;
+      // Timestamp for the transaction which inserted this row. If a scanner with an
+      // older snapshot sees this row, it will be ignored.
+      Timestamp insertion_timestamp;
 
-    // Pointer to the first mutation which has been applied to this row. Each
-    // mutation is an instance of the Mutation class, making up a singly-linked
-    // list for any mutations applied to the row.
-    Mutation* redo_head;
+      // Pointers to the first and last mutations that have been applied to this row.
+      // Together they comprise a singly-linked list of all of the row's mutations,
+      // with the head and tail used for efficient iteration and insertion respectively.
+      Mutation* redo_head;
+      Mutation* redo_tail;
   };
 
   Header *header_;
@@ -259,6 +255,11 @@ class MemRowSet : public RowSet,
     return Status::OK();
   }
 
+  virtual Status CountLiveRows(uint64_t* count) const override {
+    *count = live_row_count_.Load();
+    return Status::OK();
+  }
+
   virtual Status GetBounds(std::string *min_encoded_key,
                            std::string *max_encoded_key) const override;
 
@@ -324,7 +325,7 @@ class MemRowSet : public RowSet,
 
   // Alias to conform to DiskRowSet interface
   virtual Status NewRowIterator(const RowIteratorOptions& opts,
-                                gscoped_ptr<RowwiseIterator>* out) const override;
+                                std::unique_ptr<RowwiseIterator>* out) const override;
 
   // Create compaction input.
   virtual Status NewCompactionInput(const Schema* projection,
@@ -456,6 +457,9 @@ class MemRowSet : public RowSet,
   // and thus should not be scheduled for further compactions.
   std::atomic<bool> has_been_compacted_;
 
+  // Number of live rows in this MRS.
+  AtomicInt<uint64_t> live_row_count_;
+
   DISALLOW_COPY_AND_ASSIGN(MemRowSet);
 };
 
@@ -561,7 +565,8 @@ class MemRowSet::Iterator : public RowwiseIterator {
   Status FetchRows(RowBlock* dst, size_t* fetched);
 
   // Walks the mutations in 'mutation_head', applying relevant ones to 'dst_row'
-  // (performing any allocations out of 'dst_arena').
+  // (performing any allocations out of 'dst_arena'). 'insert_excluded' is true
+  // if the row's original insertion took place outside the iterator's time range.
   //
   // On success, 'apply_status' summarizes the application process.
   enum ApplyStatus {
@@ -575,10 +580,16 @@ class MemRowSet::Iterator : public RowwiseIterator {
     // At least one mutation was applied to the row, and the row's final state
     // was deleted (i.e. the last mutation was a DELETE).
     APPLIED_AND_DELETED,
+
+    // Some mutations were applied, but the sequence of applied mutations was
+    // such that clients should never see this row in their output (i.e. the row
+    // was inserted and deleted in the same timestamp).
+    APPLIED_AND_UNOBSERVABLE,
   };
   Status ApplyMutationsToProjectedRow(const Mutation* mutation_head,
                                       RowBlockRow* dst_row,
                                       Arena* dst_arena,
+                                      bool insert_excluded,
                                       ApplyStatus* apply_status);
 
   const std::shared_ptr<const MemRowSet> memrowset_;

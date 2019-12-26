@@ -40,6 +40,7 @@ ADD_EXPORTABLE_LIBRARY(wire_protocol_proto
   NONLINK_DEPS ${WIRE_PROTOCOL_PROTO_TGTS})
 
 set(COMMON_SRCS
+  columnblock.cc
   column_predicate.cc
   encoded_key.cc
   generic_iterators.cc
@@ -80,7 +81,7 @@ ADD_EXPORTABLE_LIBRARY(kudu_common
 
 SET_KUDU_TEST_LINK_LIBS(kudu_common)
 ADD_KUDU_TEST(columnblock-test)
-ADD_KUDU_TEST(column_predicate-test)
+ADD_KUDU_TEST(column_predicate-test NUM_SHARDS 4)
 ADD_KUDU_TEST(encoded_key-test)
 ADD_KUDU_TEST(generic_iterators-test)
 ADD_KUDU_TEST(id_mapping-test)
@@ -95,4 +96,4 @@ ADD_KUDU_TEST(scan_spec-test)
 ADD_KUDU_TEST(schema-test)
 ADD_KUDU_TEST(table_util-test)
 ADD_KUDU_TEST(types-test)
-ADD_KUDU_TEST(wire_protocol-test)
+ADD_KUDU_TEST(wire_protocol-test NUM_SHARDS 4)

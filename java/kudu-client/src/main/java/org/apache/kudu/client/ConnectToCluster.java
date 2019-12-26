@@ -31,8 +31,10 @@ import com.google.common.collect.Lists;
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.jboss.netty.util.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import org.apache.kudu.Common.HostPortPB;
 import org.apache.kudu.consensus.Metadata.RaftPeerPB.Role;
 import org.apache.kudu.master.Master.ConnectToMasterResponsePB;
@@ -60,7 +62,7 @@ final class ConnectToCluster {
 
   // Exceptions received so far: kept for debugging purposes.
   private final List<Exception> exceptionsReceived =
-      Collections.synchronizedList(new ArrayList<Exception>());
+      Collections.synchronizedList(new ArrayList<>());
 
   /**
    * If we've received a response from a master which indicates the full
@@ -93,16 +95,15 @@ final class ConnectToCluster {
       final KuduTable masterTable,
       final RpcProxy masterProxy,
       KuduRpc<?> parentRpc,
+      Timer timer,
       long defaultTimeoutMs) {
     // TODO: Handle the situation when multiple in-flight RPCs all want to query the masters,
     // basically reuse in some way the master permits.
-    final ConnectToMasterRequest rpc = new ConnectToMasterRequest(masterTable);
-    if (parentRpc != null) {
-      rpc.setTimeoutMillis(parentRpc.deadlineTracker.getMillisBeforeDeadline());
-      rpc.setParentRpc(parentRpc);
-    } else {
-      rpc.setTimeoutMillis(defaultTimeoutMs);
-    }
+    long timeoutMillis = parentRpc == null ? defaultTimeoutMs :
+                                             parentRpc.timeoutTracker.getMillisBeforeTimeout();
+    final ConnectToMasterRequest rpc =
+        new ConnectToMasterRequest(masterTable, timer, timeoutMillis);
+    rpc.setParentRpc(parentRpc);
     Deferred<ConnectToMasterResponsePB> d = rpc.getDeferred();
     rpc.attempt++;
     masterProxy.sendRpc(rpc);
@@ -168,10 +169,10 @@ final class ConnectToCluster {
     List<Deferred<ConnectToMasterResponsePB>> deferreds = new ArrayList<>();
     for (HostAndPort hostAndPort : masterAddrs) {
       Deferred<ConnectToMasterResponsePB> d;
-      RpcProxy proxy = masterTable.getAsyncClient().newMasterRpcProxy(
-          hostAndPort, credentialsPolicy);
+      AsyncKuduClient client = masterTable.getAsyncClient();
+      RpcProxy proxy = client.newMasterRpcProxy(hostAndPort, credentialsPolicy);
       if (proxy != null) {
-        d = connectToMaster(masterTable, proxy, parentRpc, defaultTimeoutMs);
+        d = connectToMaster(masterTable, proxy, parentRpc, client.getTimer(), defaultTimeoutMs);
       } else {
         String message = "Couldn't resolve this master's address " + hostAndPort.toString();
         LOG.warn(message);

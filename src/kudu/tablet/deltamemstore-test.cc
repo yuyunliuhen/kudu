@@ -138,13 +138,12 @@ class TestDeltaMemStore : public KuduTest {
     RowIteratorOptions opts;
     opts.projection = &single_col_projection;
     opts.snap_to_include = snapshot;
-    DeltaIterator* raw_iter;
-    Status s = dms_->NewDeltaIterator(opts, &raw_iter);
+    unique_ptr<DeltaIterator> iter;
+    Status s = dms_->NewDeltaIterator(opts, &iter);
     if (s.IsNotFound()) {
       return;
     }
     ASSERT_OK(s);
-    gscoped_ptr<DeltaIterator> iter(raw_iter);
     ASSERT_OK(iter->Init(nullptr));
     ASSERT_OK(iter->SeekToOrdinal(row_idx));
     ASSERT_OK(iter->PrepareBatch(cb->nrows(), DeltaIterator::PREPARE_FOR_APPLY));
@@ -549,14 +548,13 @@ TEST_F(TestDeltaMemStore, TestIteratorDoesUpdates) {
   opts.projection = &schema_;
   // TODO(todd): test snapshot reads from different points
   opts.snap_to_include = MvccSnapshot(mvcc_);
-  DeltaIterator* raw_iter;
-  Status s = dms_->NewDeltaIterator(opts, &raw_iter);
+
+  unique_ptr<DeltaIterator> iter;
+  Status s = dms_->NewDeltaIterator(opts, &iter);
   if (s.IsNotFound()) {
     FAIL() << "Iterator fell outside of the range of the snapshot";
   }
   ASSERT_OK(s);
-
-  unique_ptr<DeltaIterator> iter(raw_iter);
   ASSERT_OK(iter->Init(nullptr));
 
   int block_start_row = 50;
@@ -599,14 +597,12 @@ TEST_F(TestDeltaMemStore, TestCollectMutations) {
   RowIteratorOptions opts;
   opts.projection = &schema_;
   opts.snap_to_include = MvccSnapshot(mvcc_);
-  DeltaIterator* raw_iter;
-  Status s =  dms_->NewDeltaIterator(opts, &raw_iter);
+  unique_ptr<DeltaIterator> iter;
+  Status s =  dms_->NewDeltaIterator(opts, &iter);
   if (s.IsNotFound()) {
     FAIL() << "Iterator fell outside of the range of the snapshot";
   }
   ASSERT_OK(s);
-
-  unique_ptr<DeltaIterator> iter(raw_iter);
   ASSERT_OK(iter->Init(nullptr));
   ASSERT_OK(iter->SeekToOrdinal(0));
   ASSERT_OK(iter->PrepareBatch(kBatchSize, DeltaIterator::PREPARE_FOR_COLLECT));
@@ -650,23 +646,49 @@ TEST_F(TestDeltaMemStore, TestFuzz) {
   const int kNumDeltas = 10000;
   const std::pair<uint64_t, uint64_t> kTimestampRange(0, 100);
 
-  // Build a schema with kNumColumns columns.
+  // Build a schema with kNumColumns columns, some of which are nullable.
+  Random prng(SeedRandom());
   SchemaBuilder sb;
   for (int i = 0; i < kNumColumns; i++) {
-    ASSERT_OK(sb.AddColumn(Substitute("col$0", i), UINT32));
+    if (prng.Uniform(10) == 0) {
+      ASSERT_OK(sb.AddNullableColumn(Substitute("col$0", i), UINT32));
+    } else {
+      ASSERT_OK(sb.AddColumn(Substitute("col$0", i), UINT32));
+    }
   }
   Schema schema(sb.Build());
 
-  Random r(SeedRandom());
   MirroredDeltas<DeltaTypeSelector<REDO>> deltas(&schema);
 
   shared_ptr<DeltaMemStore> dms;
   ASSERT_OK(CreateRandomDMS(
-      schema, &r, kNumDeltas, { 0, kNumRows }, kTimestampRange, &deltas, &dms));
+      schema, &prng, kNumDeltas, { 0, kNumRows }, kTimestampRange, &deltas, &dms));
 
   NO_FATALS(RunDeltaFuzzTest<DeltaTypeSelector<REDO>>(
-      *dms, &r, &deltas, kTimestampRange,
+      *dms, &prng, &deltas, kTimestampRange,
       /*test_filter_column_ids_and_collect_deltas=*/false));
+}
+
+TEST_F(TestDeltaMemStore, TestDeletedRowCount) {
+  const int kNumUpdates = 10000;
+
+  faststring buf;
+  RowChangeListEncoder update(&buf);
+  for (rowid_t row_idx = 0; row_idx < kNumUpdates; row_idx++) {
+    // UPDATE.
+    uint32_t new_val = row_idx;
+    update.Reset();
+    update.AddColumnUpdate(schema_.column(kIntColumn), schema_.column_id(kIntColumn), &new_val);
+    ASSERT_OK(dms_->Update(Timestamp(row_idx), row_idx, RowChangeList(buf), op_id_));
+
+    // DELETE.
+    if (row_idx % 2 == 0) {
+      update.Reset();
+      update.SetToDelete();
+      ASSERT_OK(dms_->Update(Timestamp(row_idx + 1), row_idx, RowChangeList(buf), op_id_));
+    }
+  }
+  ASSERT_EQ(kNumUpdates / 2, dms_->deleted_row_count());
 }
 
 } // namespace tablet

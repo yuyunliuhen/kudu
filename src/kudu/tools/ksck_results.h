@@ -19,16 +19,15 @@
 #include <cstdint>
 #include <iosfwd>
 #include <map>
-#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
-#include <glog/logging.h>
 
-#include "kudu/tablet/metadata.pb.h"
+#include "kudu/master/master.pb.h"
+#include "kudu/rebalance/cluster_status.h"
 #include "kudu/tablet/tablet.pb.h"  // IWYU pragma: keep
 #include "kudu/util/status.h"
 
@@ -36,188 +35,6 @@ namespace kudu {
 namespace tools {
 
 class KsckResultsPB;
-
-// The result of health check on a tablet.
-// Also used to indicate the health of a table, since the health of a table is
-// the health of its least healthy tablet.
-enum class KsckCheckResult {
-  // The tablet is healthy.
-  HEALTHY,
-
-  // The tablet has on-going tablet copies.
-  RECOVERING,
-
-  // The tablet has fewer replicas than its table's replication factor and
-  // has no on-going tablet copies.
-  UNDER_REPLICATED,
-
-  // The tablet is missing a majority of its replicas and is unavailable for
-  // writes. If a majority cannot be brought back online, then the tablet
-  // requires manual intervention to recover.
-  UNAVAILABLE,
-
-  // There was a discrepancy among the tablets' consensus configs and the master's.
-  CONSENSUS_MISMATCH,
-};
-
-const char* const KsckCheckResultToString(KsckCheckResult cr);
-
-// Possible types of consensus configs.
-enum class KsckConsensusConfigType {
-  // A config reported by the master.
-  MASTER,
-  // A config that has been committed.
-  COMMITTED,
-  // A config that has not yet been committed.
-  PENDING,
-};
-
-// Representation of a consensus state.
-struct KsckConsensusState {
-  KsckConsensusState() = default;
-  KsckConsensusState(KsckConsensusConfigType type,
-                     boost::optional<int64_t> term,
-                     boost::optional<int64_t> opid_index,
-                     boost::optional<std::string> leader_uuid,
-                     const std::vector<std::string>& voters,
-                     const std::vector<std::string>& non_voters)
-    : type(type),
-      term(std::move(term)),
-      opid_index(std::move(opid_index)),
-      leader_uuid(std::move(leader_uuid)),
-      voter_uuids(voters.cbegin(), voters.cend()),
-      non_voter_uuids(non_voters.cbegin(), non_voters.cend()) {
-   // A consensus state must have a term unless it's one sourced from the master.
-   CHECK(type == KsckConsensusConfigType::MASTER || term);
-  }
-
-  // Two KsckConsensusState structs match if they have the same
-  // leader_uuid, the same set of peers, and one of the following holds:
-  // - at least one of them is of type MASTER
-  // - they are configs of the same type and they have the same term
-  bool Matches(const KsckConsensusState &other) const {
-    bool same_leader_and_peers =
-        leader_uuid == other.leader_uuid &&
-        voter_uuids == other.voter_uuids &&
-        non_voter_uuids == other.non_voter_uuids;
-    if (type == KsckConsensusConfigType::MASTER ||
-        other.type == KsckConsensusConfigType::MASTER) {
-      return same_leader_and_peers;
-    }
-    return type == other.type && term == other.term && same_leader_and_peers;
-  }
-
-  KsckConsensusConfigType type;
-  boost::optional<int64_t> term;
-  boost::optional<int64_t> opid_index;
-  boost::optional<std::string> leader_uuid;
-  std::set<std::string> voter_uuids;
-  std::set<std::string> non_voter_uuids;
-};
-
-// Represents the health of a server.
-enum class KsckServerHealth {
-  // The server is healthy.
-  HEALTHY,
-
-  // The server rejected attempts to communicate as unauthorized.
-  UNAUTHORIZED,
-
-  // The server can't be contacted.
-  UNAVAILABLE,
-
-  // The server reported an unexpected UUID.
-  WRONG_SERVER_UUID,
-};
-
-// Return a string representation of 'sh'.
-const char* const ServerHealthToString(KsckServerHealth sh);
-
-// Returns an int signifying the "unhealthiness level" of 'sh'.
-// 0 means healthy; higher values are unhealthier.
-// Useful for sorting or comparing.
-int ServerHealthScore(KsckServerHealth sh);
-
-// A summary of a server health check.
-struct KsckServerHealthSummary {
-  std::string uuid;
-  std::string address;
-  std::string ts_location;
-  boost::optional<std::string> version;
-  KsckServerHealth health = KsckServerHealth::HEALTHY;
-  Status status = Status::OK();
-};
-
-// A summary of the state of a table.
-struct KsckTableSummary {
-  std::string id;
-  std::string name;
-  int replication_factor = 0;
-  int healthy_tablets = 0;
-  int recovering_tablets = 0;
-  int underreplicated_tablets = 0;
-  int consensus_mismatch_tablets = 0;
-  int unavailable_tablets = 0;
-
-  int TotalTablets() const {
-    return healthy_tablets + recovering_tablets + underreplicated_tablets +
-        consensus_mismatch_tablets + unavailable_tablets;
-  }
-
-  int UnhealthyTablets() const {
-    return TotalTablets() - healthy_tablets;
-  }
-
-  // Summarize the table's status with a KsckCheckResult.
-  // A table's status is determined by the health of the least healthy tablet.
-  KsckCheckResult TableStatus() const {
-    if (unavailable_tablets > 0) {
-      return KsckCheckResult::UNAVAILABLE;
-    }
-    if (consensus_mismatch_tablets > 0) {
-      return KsckCheckResult::CONSENSUS_MISMATCH;
-    }
-    if (underreplicated_tablets > 0) {
-      return KsckCheckResult::UNDER_REPLICATED;
-    }
-    if (recovering_tablets > 0) {
-      return KsckCheckResult::RECOVERING;
-    }
-    return KsckCheckResult::HEALTHY;
-  }
-};
-
-// Types of Kudu servers.
-enum class KsckServerType {
-  MASTER,
-  TABLET_SERVER,
-};
-
-// Return a string representation of 'type'.
-const char* const ServerTypeToString(KsckServerType type);
-
-// A summary of the state of a tablet replica.
-struct KsckReplicaSummary {
-  std::string ts_uuid;
-  boost::optional<std::string> ts_address;
-  bool ts_healthy = false;
-  bool is_leader = false;
-  bool is_voter = false;
-  tablet::TabletStatePB state = tablet::UNKNOWN;
-  boost::optional<tablet::TabletStatusPB> status_pb;
-  boost::optional<KsckConsensusState> consensus_state;
-};
-
-// A summary of the state of a tablet.
-struct KsckTabletSummary {
-  std::string id;
-  std::string table_id;
-  std::string table_name;
-  KsckCheckResult result;
-  std::string status;
-  KsckConsensusState master_cstate;
-  std::vector<KsckReplicaSummary> replicas;
-};
 
 // The result of a checksum on a tablet replica.
 struct KsckReplicaChecksum {
@@ -257,7 +74,24 @@ enum class PrintMode {
   PLAIN_FULL,
 };
 
-typedef std::map<std::string, KsckConsensusState> KsckConsensusStateMap;
+// It's a convenient method to use `struct ... enum ...` here to keep
+// in a standalone namespace and support some bit operators on this type.
+struct PrintSections {
+  enum Values {
+    NONE = 0,
+    MASTER_SUMMARIES = 1 << 0,
+    TSERVER_STATES = 1 << 1,
+    TSERVER_SUMMARIES = 1 << 2,
+    VERSION_SUMMARIES = 1 << 3,
+    TABLET_SUMMARIES = 1 << 4,
+    TABLE_SUMMARIES = 1 << 5,
+    CHECKSUM_RESULTS = 1 << 6,
+    TOTAL_COUNT = 1 << 7,
+
+    // Print all sections above.
+    ALL_SECTIONS = 0b011111111
+  };
+};
 
 // A flag and its value.
 typedef std::pair<std::string, std::string> KsckFlag;
@@ -268,8 +102,16 @@ typedef std::map<KsckFlag, std::vector<std::string>> KsckFlagToServersMap;
 // Convenience map flag name -> flag tags.
 typedef std::unordered_map<std::string, std::string> KsckFlagTagsMap;
 
+// Convenience map version -> servers.
+typedef std::map<std::string, std::vector<std::string>> KsckVersionToServersMap;
+
+typedef std::map<std::string, master::TServerStatePB> KsckTServerStateMap;
+
 // Container for all the results of a series of ksck checks.
 struct KsckResults {
+
+  cluster_summary::ClusterStatus cluster_status;
+
   // Collection of error status for failed checks. Used to print out a final
   // summary of all failed checks.
   // All checks passed if and only if this vector is empty.
@@ -280,9 +122,8 @@ struct KsckResults {
   // so they do not cause ksck to report an error.
   std::vector<Status> warning_messages;
 
-  // Health summaries for master and tablet servers.
-  std::vector<KsckServerHealthSummary> master_summaries;
-  std::vector<KsckServerHealthSummary> tserver_summaries;
+  // Version summaries for master and tablet servers.
+  KsckVersionToServersMap version_summaries;
 
   // Information about the flags of masters and tablet servers.
   KsckFlagToServersMap master_flag_to_servers_map;
@@ -290,68 +131,70 @@ struct KsckResults {
   KsckFlagToServersMap tserver_flag_to_servers_map;
   KsckFlagTagsMap tserver_flag_tags_map;
 
-  // Information about the master consensus configuration.
-  std::vector<std::string> master_uuids;
-  bool master_consensus_conflict = false;
-  KsckConsensusStateMap master_consensus_state_map;
-
-  // Detailed information about each table and tablet.
-  // Tablet information includes consensus state.
-  std::vector<KsckTabletSummary> tablet_summaries;
-  std::vector<KsckTableSummary> table_summaries;
+  // Any special states that the tablet servers may be in.
+  KsckTServerStateMap ts_states;
 
   // Collected results of the checksum scan.
   KsckChecksumResults checksum_results;
 
-  // Print this KsckResults to 'out', according to the PrintMode 'mode'.
-  Status PrintTo(PrintMode mode, std::ostream& out);
+  // Print this KsckResults to 'out' according to the PrintMode 'mode'.
+  // The sections printed will be limited according to the value of 'sections'.
+  Status PrintTo(PrintMode mode, int sections, std::ostream& out);
 
   // Print this KsckResults to 'out' in JSON format.
   // 'mode' must be PrintMode::JSON_PRETTY or PrintMode::JSON_COMPACT.
-  Status PrintJsonTo(PrintMode mode, std::ostream& out) const;
+  // The sections printed will be limited according to the value of 'sections'.
+  Status PrintJsonTo(PrintMode mode, int sections, std::ostream& out) const;
 
-  void ToPb(KsckResultsPB* pb) const;
+  void ToPb(KsckResultsPB* pb, int sections) const;
 };
 
 // Print a formatted health summary to 'out', given a list `summaries`
 // describing the health of servers of type 'type'.
-Status PrintServerHealthSummaries(KsckServerType type,
-                                  const std::vector<KsckServerHealthSummary>& summaries,
-                                  std::ostream& out);
+Status PrintServerHealthSummaries(
+    cluster_summary::ServerType type,
+    const std::vector<cluster_summary::ServerHealthSummary>& summaries,
+    std::ostream& out);
 
 // Print a formatted summary of the flags in 'flag_to_servers_map', indicating
 // which servers have which (flag, value) pairs set.
 // Flag tag information is sourced from 'flag_tags_map'.
-Status PrintFlagTable(KsckServerType type,
+Status PrintFlagTable(cluster_summary::ServerType type,
                       int num_servers,
                       const KsckFlagToServersMap& flag_to_servers_map,
                       const KsckFlagTagsMap& flag_tags_map,
                       std::ostream& out);
 
+Status PrintTServerStatesTable(const KsckTServerStateMap& ts_states,
+                               std::ostream& out);
+
 // Print a summary of the Kudu versions running across all servers from which
 // information could be fetched. Servers are grouped by version to make the
 // table compact.
-Status PrintVersionTable(const std::vector<KsckServerHealthSummary>& masters,
-                         const std::vector<KsckServerHealthSummary>& tservers,
+Status PrintVersionTable(const KsckVersionToServersMap& version_summaries,
+                         int num_servers,
                          std::ostream& out);
 
 // Print a formatted summary of the tables in 'table_summaries' to 'out'.
-Status PrintTableSummaries(const std::vector<KsckTableSummary>& table_summaries,
-                           std::ostream& out);
+Status PrintTableSummaries(
+    const std::vector<cluster_summary::TableSummary>& table_summaries,
+    std::ostream& out);
 
 // Print a formatted summary of the tablets in 'tablet_summaries' to 'out'.
-Status PrintTabletSummaries(const std::vector<KsckTabletSummary>& tablet_summaries,
-                            PrintMode mode,
-                            std::ostream& out);
+Status PrintTabletSummaries(
+    const std::vector<cluster_summary::TabletSummary>& tablet_summaries,
+    PrintMode mode,
+    std::ostream& out);
 
 // Print to 'out' a "consensus matrix" that compares the consensus states of the
 // replicas on servers with ids in 'server_uuids', given the set of consensus
 // states in 'consensus_states'. If given, 'ref_cstate' will be used as the
 // master's point of view of the consensus state of the tablet.
-Status PrintConsensusMatrix(const std::vector<std::string>& server_uuids,
-                            const boost::optional<KsckConsensusState> ref_cstate,
-                            const KsckConsensusStateMap& consensus_states,
-                            std::ostream& out);
+Status PrintConsensusMatrix(
+    const std::vector<std::string>& server_uuids,
+    const boost::optional<cluster_summary::ConsensusState>& ref_cstate,
+    const cluster_summary::ConsensusStateMap& cstates,
+    std::ostream& out);
 
 // Print to 'out' a table summarizing the counts of tablet replicas in the
 // cluster. 'mode' must be PLAIN_FULL or PLAIN_CONCISE. In PLAIN_CONCISE mode,

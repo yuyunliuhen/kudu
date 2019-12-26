@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/common/partial_row.h"
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -22,8 +24,8 @@
 #include <gtest/gtest.h>
 
 #include "kudu/common/common.pb.h"
-#include "kudu/common/partial_row.h"
 #include "kudu/common/schema.h"
+#include "kudu/util/int128.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
@@ -41,7 +43,9 @@ class PartialRowTest : public KuduTest {
                 ColumnSchema("string_val", STRING, true),
                 ColumnSchema("binary_val", BINARY, true),
                 ColumnSchema("decimal_val", DECIMAL32, true, nullptr, nullptr,
-                             ColumnStorageAttributes(), ColumnTypeAttributes(6, 2)) },
+                             ColumnStorageAttributes(), ColumnTypeAttributes(6, 2)),
+                ColumnSchema("varchar_val", VARCHAR, true, nullptr, nullptr,
+                             ColumnStorageAttributes(), ColumnTypeAttributes(10)) },
               1) {
     SeedRandom();
   }
@@ -127,6 +131,9 @@ TEST_F(PartialRowTest, UnitTest) {
   EXPECT_FALSE(row.IsColumnSet(0));
   EXPECT_FALSE(row.IsColumnSet(1));
   EXPECT_FALSE(row.IsColumnSet(2));
+  EXPECT_FALSE(row.IsColumnSet(3));
+  EXPECT_FALSE(row.IsColumnSet(4));
+  EXPECT_FALSE(row.IsColumnSet(5));
   EXPECT_FALSE(row.IsKeySet());
   EXPECT_EQ("", row.ToString());
 
@@ -214,6 +221,17 @@ TEST_F(PartialRowTest, UnitTest) {
   EXPECT_TRUE(row.IsColumnSet(4));
   EXPECT_EQ("decimal decimal_val=123456_D32", row.ToString());
 
+  // Get a decimal value using the const version of the function.
+  int128_t decValFromConst;
+  EXPECT_OK(const_cast<const KuduPartialRow&>(row).GetUnscaledDecimal("decimal_val",
+      &decValFromConst));
+  EXPECT_EQ(123456, decValFromConst);
+
+  // Get a decimal value the backward compatible non-const version of the function.
+  int128_t decValFromNonConst;
+  EXPECT_OK(row.GetUnscaledDecimal("decimal_val", &decValFromNonConst));
+  EXPECT_EQ(123456, decValFromNonConst);
+
   // Set the max decimal value for the decimal_val column
   EXPECT_OK(row.SetUnscaledDecimal("decimal_val", 999999));
   EXPECT_EQ("decimal decimal_val=999999_D32", row.ToString());
@@ -232,10 +250,54 @@ TEST_F(PartialRowTest, UnitTest) {
   EXPECT_EQ("Invalid argument: value -10000.00 out of range for decimal column 'decimal_val'",
             s.ToString());
 
+  // Set a decimal value on a non decimal column.
+  s = row.SetUnscaledDecimal("string_val", 123456);
+  EXPECT_EQ("Invalid argument: invalid type string provided for column "
+            "'string_val' (expected decimal)",
+            s.ToString());
+
   // Even though the storage is actually the same at the moment, we shouldn't be
   // able to set string columns with SetBinary and vice versa.
   EXPECT_FALSE(row.SetBinaryCopy("string_val", "oops").ok());
   EXPECT_FALSE(row.SetStringCopy("binary_val", "oops").ok());
+
+  EXPECT_OK(row.Unset(4));
+
+  s = row.SetVarchar("varchar_val", "shortval");
+  EXPECT_TRUE(row.IsColumnSet(5));
+  EXPECT_EQ("varchar varchar_val=\"shortval\"", row.ToString());
+
+  s = row.SetVarchar("varchar_val", "shortval  value ");
+  EXPECT_EQ("varchar varchar_val=\"shortval  \"", row.ToString());
+
+  s = row.SetVarchar("varchar_val", "this value is too long");
+  EXPECT_EQ("varchar varchar_val=\"this value\"", row.ToString());
+
+  s = row.SetVarchar("varchar_val", "Árvíztűrő tükörfúrógép");
+  EXPECT_EQ("varchar varchar_val=\"Árvíztűrő \"", row.ToString());
+
+  s = row.SetVarchar("varchar_val", "123456789\xF0\x9F\xA6\x8C ABCDEF");
+  EXPECT_EQ("varchar varchar_val=\"123456789\xF0\x9F\xA6\x8C\"", row.ToString());
+
+  s = row.SetVarcharNoCopyUnsafe("varchar_val", "varchar");
+  EXPECT_EQ("varchar varchar_val=\"varchar\"", row.ToString());
+
+  std::string utf8_char_4byte = "\xf3\xa0\x87\xa1";
+  std::string test_string = utf8_char_4byte;
+  for (auto i = 0; i < 9; ++i) {
+    test_string += utf8_char_4byte;
+  }
+
+  std::string expected_string = "varchar varchar_val=\"";
+  expected_string += test_string + "\"";
+
+  s = row.SetVarcharNoCopyUnsafe("varchar_val", test_string);
+  EXPECT_EQ(expected_string, row.ToString());
+
+  test_string += utf8_char_4byte;
+
+  s = row.SetVarcharNoCopyUnsafe("varchar_val", test_string);
+  EXPECT_TRUE(s.IsInvalidArgument());
 }
 
 TEST_F(PartialRowTest, TestCopy) {

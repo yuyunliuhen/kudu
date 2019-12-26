@@ -19,6 +19,7 @@ package org.apache.kudu.client;
 
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -28,10 +29,8 @@ import java.util.ListIterator;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import org.apache.kudu.util.TimestampUtil;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
-import org.jboss.netty.util.CharsetUtil;
 
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.ColumnTypeAttributes;
@@ -39,6 +38,7 @@ import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.util.DecimalUtil;
 import org.apache.kudu.util.StringUtil;
+import org.apache.kudu.util.TimestampUtil;
 
 /**
  * Class used to represent parts of a row along with its schema.<p>
@@ -634,6 +634,44 @@ public class PartialRow {
   }
 
   /**
+   * Add a VARCHAR for the specified column.
+   *
+   * Truncates val to the length of the column in characters.
+   *
+   * @param columnIndex Index of the column
+   * @param val value to add
+   * @throws IllegalArgumentException if the column doesn't exist, is the wrong type
+   *         or the string is not UTF-8
+   * @throws IllegalStateException if the row was already applied
+   */
+  public void addVarchar(int columnIndex, String val) {
+    ColumnSchema column = schema.getColumnByIndex(columnIndex);
+    checkColumn(column, Type.VARCHAR);
+    checkNotFrozen();
+    int length = column.getTypeAttributes().getLength();
+    if (length < val.length()) {
+      val = val.substring(0, length);
+    }
+    byte[] bytes = Bytes.fromString(val);
+    addVarLengthData(columnIndex, bytes);
+  }
+
+  /**
+   * Add a VARCHAR for the specified column.
+   *
+   * Truncates val to the length of the column in characters.
+   *
+   * @param columnName Name of the column
+   * @param val value to add
+   * @throws IllegalArgumentException if the column doesn't exist, is the wrong type
+   *         or the string is not UTF-8
+   * @throws IllegalStateException if the row was already applied
+   */
+  public void addVarchar(String columnName, String val) {
+    addVarchar(schema.getColumnIndex(columnName), val);
+  }
+
+  /**
    * Get the specified column's string.
    * @param columnName name of the column to get data for
    * @return a string
@@ -655,7 +693,33 @@ public class PartialRow {
   public String getString(int columnIndex) {
     checkColumn(schema.getColumnByIndex(columnIndex), Type.STRING);
     checkValue(columnIndex);
-    return new String(getVarLengthData(columnIndex).array(), CharsetUtil.UTF_8);
+    return new String(getVarLengthData(columnIndex).array(), StandardCharsets.UTF_8);
+  }
+
+  /**
+   * Get the specified column's VARCHAR.
+   * @param columnName Name of the column to get the data for
+   * @return a VARCHAR
+   * @throws IllegalArgumentException if the column is null, is unset,
+   *         or if the type doesn't match the column's type
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public String getVarchar(String columnName) {
+    return getVarchar(this.schema.getColumnIndex(columnName));
+  }
+
+  /**
+   * Get the specified column's VARCHAR.
+   * @param columnIndex Column index in the schema
+   * @return a VARCHAR
+   * @throws IllegalArgumentException if the column is null, is unset,
+   *         or if the type doesn't match the column's type
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public String getVarchar(int columnIndex) {
+    checkColumn(schema.getColumnByIndex(columnIndex), Type.VARCHAR);
+    checkValue(columnIndex);
+    return new String(getVarLengthData(columnIndex).array(), StandardCharsets.UTF_8);
   }
 
   /**
@@ -887,6 +951,199 @@ public class PartialRow {
   public boolean isNull(int columnIndex) {
     checkColumnExists(schema.getColumnByIndex(columnIndex));
     return schema.getColumnByIndex(columnIndex).isNullable() && isSetToNull(columnIndex);
+  }
+
+  /**
+   * Add the specified column's value as an Object.
+   *
+   * This method is useful when you don't care about autoboxing
+   * and your existing type handling logic is based on Java types.
+   *
+   * The accepted Object type is based on the column's {@link Type}:
+   *  Type.BOOL -> java.lang.Boolean
+   *  Type.INT8 -> java.lang.Byte
+   *  Type.INT16 -> java.lang.Short
+   *  Type.INT32 -> java.lang.Integer
+   *  Type.INT64 -> java.lang.Long
+   *  Type.UNIXTIME_MICROS -> java.sql.Timestamp or java.lang.Long
+   *  Type.FLOAT -> java.lang.Float
+   *  Type.DOUBLE -> java.lang.Double
+   *  Type.STRING -> java.lang.String
+   *  Type.VARCHAR -> java.lang.String
+   *  Type.BINARY -> byte[] or java.lang.ByteBuffer
+   *  Type.DECIMAL -> java.math.BigDecimal
+   *
+   * @param columnName name of the column in the schema
+   * @param val the value to add as an Object
+   * @throws IllegalStateException if the row was already applied
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public void addObject(String columnName, Object val) {
+    addObject(this.schema.getColumnIndex(columnName), val);
+  }
+
+  /**
+   * Add the specified column's value as an Object.
+   *
+   * This method is useful when you don't care about autoboxing
+   * and your existing type handling logic is based on Java types.
+   *
+   * The accepted Object type is based on the column's {@link Type}:
+   *  Type.BOOL -> java.lang.Boolean
+   *  Type.INT8 -> java.lang.Byte
+   *  Type.INT16 -> java.lang.Short
+   *  Type.INT32 -> java.lang.Integer
+   *  Type.INT64 -> java.lang.Long
+   *  Type.UNIXTIME_MICROS -> java.sql.Timestamp or java.lang.Long
+   *  Type.FLOAT -> java.lang.Float
+   *  Type.DOUBLE -> java.lang.Double
+   *  Type.STRING -> java.lang.String
+   *  Type.VARCHAR -> java.lang.String
+   *  Type.BINARY -> byte[] or java.lang.ByteBuffer
+   *  Type.DECIMAL -> java.math.BigDecimal
+   *
+   * @param columnIndex column index in the schema
+   * @param val the value to add as an Object
+   * @throws IllegalStateException if the row was already applied
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public void addObject(int columnIndex, Object val) {
+    checkNotFrozen();
+    ColumnSchema col = schema.getColumnByIndex(columnIndex);
+    checkColumnExists(col);
+    try {
+      if (val == null) {
+        setNull(columnIndex);
+        return;
+      }
+      switch (col.getType()) {
+        case BOOL:
+          addBoolean(columnIndex, (Boolean) val);
+          break;
+        case INT8:
+          addByte(columnIndex, (Byte) val);
+          break;
+        case INT16:
+          addShort(columnIndex, (Short) val);
+          break;
+        case INT32:
+          addInt(columnIndex, (Integer) val);
+          break;
+        case INT64:
+          addLong(columnIndex, (Long) val);
+          break;
+        case UNIXTIME_MICROS:
+          if (val instanceof Timestamp) {
+            addTimestamp(columnIndex, (Timestamp) val);
+          } else {
+            addLong(columnIndex, (Long) val);
+          }
+          break;
+        case FLOAT:
+          addFloat(columnIndex, (Float) val);
+          break;
+        case DOUBLE:
+          addDouble(columnIndex, (Double) val);
+          break;
+        case STRING:
+          addString(columnIndex, (String) val);
+          break;
+        case VARCHAR:
+          addVarchar(columnIndex, (String) val);
+          break;
+        case BINARY:
+          if (val instanceof byte[]) {
+            addBinary(columnIndex, (byte[]) val);
+          } else {
+            addBinary(columnIndex, (ByteBuffer) val);
+          }
+          break;
+        case DECIMAL:
+          addDecimal(columnIndex, (BigDecimal) val);
+          break;
+        default:
+          throw new IllegalArgumentException("Unsupported column type: " + col.getType());
+      }
+    } catch (ClassCastException e) {
+      throw new IllegalArgumentException(
+          "Value type does not match column type " + col.getType() +
+              " for column " + col.getName());
+    }
+  }
+
+  /**
+   * Get the specified column's value as an Object.
+   *
+   * This method is useful when you don't care about autoboxing
+   * and your existing type handling logic is based on Java types.
+   *
+   * The Object type is based on the column's {@link Type}:
+   *  Type.BOOL -> java.lang.Boolean
+   *  Type.INT8 -> java.lang.Byte
+   *  Type.INT16 -> java.lang.Short
+   *  Type.INT32 -> java.lang.Integer
+   *  Type.INT64 -> java.lang.Long
+   *  Type.UNIXTIME_MICROS -> java.sql.Timestamp
+   *  Type.FLOAT -> java.lang.Float
+   *  Type.DOUBLE -> java.lang.Double
+   *  Type.STRING -> java.lang.String
+   *  Type.VARCHAR -> java.lang.String
+   *  Type.BINARY -> byte[]
+   *  Type.DECIMAL -> java.math.BigDecimal
+   *
+   * @param columnName name of the column in the schema
+   * @return the column's value as an Object, null if the column value is null or unset
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public Object getObject(String columnName) {
+    return getObject(this.schema.getColumnIndex(columnName));
+  }
+
+  /**
+   * Get the specified column's value as an Object.
+   *
+   * This method is useful when you don't care about autoboxing
+   * and your existing type handling logic is based on Java types.
+   *
+   * The Object type is based on the column's {@link Type}:
+   *  Type.BOOL -> java.lang.Boolean
+   *  Type.INT8 -> java.lang.Byte
+   *  Type.INT16 -> java.lang.Short
+   *  Type.INT32 -> java.lang.Integer
+   *  Type.INT64 -> java.lang.Long
+   *  Type.UNIXTIME_MICROS -> java.sql.Timestamp
+   *  Type.FLOAT -> java.lang.Float
+   *  Type.DOUBLE -> java.lang.Double
+   *  Type.STRING -> java.lang.String
+   *  Type.VARCHAR -> java.lang.String
+   *  Type.BINARY -> byte[]
+   *  Type.DECIMAL -> java.math.BigDecimal
+   *
+   * @param columnIndex Column index in the schema
+   * @return the column's value as an Object, null if the column value is null or unset
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public Object getObject(int columnIndex) {
+    checkColumnExists(schema.getColumnByIndex(columnIndex));
+    if (isNull(columnIndex) || !isSet(columnIndex)) {
+      return null;
+    }
+    Type type = schema.getColumnByIndex(columnIndex).getType();
+    switch (type) {
+      case BOOL: return getBoolean(columnIndex);
+      case INT8: return getByte(columnIndex);
+      case INT16: return getShort(columnIndex);
+      case INT32: return getInt(columnIndex);
+      case INT64: return getLong(columnIndex);
+      case UNIXTIME_MICROS: return getTimestamp(columnIndex);
+      case FLOAT: return getFloat(columnIndex);
+      case DOUBLE: return getDouble(columnIndex);
+      case VARCHAR: return getVarchar(columnIndex);
+      case STRING: return getString(columnIndex);
+      case BINARY: return getBinaryCopy(columnIndex);
+      case DECIMAL: return getDecimal(columnIndex);
+      default: throw new UnsupportedOperationException("Unsupported type: " + type);
+    }
   }
 
   /**
@@ -1132,13 +1389,14 @@ public class PartialRow {
         sb.append(Bytes.getDecimal(rowAlloc, schema.getColumnOffset(idx),
             typeAttributes.getPrecision(), typeAttributes.getScale()));
         return;
+      case VARCHAR:
       case BINARY:
       case STRING:
         ByteBuffer value = getVarLengthData().get(idx).duplicate();
         value.reset(); // Make sure we start at the beginning.
         byte[] data = new byte[value.limit() - value.position()];
         value.get(data);
-        if (col.getType() == Type.STRING) {
+        if (col.getType() == Type.STRING || col.getType() == Type.VARCHAR) {
           sb.append('"');
           StringUtil.appendEscapedSQLString(Bytes.getString(data), sb);
           sb.append('"');
@@ -1192,6 +1450,9 @@ public class PartialRow {
       case BINARY:
         addBinary(index, AsyncKuduClient.EMPTY_ARRAY);
         break;
+      case VARCHAR:
+        addVarchar(index, "");
+        break;
       default:
         throw new RuntimeException("unreachable");
     }
@@ -1220,6 +1481,7 @@ public class PartialRow {
             getPositionInRowAllocAndSetBitSet(index), value.length);
         break;
       }
+      case VARCHAR:
       case STRING:
       case BINARY: {
         addVarLengthData(index, value);
@@ -1238,6 +1500,7 @@ public class PartialRow {
    * @return {@code true} if the column is successfully incremented, or {@code false} if
    *         it is already the maximum value
    */
+  @SuppressWarnings("BigDecimalEquals")
   boolean incrementColumn(int index) {
     ColumnSchema column = schema.getColumnByIndex(index);
     Type type = column.getType();
@@ -1312,6 +1575,7 @@ public class PartialRow {
         Bytes.setBigDecimal(rowAlloc, existing.add(smallest), precision, offset);
         return true;
       }
+      case VARCHAR:
       case STRING:
       case BINARY: {
         ByteBuffer data = varLengthData.get(index);
@@ -1365,6 +1629,7 @@ public class PartialRow {
    * @param index the column index
    * @return {@code true} if the cell values for the given column are equal
    */
+  @SuppressWarnings("BigDecimalEquals")
   private static boolean isCellEqual(PartialRow a, PartialRow b, int index) {
     // These checks are perhaps overly restrictive, but right now we only use
     // this method for checking fully-set keys.
@@ -1379,7 +1644,6 @@ public class PartialRow {
 
     switch (type) {
       case BOOL:
-        return a.rowAlloc[offset] == b.rowAlloc[offset];
       case INT8:
         return a.rowAlloc[offset] == b.rowAlloc[offset];
       case INT16:
@@ -1399,20 +1663,21 @@ public class PartialRow {
         int scale = typeAttributes.getScale();
         return Bytes.getDecimal(a.rowAlloc, offset, precision, scale)
             .equals(Bytes.getDecimal(b.rowAlloc, offset, precision, scale));
+      case VARCHAR:
       case STRING:
       case BINARY: {
-        ByteBuffer aData = a.varLengthData.get(index).duplicate();
-        ByteBuffer bData = b.varLengthData.get(index).duplicate();
-        aData.reset();
-        bData.reset();
-        int aLen = aData.limit() - aData.position();
-        int bLen = bData.limit() - bData.position();
+        ByteBuffer dataA = a.varLengthData.get(index).duplicate();
+        ByteBuffer dataB = b.varLengthData.get(index).duplicate();
+        dataA.reset();
+        dataB.reset();
+        int lenA = dataA.limit() - dataA.position();
+        int lenB = dataB.limit() - dataB.position();
 
-        if (aLen != bLen) {
+        if (lenA != lenB) {
           return false;
         }
-        for (int i = 0; i < aLen; i++) {
-          if (aData.get(aData.position() + i) != bData.get(bData.position() + i)) {
+        for (int i = 0; i < lenA; i++) {
+          if (dataA.get(dataA.position() + i) != dataB.get(dataB.position() + i)) {
             return false;
           }
         }
@@ -1432,6 +1697,7 @@ public class PartialRow {
    * @return {@code true} if the column cell value in the upper row is equal to
    *         the value in the lower row, incremented by one.
    */
+  @SuppressWarnings("BigDecimalEquals")
   private static boolean isCellIncremented(PartialRow lower, PartialRow upper, int index) {
     // These checks are perhaps overly restrictive, but right now we only use
     // this method for checking fully-set keys.
@@ -1445,7 +1711,8 @@ public class PartialRow {
     int offset = lower.getSchema().getColumnOffset(index);
 
     switch (type) {
-      case BOOL: return lower.rowAlloc[offset] + 1 == upper.rowAlloc[offset];
+      case BOOL:
+        return lower.rowAlloc[offset] + 1 == upper.rowAlloc[offset];
       case INT8: {
         byte val = lower.rowAlloc[offset];
         return val != Byte.MAX_VALUE && val + 1 == upper.rowAlloc[offset];
@@ -1484,24 +1751,25 @@ public class PartialRow {
         return val.add(smallestVal).equals(
                 Bytes.getDecimal(upper.rowAlloc, offset, precision, scale));
       }
+      case VARCHAR:
       case STRING:
       case BINARY: {
         // Check that b is 1 byte bigger than a, the extra byte is 0, and the other bytes are equal.
-        ByteBuffer aData = lower.varLengthData.get(index).duplicate();
-        ByteBuffer bData = upper.varLengthData.get(index).duplicate();
-        aData.reset();
-        bData.reset();
-        int aLen = aData.limit() - aData.position();
-        int bLen = bData.limit() - bData.position();
+        ByteBuffer dataA = lower.varLengthData.get(index).duplicate();
+        ByteBuffer dataB = upper.varLengthData.get(index).duplicate();
+        dataA.reset();
+        dataB.reset();
+        int lenA = dataA.limit() - dataA.position();
+        int lenB = dataB.limit() - dataB.position();
 
-        if (aLen == Integer.MAX_VALUE ||
-            aLen + 1 != bLen ||
-            bData.get(bData.limit() - 1) != 0) {
+        if (lenA == Integer.MAX_VALUE ||
+            lenA + 1 != lenB ||
+            dataB.get(dataB.limit() - 1) != 0) {
           return false;
         }
 
-        for (int i = 0; i < aLen; i++) {
-          if (aData.get(aData.position() + i) != bData.get(bData.position() + i)) {
+        for (int i = 0; i < lenA; i++) {
+          if (dataA.get(dataA.position() + i) != dataB.get(dataB.position() + i)) {
             return false;
           }
         }

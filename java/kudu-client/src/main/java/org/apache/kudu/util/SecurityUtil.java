@@ -21,9 +21,9 @@ import java.security.MessageDigest;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-
 import javax.annotation.Nullable;
 import javax.security.auth.Subject;
 import javax.security.auth.kerberos.KerberosPrincipal;
@@ -35,7 +35,6 @@ import javax.security.auth.login.LoginException;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
@@ -144,7 +143,7 @@ public abstract class SecurityUtil {
     // There's no API available to actually find just the digest algorithm,
     // so we resort to some hackery.
     String[] components = sigAlg.split("with", 2);
-    String digestAlg = CERT_DIGEST_TO_MESSAGE_DIGEST.get(components[0].toUpperCase());
+    String digestAlg = CERT_DIGEST_TO_MESSAGE_DIGEST.get(components[0].toUpperCase(Locale.ENGLISH));
     if (digestAlg == null) {
       // RFC 5929: if the certificate's signatureAlgorithm uses no hash functions or
       // uses multiple hash functions, then this channel binding type's channel

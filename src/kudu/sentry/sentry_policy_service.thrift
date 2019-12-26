@@ -19,10 +19,12 @@
  */
 
 # DO NOT MODIFY! Copied from
-# https://raw.githubusercontent.com/apache/sentry/2c9a927a9e87cba0e4c0f34fc0b55887c6636927/sentry-service/sentry-service-api/src/main/resources/sentry_policy_service.thrift
+# https://raw.githubusercontent.com/apache/sentry/b71a78ed960702536b35e1f048dc40dfc79992d4/sentry-service/sentry-service-api/src/main/resources/sentry_policy_service.thrift
 #
 # With edits:
 #   - Change cpp namespace to 'sentry' to match the Kudu codebase style.
+#   - Rename enum TSentryGrantOption.TRUE and TSentryGrantOption.FALSE
+#     to avoid conflict with the macro definition in the macOS system header.
 
 #
 # Thrift Service that the MetaStore is built on
@@ -35,8 +37,8 @@ namespace php sentry.api.service.thrift
 namespace cpp sentry
 
 enum TSentryGrantOption {
-  TRUE = 1,
-  FALSE = 0,
+  ENABLED = 1,
+  DISABLED = 0,
   # UNSET is used for revoke privilege, the component like 'hive'
   # didn't support getting grant option, so use UNSET is stand
   # for revoke both privileges with grant option and without grant
@@ -59,13 +61,22 @@ struct TSentryPrivilege {
 6: optional string URI = "",
 7: required string action = "",
 8: optional i64 createTime, # Set on server side
-9: optional TSentryGrantOption grantOption = TSentryGrantOption.FALSE
+9: optional TSentryGrantOption grantOption = TSentryGrantOption.DISABLED
 10: optional string columnName = "",
 }
 
 # TODO can this be deleted? it's not adding value to TAlterSentryRoleAddGroupsRequest
 struct TSentryGroup {
 1: required string groupName
+}
+
+struct TIsSentryAdminRequest {
+1: required i32 protocol_version = sentry_common_service.TSENTRY_SERVICE_V2,
+2: required string userName,
+}
+struct TIsSentryAdminResponse {
+1: required sentry_common_service.TSentryResponseStatus status,
+2: required bool isAdmin,
 }
 
 # CREATE ROLE r1
@@ -280,6 +291,19 @@ struct TListSentryPrivilegesByAuthResponse {
 3: optional map<TSentryAuthorizable, TSentryPrivilegeMap> privilegesMapByAuthForUsers
 }
 
+struct TListSentryPrivilegesByAuthUserRequest {
+1: required i32 protocol_version = sentry_common_service.TSENTRY_SERVICE_V2,
+2: required string requestorUserName, # user on whose behalf the request is issued
+3: required set<TSentryAuthorizable> authorizableSet,
+4: required string user
+}
+
+struct TListSentryPrivilegesByAuthUserResponse {
+1: required sentry_common_service.TSentryResponseStatus status,
+# Authorizable to set of privileges map
+2: optional map<TSentryAuthorizable, set<TSentryPrivilege>> privilegesMapByAuth,
+}
+
 # Obtain a config value from the Sentry service
 struct TSentryConfigValueRequest {
 1: required i32 protocol_version = sentry_common_service.TSENTRY_SERVICE_V2,
@@ -301,7 +325,7 @@ struct TSentryMappingData {
 struct TSentryExportMappingDataRequest {
 1: required i32 protocol_version = sentry_common_service.TSENTRY_SERVICE_V1,
 2: required string requestorUserName, # user on whose behalf the request is issued
-3: optional string objectPath # for specific auth object
+3: optional set<TSentryAuthorizable> authorizables # for which permission information needs to be exported.
 }
 
 struct TSentryExportMappingDataResponse {
@@ -312,7 +336,7 @@ struct TSentryExportMappingDataResponse {
 struct TSentryImportMappingDataRequest {
 1: required i32 protocol_version = sentry_common_service.TSENTRY_SERVICE_V1,
 2: required string requestorUserName, # user on whose behalf the request is issued
-3: required bool overwriteRole = false, # if overwrite the exist role with the imported privileges, default is false 
+3: required bool overwriteRole = false, # if overwrite the exist role with the imported privileges, default is false
 4: required TSentryMappingData mappingData
 }
 
@@ -398,6 +422,9 @@ struct TSentryPrivilegesResponse {
 
 service SentryPolicyService
 {
+  # Check if the given user is in the Sentry admin group.
+  TIsSentryAdminResponse is_sentry_admin(1:TIsSentryAdminRequest request)
+
   TCreateSentryRoleResponse create_sentry_role(1:TCreateSentryRoleRequest request)
   TDropSentryRoleResponse drop_sentry_role(1:TDropSentryRoleRequest request)
 
@@ -431,7 +458,13 @@ service SentryPolicyService
 
   TRenamePrivilegesResponse rename_sentry_privilege(1:TRenamePrivilegesRequest request);
 
+  # List sentry privileges filterted based on a set of authorizables, that
+  # granted to the given user and the given role if present.
   TListSentryPrivilegesByAuthResponse list_sentry_privileges_by_authorizable(1:TListSentryPrivilegesByAuthRequest request);
+
+  # List sentry privileges filterted based on a set of authorizables, that
+  # granted to the given user and the groups the user associated with.
+  TListSentryPrivilegesByAuthUserResponse list_sentry_privileges_by_authorizable_and_user(1:TListSentryPrivilegesByAuthUserRequest request);
 
   TSentryConfigValueResponse get_sentry_config_value(1:TSentryConfigValueRequest request);
 

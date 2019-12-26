@@ -44,6 +44,7 @@ namespace kudu {
 class BlockIdPB;
 class FsManager;
 class Schema;
+class TableExtraConfigPB;
 
 namespace consensus {
 class OpId;
@@ -81,6 +82,9 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
                           const Partition& partition,
                           const TabletDataState& initial_tablet_data_state,
                           boost::optional<consensus::OpId> tombstone_last_logged_opid,
+                          bool supports_live_row_count,
+                          boost::optional<TableExtraConfigPB> extra_config,
+                          boost::optional<std::string> dimension_label,
                           scoped_refptr<TabletMetadata>* metadata);
 
   // Load existing metadata from disk.
@@ -102,12 +106,14 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
                              const Partition& partition,
                              const TabletDataState& initial_tablet_data_state,
                              boost::optional<consensus::OpId> tombstone_last_logged_opid,
+                             boost::optional<TableExtraConfigPB> extra_config,
+                             boost::optional<std::string> dimension_label,
                              scoped_refptr<TabletMetadata>* metadata);
 
   static std::vector<BlockIdPB> CollectBlockIdPBs(
       const TabletSuperBlockPB& superblock);
 
-  std::vector<BlockId> CollectBlockIds();
+  BlockIdContainer CollectBlockIds();
 
   const std::string& tablet_id() const {
     DCHECK_NE(state_, kNotLoadedYet);
@@ -119,7 +125,7 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
     return partition_;
   }
 
-  std::string table_id() const {
+  const std::string& table_id() const {
     DCHECK_NE(state_, kNotLoadedYet);
     return table_id_;
   }
@@ -131,6 +137,8 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   void SetSchema(const Schema& schema, uint32_t version);
 
   void SetTableName(const std::string& table_name);
+
+  void SetExtraConfig(TableExtraConfigPB extra_config);
 
   // Return a reference to the current schema.
   // This pointer will be valid until the TabletMetadata is destructed,
@@ -182,7 +190,7 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   //
   // Blocks are removed from this set after they are successfully deleted
   // in a call to DeleteOrphanedBlocks().
-  void AddOrphanedBlocks(const std::vector<BlockId>& block_ids);
+  void AddOrphanedBlocks(const BlockIdContainer& block_ids);
 
   // Mark the superblock to be in state 'delete_type', sync it to disk, and
   // then delete all of the rowsets in this tablet.
@@ -233,6 +241,12 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // Return the last-logged opid of a tombstoned tablet, if known.
   boost::optional<consensus::OpId> tombstone_last_logged_opid() const;
 
+  // Returns the table's extra configuration properties.
+  boost::optional<TableExtraConfigPB> extra_config() const;
+
+  // Returns the table's dimension label.
+  boost::optional<std::string> dimension_label() const;
+
   // Loads the currently-flushed superblock from disk into the given protobuf.
   Status ReadSuperBlockFromDisk(TabletSuperBlockPB* superblock) const;
 
@@ -263,9 +277,19 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
     return flush_count_for_tests_;
   }
 
+  // For testing only.
+  void set_supports_live_row_count_for_tests(bool supports_live_row_count) {
+    supports_live_row_count_ = supports_live_row_count;
+  }
+
+  bool supports_live_row_count() const {
+    return supports_live_row_count_;
+  }
+
  private:
   friend class RefCountedThreadSafe<TabletMetadata>;
   friend class MetadataTest;
+  friend class TestTabletMetadataBenchmark;
 
   // Compile time assert that no one deletes TabletMetadata objects.
   ~TabletMetadata();
@@ -279,7 +303,10 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
                  const Schema& schema, PartitionSchema partition_schema,
                  Partition partition,
                  const TabletDataState& tablet_data_state,
-                 boost::optional<consensus::OpId> tombstone_last_logged_opid);
+                 boost::optional<consensus::OpId> tombstone_last_logged_opid,
+                 bool supports_live_row_count,
+                 boost::optional<TableExtraConfigPB> extra_config,
+                 boost::optional<std::string> dimension_label);
 
   // Constructor for loading an existing tablet.
   TabletMetadata(FsManager* fs_manager, std::string tablet_id);
@@ -305,7 +332,7 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
                               const RowSetMetadataVector& rowsets) const;
 
   // Requires 'data_lock_'.
-  void AddOrphanedBlocksUnlocked(const std::vector<BlockId>& block_ids);
+  void AddOrphanedBlocksUnlocked(const BlockIdContainer& block_ids);
 
   // Deletes the provided 'blocks' on disk.
   //
@@ -313,7 +340,7 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // 'orphaned_blocks_' set.
   //
   // Failures are logged, but are not fatal.
-  void DeleteOrphanedBlocks(const std::vector<BlockId>& blocks);
+  void DeleteOrphanedBlocks(const BlockIdContainer& blocks);
 
   enum State {
     kNotLoadedYet,
@@ -367,6 +394,12 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // Protected by 'data_lock_'.
   boost::optional<consensus::OpId> tombstone_last_logged_opid_;
 
+  // Table extra config.
+  boost::optional<TableExtraConfigPB> extra_config_;
+
+  // Tablet's dimension label.
+  boost::optional<std::string> dimension_label_;
+
   // If this counter is > 0 then Flush() will not write any data to
   // disk.
   int32_t num_flush_pins_;
@@ -386,6 +419,9 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // The on-disk size of the tablet metadata, as of the last successful
   // call to Flush() or LoadFromDisk().
   std::atomic<int64_t> on_disk_size_;
+
+  // The tablet supports live row counting if true.
+  bool supports_live_row_count_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletMetadata);
 };

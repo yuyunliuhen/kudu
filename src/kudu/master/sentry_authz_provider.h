@@ -18,24 +18,35 @@
 #pragma once
 
 #include <string>
+#include <unordered_set>
+
+#include <gtest/gtest_prod.h>
 
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/master/authz_provider.h"
-#include "kudu/sentry/sentry_client.h"
-#include "kudu/thrift/client.h"
+#include "kudu/master/sentry_privileges_fetcher.h"
+#include "kudu/sentry/sentry_action.h"
+#include "kudu/sentry/sentry_authorizable_scope.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/status.h"
-
-namespace sentry {
-class TSentryAuthorizable;
-} // namespace sentry
 
 namespace kudu {
 
-namespace sentry {
-class SentryAction;
-} // namespace sentry
+class SchemaPB;
+
+namespace security {
+class TablePrivilegePB;
+} // namespace security
 
 namespace master {
+
+// Enum indicating whether a grant option is required to perform a specific
+// action.
+enum SentryGrantRequired {
+  NOT_REQUIRED,
+  REQUIRED,
+};
 
 // An implementation of AuthzProvider that connects to the Sentry service
 // for authorization metadata and allows or denies the actions performed by
@@ -44,12 +55,7 @@ namespace master {
 // This class is thread-safe after Start() is called.
 class SentryAuthzProvider : public AuthzProvider {
  public:
-
-  enum class AuthorizableScope {
-    SERVER,
-    DATABASE,
-    TABLE,
-  };
+  explicit SentryAuthzProvider(scoped_refptr<MetricEntity> metric_entity = {});
 
   ~SentryAuthzProvider();
 
@@ -58,9 +64,14 @@ class SentryAuthzProvider : public AuthzProvider {
 
   void Stop() override;
 
+  Status ResetCache() override WARN_UNUSED_RESULT;
+
+  // Returns true if the SentryAuthzProvider should be enabled.
+  static bool IsEnabled();
+
   // The following authorizing methods will fail if:
   //   - the operation is not authorized
-  //   - the Sentry service is unreachable
+  //   - the Sentry service is unreachable (when privilege caching is disabled)
   //   - Sentry fails to resolve the group mapping of the user
   //   - the specified '--kudu_service_name' is a non-admin user in Sentry
   // TODO(hao): add early failure recognition when SENTRY-2440 is done.
@@ -81,19 +92,48 @@ class SentryAuthzProvider : public AuthzProvider {
   Status AuthorizeGetTableMetadata(const std::string& table_name,
                                    const std::string& user) override WARN_UNUSED_RESULT;
 
-  // Validates the sentry_service_rpc_addresses gflag.
-  static bool ValidateAddresses(const char* flag_name, const std::string& addresses);
+  Status AuthorizeListTables(const std::string& user,
+                             std::unordered_set<std::string>* table_names,
+                             bool* checked_table_names) override WARN_UNUSED_RESULT;
+
+  Status AuthorizeGetTableStatistics(const std::string& table_name,
+                                     const std::string& user) override WARN_UNUSED_RESULT;
+
+  Status FillTablePrivilegePB(const std::string& table_name,
+                              const std::string& user,
+                              const SchemaPB& schema_pb,
+                              security::TablePrivilegePB* pb) override WARN_UNUSED_RESULT;
 
  private:
+  friend class SentryAuthzProviderTest;
+  FRIEND_TEST(TestAuthzHierarchy, TestAuthorizableScope);
+  FRIEND_TEST(SentryAuthzProviderFilterPrivilegesScopeTest, TestFilterInvalidResponses);
+  FRIEND_TEST(SentryAuthzProviderFilterPrivilegesScopeTest, TestFilterValidResponses);
+  FRIEND_TEST(SentryAuthzProviderTest, CacheBehaviorNotCachingTableInfo);
 
-  // Checks if the user can perform an action on the given authorizable.
+  // Checks if the user can perform an action on the table identifier (in the format
+  // <database-name>.<table-name>), based on the given authorizable scope and the
+  // grant option. Note that the authorizable scope should be equal or higher than
+  // 'TABLE' scope.
+  //
   // If the operation is not authorized, returns Status::NotAuthorized().
-  Status Authorize(const ::sentry::TSentryAuthorizable& authorizable,
-                   const sentry::SentryAction& action,
+  // Note that the authorization process is case insensitive for the
+  // authorizables.
+  //
+  // If 'caching' is SERVER_AND_DB_ONLY and the underlying
+  // SentryPrivilegesFetcher is configured to cache privileges, it will not
+  // cache privileges equal to or below the 'TABLE' scope.
+  Status Authorize(sentry::SentryAuthorizableScope::Scope scope,
+                   sentry::SentryAction::Action action,
+                   const std::string& table_ident,
                    const std::string& user,
-                   bool grant_option = false);
+                   SentryGrantRequired require_grant_option = NOT_REQUIRED,
+                   SentryCaching caching = ALL);
 
-  thrift::HaClient<sentry::SentryClient> ha_client_;
+  // An instance of utility class that provides interface to search for
+  // required privileges through the information received from Sentry.
+  // The fetcher can optionally cache the received information.
+  SentryPrivilegesFetcher fetcher_;
 };
 
 } // namespace master

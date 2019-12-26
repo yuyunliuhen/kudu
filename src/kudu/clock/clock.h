@@ -42,6 +42,7 @@ namespace clock {
 // 2 - Update() must never set the clock backwards (corollary of 1)
 class Clock : public RefCountedThreadSafe<Clock> {
  public:
+  virtual ~Clock() = default;
 
   // Initializes the clock.
   virtual Status Init() = 0;
@@ -77,6 +78,7 @@ class Clock : public RefCountedThreadSafe<Clock> {
   // that HasPhysicalComponent() return true, otherwise it will crash.
   virtual MonoDelta GetPhysicalComponentDifference(Timestamp /*lhs*/, Timestamp /*rhs*/) const {
     LOG(FATAL) << "Clock's timestamps don't have a physical component.";
+    __builtin_unreachable();
   }
 
   // Update the clock with a transaction timestamp originating from
@@ -106,8 +108,6 @@ class Clock : public RefCountedThreadSafe<Clock> {
 
   // Strigifies the provided timestamp according to this clock's internal format.
   virtual std::string Stringify(Timestamp timestamp) = 0;
-
-  virtual ~Clock() {}
 };
 
 } // namespace clock

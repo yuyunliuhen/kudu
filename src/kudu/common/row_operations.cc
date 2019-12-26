@@ -20,7 +20,9 @@
 #include <cstring>
 #include <ostream>
 #include <string>
+#include <utility>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/common/common.pb.h"
@@ -33,6 +35,7 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/bitmap.h"
 #include "kudu/util/faststring.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/safe_math.h"
@@ -42,9 +45,18 @@ using std::string;
 using std::vector;
 using strings::Substitute;
 
+DEFINE_int32(max_cell_size_bytes, 64 * 1024,
+             "The maximum size of any individual cell in a table. Attempting to store "
+             "string or binary columns with a size greater than this will result "
+             "in errors.");
+TAG_FLAG(max_cell_size_bytes, unsafe);
+
 namespace kudu {
 
 string DecodedRowOperation::ToString(const Schema& schema) const {
+  if (!result.ok()) {
+    return Substitute("row error: $0", result.ToString());
+  }
   // A note on redaction: We redact row operations, since they contain sensitive
   // row data. Range partition operations are not redacted, since range
   // partitions are considered to be metadata.
@@ -74,6 +86,13 @@ string DecodedRowOperation::ToString(const Schema& schema) const {
                         KUDU_DISABLE_REDACTION(split_row->ToString()));
   }
   return "UNKNOWN";
+}
+
+void DecodedRowOperation::SetFailureStatusOnce(Status s) {
+  DCHECK(!s.ok());
+  if (result.ok()) {
+    result = std::move(s);
+  }
 }
 
 RowOperationsPBEncoder::RowOperationsPBEncoder(RowOperationsPB* pb)
@@ -191,8 +210,10 @@ Status RowOperationsPBDecoder::ReadNullBitmap(const uint8_t** null_bm) {
   return Status::OK();
 }
 
-Status RowOperationsPBDecoder::GetColumnSlice(const ColumnSchema& col, Slice* slice) {
-  int size = col.type_info()->size();
+Status RowOperationsPBDecoder::GetColumnSlice(const ColumnSchema& col,
+                                              Slice* slice,
+                                              Status* row_status) {
+  size_t size = col.type_info()->size();
   if (PREDICT_FALSE(src_.size() < size)) {
     return Status::Corruption("Not enough data for column", col.ToString());
   }
@@ -200,14 +221,23 @@ Status RowOperationsPBDecoder::GetColumnSlice(const ColumnSchema& col, Slice* sl
   if (col.type_info()->physical_type() == BINARY) {
     // The Slice in the protobuf has a pointer relative to the indirect data,
     // not a real pointer. Need to fix that.
-    const Slice* ptr_slice = reinterpret_cast<const Slice*>(src_.data());
-    size_t offset_in_indirect = reinterpret_cast<uintptr_t>(ptr_slice->data());
+    auto ptr_slice = reinterpret_cast<const Slice*>(src_.data());
+    auto offset_in_indirect = reinterpret_cast<uintptr_t>(ptr_slice->data());
     bool overflowed = false;
     size_t max_offset = AddWithOverflowCheck(offset_in_indirect, ptr_slice->size(), &overflowed);
     if (PREDICT_FALSE(overflowed || max_offset > pb_->indirect_data().size())) {
       return Status::Corruption("Bad indirect slice");
     }
 
+    // Check that no individual cell is larger than the specified max.
+    if (PREDICT_FALSE(row_status && ptr_slice->size() > FLAGS_max_cell_size_bytes)) {
+      *row_status = Status::InvalidArgument(Substitute(
+          "value too large for column '$0' ($1 bytes, maximum is $2 bytes)",
+          col.name(), ptr_slice->size(), FLAGS_max_cell_size_bytes));
+      // After one row's column size has been found to exceed the limit and has been recorded
+      // in 'row_status', we will consider it OK and continue to consume data in order to properly
+      // validate subsequent columns and rows.
+    }
     *slice = Slice(&pb_->indirect_data()[offset_in_indirect], ptr_slice->size());
   } else {
     *slice = Slice(src_.data(), size);
@@ -216,14 +246,22 @@ Status RowOperationsPBDecoder::GetColumnSlice(const ColumnSchema& col, Slice* sl
   return Status::OK();
 }
 
-Status RowOperationsPBDecoder::ReadColumn(const ColumnSchema& col, uint8_t* dst) {
+Status RowOperationsPBDecoder::ReadColumn(const ColumnSchema& col,
+                                          uint8_t* dst,
+                                          Status* row_status) {
   Slice slice;
-  RETURN_NOT_OK(GetColumnSlice(col, &slice));
+  RETURN_NOT_OK(GetColumnSlice(col, &slice, row_status));
   if (col.type_info()->physical_type() == BINARY) {
     memcpy(dst, &slice, col.type_info()->size());
   } else {
     slice.relocate(dst);
   }
+  return Status::OK();
+}
+
+Status RowOperationsPBDecoder::ReadColumnAndDiscard(const ColumnSchema& col) {
+  uint8_t scratch[kLargestTypeSize];
+  RETURN_NOT_OK(ReadColumn(col, scratch, nullptr));
   return Status::OK();
 }
 
@@ -271,7 +309,7 @@ class ClientServerMapping {
     DCHECK_EQ(client_to_tablet_.size(), client_col_idx);
     DCHECK_LT(tablet_col_idx, saw_tablet_col_.size());
     client_to_tablet_.push_back(tablet_col_idx);
-    saw_tablet_col_[tablet_col_idx] = 1;
+    saw_tablet_col_[tablet_col_idx] = true;
     return Status::OK();
   }
 
@@ -288,12 +326,12 @@ class ClientServerMapping {
   }
 
   // Translate from a client schema index to the tablet schema index
-  int client_to_tablet_idx(int client_idx) const {
+  size_t client_to_tablet_idx(size_t client_idx) const {
     DCHECK_LT(client_idx, client_to_tablet_.size());
     return client_to_tablet_[client_idx];
   }
 
-  int num_mapped() const {
+  size_t num_mapped() const {
     return client_to_tablet_.size();
   }
 
@@ -301,7 +339,7 @@ class ClientServerMapping {
   // server side schema are found in the client-side schema. If not,
   // returns an InvalidArgument.
   Status CheckAllRequiredColumnsPresent() {
-    for (int tablet_col_idx = 0;
+    for (size_t tablet_col_idx = 0;
          tablet_col_idx < tablet_schema_->num_columns();
          tablet_col_idx++) {
       const ColumnSchema& col = tablet_schema_->column(tablet_col_idx);
@@ -320,17 +358,16 @@ class ClientServerMapping {
  private:
   const Schema* const client_schema_;
   const Schema* const tablet_schema_;
-  vector<int> client_to_tablet_;
+  vector<size_t> client_to_tablet_;
   vector<bool> saw_tablet_col_;
   DISALLOW_COPY_AND_ASSIGN(ClientServerMapping);
 };
 
-
 Status RowOperationsPBDecoder::DecodeInsertOrUpsert(const uint8_t* prototype_row_storage,
                                                     const ClientServerMapping& mapping,
                                                     DecodedRowOperation* op) {
-  const uint8_t* client_isset_map;
-  const uint8_t* client_null_map;
+  const uint8_t* client_isset_map = nullptr;
+  const uint8_t* client_null_map = nullptr;
 
   // Read the null and isset bitmaps for the client-provided row.
   RETURN_NOT_OK(ReadIssetBitmap(&client_isset_map));
@@ -339,9 +376,9 @@ Status RowOperationsPBDecoder::DecodeInsertOrUpsert(const uint8_t* prototype_row
   }
 
   // Allocate a row with the tablet's layout.
-  uint8_t* tablet_row_storage = reinterpret_cast<uint8_t*>(
+  auto tablet_row_storage = reinterpret_cast<uint8_t*>(
       dst_arena_->AllocateBytesAligned(tablet_row_size_, 8));
-  uint8_t* tablet_isset_bitmap = reinterpret_cast<uint8_t*>(
+  auto tablet_isset_bitmap = reinterpret_cast<uint8_t*>(
       dst_arena_->AllocateBytes(BitmapSize(tablet_schema_->num_columns())));
   if (PREDICT_FALSE(!tablet_row_storage || !tablet_isset_bitmap)) {
     return Status::RuntimeError("Out of memory");
@@ -357,12 +394,14 @@ Status RowOperationsPBDecoder::DecodeInsertOrUpsert(const uint8_t* prototype_row
 
   // Now handle each of the columns passed by the user, replacing the defaults
   // from the prototype.
-  for (int client_col_idx = 0; client_col_idx < client_schema_->num_columns(); client_col_idx++) {
+  Status row_status;
+  for (size_t client_col_idx = 0;
+       client_col_idx < client_schema_->num_columns();
+       client_col_idx++) {
     // Look up the corresponding column from the tablet. We use the server-side
     // ColumnSchema object since it has the most up-to-date default, nullability,
     // etc.
-    int tablet_col_idx = mapping.client_to_tablet_idx(client_col_idx);
-    DCHECK_GE(tablet_col_idx, 0);
+    size_t tablet_col_idx = mapping.client_to_tablet_idx(client_col_idx);
     const ColumnSchema& col = tablet_schema_->column(tablet_col_idx);
 
     bool isset = BitmapTest(client_isset_map, client_col_idx);
@@ -371,24 +410,26 @@ Status RowOperationsPBDecoder::DecodeInsertOrUpsert(const uint8_t* prototype_row
       // If the client provided a value for this column, copy it.
 
       // Copy null-ness, if the server side column is nullable.
-      bool client_set_to_null = col.is_nullable() &&
+      bool client_set_to_null = client_schema_->has_nullables() &&
         BitmapTest(client_null_map, client_col_idx);
       if (col.is_nullable()) {
         tablet_row.set_null(tablet_col_idx, client_set_to_null);
       }
-      // Copy the value if it's not null
       if (!client_set_to_null) {
-        RETURN_NOT_OK(ReadColumn(col, tablet_row.mutable_cell_ptr(tablet_col_idx)));
+        // Copy the value if it's not null.
+        RETURN_NOT_OK(ReadColumn(col, tablet_row.mutable_cell_ptr(tablet_col_idx), &row_status));
+        if (PREDICT_FALSE(!row_status.ok())) op->SetFailureStatusOnce(row_status);
+      } else if (PREDICT_FALSE(!col.is_nullable())) {
+        op->SetFailureStatusOnce(Status::InvalidArgument(
+            "NULL values not allowed for non-nullable column", col.ToString()));
+        RETURN_NOT_OK(ReadColumnAndDiscard(col));
       }
     } else {
       // If the client didn't provide a value, then the column must either be nullable or
-      // have a default (which was already set in the prototype row.
-
+      // have a default (which was already set in the prototype row).
       if (PREDICT_FALSE(!(col.is_nullable() || col.has_write_default()))) {
-        // TODO: change this to return per-row errors. Otherwise if one row in a batch
-        // is missing a field for some reason, the whole batch will fail.
-        return Status::InvalidArgument("No value provided for required column",
-                                       col.ToString());
+        op->SetFailureStatusOnce(Status::InvalidArgument("No value provided for required column",
+                                                         col.ToString()));
       }
     }
   }
@@ -400,10 +441,10 @@ Status RowOperationsPBDecoder::DecodeInsertOrUpsert(const uint8_t* prototype_row
 
 Status RowOperationsPBDecoder::DecodeUpdateOrDelete(const ClientServerMapping& mapping,
                                                     DecodedRowOperation* op) {
-  int rowkey_size = tablet_schema_->key_byte_size();
+  size_t rowkey_size = tablet_schema_->key_byte_size();
 
-  const uint8_t* client_isset_map;
-  const uint8_t* client_null_map;
+  const uint8_t* client_isset_map = nullptr;
+  const uint8_t* client_null_map = nullptr;
 
   // Read the null and isset bitmaps for the client-provided row.
   RETURN_NOT_OK(ReadIssetBitmap(&client_isset_map));
@@ -412,7 +453,7 @@ Status RowOperationsPBDecoder::DecodeUpdateOrDelete(const ClientServerMapping& m
   }
 
   // Allocate space for the row key.
-  uint8_t* rowkey_storage = reinterpret_cast<uint8_t*>(
+  auto rowkey_storage = reinterpret_cast<uint8_t*>(
     dst_arena_->AllocateBytesAligned(rowkey_size, 8));
   if (PREDICT_FALSE(!rowkey_storage)) {
     return Status::RuntimeError("Out of memory");
@@ -424,29 +465,32 @@ Status RowOperationsPBDecoder::DecodeUpdateOrDelete(const ClientServerMapping& m
   ContiguousRow rowkey(tablet_schema_, rowkey_storage);
 
   // First process the key columns.
-  int client_col_idx = 0;
+  size_t client_col_idx = 0;
   for (; client_col_idx < client_schema_->num_key_columns(); client_col_idx++) {
     // Look up the corresponding column from the tablet. We use the server-side
     // ColumnSchema object since it has the most up-to-date default, nullability,
     // etc.
     DCHECK_EQ(mapping.client_to_tablet_idx(client_col_idx),
               client_col_idx) << "key columns should match";
-    int tablet_col_idx = client_col_idx;
+    size_t tablet_col_idx = client_col_idx;
 
     const ColumnSchema& col = tablet_schema_->column(tablet_col_idx);
     if (PREDICT_FALSE(!BitmapTest(client_isset_map, client_col_idx))) {
-      return Status::InvalidArgument("No value provided for key column",
-                                     col.ToString());
+      op->SetFailureStatusOnce(Status::InvalidArgument("No value provided for key column",
+                                                       col.ToString()));
+      continue;
     }
 
     bool client_set_to_null = client_schema_->has_nullables() &&
       BitmapTest(client_null_map, client_col_idx);
     if (PREDICT_FALSE(client_set_to_null)) {
-      return Status::InvalidArgument("NULL values not allowed for key column",
-                                     col.ToString());
+      op->SetFailureStatusOnce(Status::InvalidArgument("NULL values not allowed for key column",
+                                                       col.ToString()));
+      RETURN_NOT_OK(ReadColumnAndDiscard(col));
+      continue;
     }
 
-    RETURN_NOT_OK(ReadColumn(col, rowkey.mutable_cell_ptr(tablet_col_idx)));
+    RETURN_NOT_OK(ReadColumn(col, rowkey.mutable_cell_ptr(tablet_col_idx), nullptr));
   }
   op->row_data = rowkey_storage;
 
@@ -454,31 +498,30 @@ Status RowOperationsPBDecoder::DecodeUpdateOrDelete(const ClientServerMapping& m
   // For UPDATE, we expect at least one other column to be set, indicating the
   // update to perform.
   // For DELETE, we expect no other columns to be set (and we verify that).
+  Status row_status;
   if (op->type == RowOperationsPB::UPDATE) {
     faststring buf;
     RowChangeListEncoder rcl_encoder(&buf);
 
     // Now process the rest of columns as updates.
     for (; client_col_idx < client_schema_->num_columns(); client_col_idx++) {
-      int tablet_col_idx = mapping.client_to_tablet_idx(client_col_idx);
-      DCHECK_GE(tablet_col_idx, 0);
+      size_t tablet_col_idx = mapping.client_to_tablet_idx(client_col_idx);
       const ColumnSchema& col = tablet_schema_->column(tablet_col_idx);
 
       if (BitmapTest(client_isset_map, client_col_idx)) {
         bool client_set_to_null = client_schema_->has_nullables() &&
           BitmapTest(client_null_map, client_col_idx);
         uint8_t scratch[kLargestTypeSize];
-        uint8_t* val_to_add;
+        uint8_t* val_to_add = nullptr;
         if (!client_set_to_null) {
-          RETURN_NOT_OK(ReadColumn(col, scratch));
+          RETURN_NOT_OK(ReadColumn(col, scratch, &row_status));
+          if (PREDICT_FALSE(!row_status.ok())) op->SetFailureStatusOnce(row_status);
           val_to_add = scratch;
-        } else {
-
-          if (PREDICT_FALSE(!col.is_nullable())) {
-            return Status::InvalidArgument("NULL value not allowed for non-nullable column",
-                                           col.ToString());
-          }
-          val_to_add = nullptr;
+        } else if (PREDICT_FALSE(!col.is_nullable())) {
+          op->SetFailureStatusOnce(Status::InvalidArgument(
+              "NULL value not allowed for non-nullable column", col.ToString()));
+          RETURN_NOT_OK(ReadColumnAndDiscard(col));
+          continue;
         }
         rcl_encoder.AddColumnUpdate(col, tablet_schema_->column_id(tablet_col_idx), val_to_add);
       }
@@ -486,32 +529,39 @@ Status RowOperationsPBDecoder::DecodeUpdateOrDelete(const ClientServerMapping& m
 
     if (PREDICT_FALSE(buf.size() == 0)) {
       // No actual column updates specified!
-      return Status::InvalidArgument("No fields updated, key is",
-                                     tablet_schema_->DebugRowKey(rowkey));
+      op->SetFailureStatusOnce(Status::InvalidArgument("No fields updated, key is",
+                                                       tablet_schema_->DebugRowKey(rowkey)));
     }
 
-    // Copy the row-changelist to the arena.
-    uint8_t* rcl_in_arena = reinterpret_cast<uint8_t*>(
-      dst_arena_->AllocateBytesAligned(buf.size(), 8));
-    if (PREDICT_FALSE(rcl_in_arena == nullptr)) {
-      return Status::RuntimeError("Out of memory allocating RCL");
+    if (PREDICT_TRUE(op->result.ok())) {
+      // Copy the row-changelist to the arena.
+      auto rcl_in_arena = reinterpret_cast<uint8_t*>(
+        dst_arena_->AllocateBytesAligned(buf.size(), 8));
+      if (PREDICT_FALSE(rcl_in_arena == nullptr)) {
+        return Status::RuntimeError("Out of memory allocating RCL");
+      }
+      memcpy(rcl_in_arena, buf.data(), buf.size());
+      op->changelist = RowChangeList(Slice(rcl_in_arena, buf.size()));
     }
-    memcpy(rcl_in_arena, buf.data(), buf.size());
-    op->changelist = RowChangeList(Slice(rcl_in_arena, buf.size()));
   } else if (op->type == RowOperationsPB::DELETE) {
-
     // Ensure that no other columns are set.
     for (; client_col_idx < client_schema_->num_columns(); client_col_idx++) {
-      if (BitmapTest(client_isset_map, client_col_idx)) {
-        int tablet_col_idx = mapping.client_to_tablet_idx(client_col_idx);
-        DCHECK_GE(tablet_col_idx, 0);
+      if (PREDICT_FALSE(BitmapTest(client_isset_map, client_col_idx))) {
+        size_t tablet_col_idx = mapping.client_to_tablet_idx(client_col_idx);
         const ColumnSchema& col = tablet_schema_->column(tablet_col_idx);
+        op->SetFailureStatusOnce(Status::InvalidArgument(
+            "DELETE should not have a value for column", col.ToString()));
 
-        return Status::InvalidArgument("DELETE should not have a value for column",
-                                       col.ToString());
+        bool client_set_to_null = client_schema_->has_nullables() &&
+          BitmapTest(client_null_map, client_col_idx);
+        if (!client_set_to_null || !col.is_nullable()) {
+          RETURN_NOT_OK(ReadColumnAndDiscard(col));
+        }
       }
     }
-    op->changelist = RowChangeList::CreateDelete();
+    if (PREDICT_TRUE(op->result.ok())) {
+      op->changelist = RowChangeList::CreateDelete();
+    }
   } else {
     LOG(FATAL) << "Should only call this method with UPDATE or DELETE";
   }
@@ -533,38 +583,39 @@ Status RowOperationsPBDecoder::DecodeSplitRow(const ClientServerMapping& mapping
   }
 
   // Now handle each of the columns passed by the user.
-  for (int client_col_idx = 0; client_col_idx < client_schema_->num_columns(); client_col_idx++) {
+  for (size_t client_col_idx = 0;
+       client_col_idx < client_schema_->num_columns();
+       client_col_idx++) {
     // Look up the corresponding column from the tablet. We use the server-side
     // ColumnSchema object since it has the most up-to-date default, nullability,
     // etc.
-    int tablet_col_idx = mapping.client_to_tablet_idx(client_col_idx);
-    DCHECK_GE(tablet_col_idx, 0);
+    size_t tablet_col_idx = mapping.client_to_tablet_idx(client_col_idx);
     const ColumnSchema& col = tablet_schema_->column(tablet_col_idx);
 
     if (BitmapTest(client_isset_map, client_col_idx)) {
       // If the client provided a value for this column, copy it.
       Slice column_slice;
-      RETURN_NOT_OK(GetColumnSlice(col, &column_slice));
+      RETURN_NOT_OK(GetColumnSlice(col, &column_slice, nullptr));
       const uint8_t* data;
       if (col.type_info()->physical_type() == BINARY) {
         data = reinterpret_cast<const uint8_t*>(&column_slice);
       } else {
         data = column_slice.data();
       }
-      RETURN_NOT_OK(op->split_row->Set(tablet_col_idx, data));
+      RETURN_NOT_OK(op->split_row->Set(static_cast<int32_t>(tablet_col_idx), data));
     }
   }
   return Status::OK();
 }
 
+template <DecoderMode mode>
 Status RowOperationsPBDecoder::DecodeOperations(vector<DecodedRowOperation>* ops) {
-  // TODO: there's a bug here, in that if a client passes some column
-  // in its schema that has been deleted on the server, it will fail
-  // even if the client never actually specified any values for it.
-  // For example, a DBA might do a thorough audit that no one is using
-  // some column anymore, and then drop the column, expecting it to be
-  // compatible, but all writes would start failing until clients
-  // refreshed their schema.
+  // TODO(todd): there's a bug here, in that if a client passes some column in
+  // its schema that has been deleted on the server, it will fail even if the
+  // client never actually specified any values for it.  For example, a DBA
+  // might do a thorough audit that no one is using some column anymore, and
+  // then drop the column, expecting it to be compatible, but all writes would
+  // start failing until clients refreshed their schema.
   // See DISABLED_TestProjectUpdatesSubsetOfColumns
   CHECK(!client_schema_->has_column_ids());
   DCHECK(tablet_schema_->has_column_ids());
@@ -581,34 +632,66 @@ Status RowOperationsPBDecoder::DecodeOperations(vector<DecodedRowOperation>* ops
   SetupPrototypeRow(*tablet_schema_, &prototype_row);
 
   while (HasNext()) {
-    RowOperationsPB::Type type;
+    RowOperationsPB::Type type = RowOperationsPB::UNKNOWN;
     RETURN_NOT_OK(ReadOpType(&type));
     DecodedRowOperation op;
     op.type = type;
 
-    switch (type) {
-      case RowOperationsPB::UNKNOWN:
-        return Status::NotSupported("Unknown row operation type");
-      case RowOperationsPB::INSERT:
-      case RowOperationsPB::UPSERT:
-        RETURN_NOT_OK(DecodeInsertOrUpsert(prototype_row_storage, mapping, &op));
-        break;
-      case RowOperationsPB::UPDATE:
-      case RowOperationsPB::DELETE:
-        RETURN_NOT_OK(DecodeUpdateOrDelete(mapping, &op));
-        break;
-      case RowOperationsPB::SPLIT_ROW:
-      case RowOperationsPB::RANGE_LOWER_BOUND:
-      case RowOperationsPB::RANGE_UPPER_BOUND:
-      case RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND:
-      case RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND:
-        RETURN_NOT_OK(DecodeSplitRow(mapping, &op));
-        break;
-    }
-
+    RETURN_NOT_OK(DecodeOp<mode>(type, prototype_row_storage, mapping, &op));
     ops->push_back(op);
+  }
+
+  return Status::OK();
+}
+
+template<>
+Status RowOperationsPBDecoder::DecodeOp<DecoderMode::WRITE_OPS>(
+    RowOperationsPB::Type type, const uint8_t* prototype_row_storage,
+    const ClientServerMapping& mapping, DecodedRowOperation* op) {
+  switch (type) {
+    case RowOperationsPB::UNKNOWN:
+      return Status::NotSupported("Unknown row operation type");
+    case RowOperationsPB::INSERT:
+    case RowOperationsPB::UPSERT:
+      RETURN_NOT_OK(DecodeInsertOrUpsert(prototype_row_storage, mapping, op));
+      break;
+    case RowOperationsPB::UPDATE:
+    case RowOperationsPB::DELETE:
+      RETURN_NOT_OK(DecodeUpdateOrDelete(mapping, op));
+      break;
+    default:
+      return Status::InvalidArgument(Substitute("Invalid write operation type $0",
+                                                RowOperationsPB_Type_Name(type)));
   }
   return Status::OK();
 }
+
+template<>
+Status RowOperationsPBDecoder::DecodeOp<DecoderMode::SPLIT_ROWS>(
+    RowOperationsPB::Type type, const uint8_t* /*prototype_row_storage*/,
+    const ClientServerMapping& mapping, DecodedRowOperation* op) {
+  switch (type) {
+    case RowOperationsPB::UNKNOWN:
+      return Status::NotSupported("Unknown row operation type");
+    case RowOperationsPB::SPLIT_ROW:
+    case RowOperationsPB::RANGE_LOWER_BOUND:
+    case RowOperationsPB::RANGE_UPPER_BOUND:
+    case RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND:
+    case RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND:
+      RETURN_NOT_OK(DecodeSplitRow(mapping, op));
+      break;
+    default:
+      return Status::InvalidArgument(Substitute("Invalid split row type $0",
+                                                RowOperationsPB_Type_Name(type)));
+  }
+  return Status::OK();
+}
+
+template
+Status RowOperationsPBDecoder::DecodeOperations<DecoderMode::SPLIT_ROWS>(
+    vector<DecodedRowOperation>* ops);
+template
+Status RowOperationsPBDecoder::DecodeOperations<DecoderMode::WRITE_OPS>(
+    vector<DecodedRowOperation>* ops);
 
 } // namespace kudu

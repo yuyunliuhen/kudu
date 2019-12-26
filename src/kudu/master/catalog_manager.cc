@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -63,8 +64,8 @@
 #include <boost/function.hpp>
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
+#include <google/protobuf/stubs/common.h>
 
 #include "kudu/cfile/type_encodings.h"
 #include "kudu/common/common.pb.h"
@@ -86,6 +87,7 @@
 #include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/bind.h"
 #include "kudu/gutil/bind_helpers.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
@@ -97,12 +99,16 @@
 #include "kudu/gutil/utf/utf.h"
 #include "kudu/gutil/walltime.h"
 #include "kudu/hms/hms_catalog.h"
+#include "kudu/master/authz_provider.h"
+#include "kudu/master/default_authz_provider.h"
 #include "kudu/master/hms_notification_log_listener.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master_cert_authority.h"
 #include "kudu/master/placement_policy.h"
+#include "kudu/master/sentry_authz_provider.h"
 #include "kudu/master/sys_catalog.h"
+#include "kudu/master/table_metrics.h"
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
 #include "kudu/rpc/messenger.h"
@@ -128,6 +134,7 @@
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/pb_util.h"
@@ -135,6 +142,7 @@
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/thread.h"
+#include "kudu/util/thread_restrictions.h"
 #include "kudu/util/threadpool.h"
 #include "kudu/util/trace.h"
 
@@ -176,6 +184,10 @@ TAG_FLAG(max_num_columns, unsafe);
 
 DEFINE_int32(max_identifier_length, 256,
              "Maximum length of the name of a column or table.");
+
+DEFINE_int32(max_column_comment_length, 256,
+             "Maximum length of the comment of a column");
+
 // Tag as unsafe because we end up writing schemas in every WAL entry, etc,
 // and having very long column names would enter untested territory and affect
 // performance.
@@ -251,34 +263,65 @@ DEFINE_bool(catalog_manager_evict_excess_replicas, true,
 TAG_FLAG(catalog_manager_evict_excess_replicas, hidden);
 TAG_FLAG(catalog_manager_evict_excess_replicas, runtime);
 
+DEFINE_int32(catalog_manager_inject_latency_list_authz_ms, 0,
+             "Injects a sleep in milliseconds while authorizing a ListTables "
+             "request. This is a test-only flag.");
+TAG_FLAG(catalog_manager_inject_latency_list_authz_ms, hidden);
+TAG_FLAG(catalog_manager_inject_latency_list_authz_ms, unsafe);
+
+DEFINE_bool(mock_table_metrics_for_testing, false,
+            "Whether to enable mock table metrics for testing.");
+TAG_FLAG(mock_table_metrics_for_testing, hidden);
+TAG_FLAG(mock_table_metrics_for_testing, runtime);
+
+DEFINE_bool(catalog_manager_support_live_row_count, true,
+            "Whether to enable mock live row count statistic for tables. For testing only");
+TAG_FLAG(catalog_manager_support_live_row_count, hidden);
+TAG_FLAG(catalog_manager_support_live_row_count, runtime);
+
+DEFINE_int64(on_disk_size_for_testing, 0,
+             "Mock the on disk size of metrics for testing.");
+TAG_FLAG(on_disk_size_for_testing, hidden);
+TAG_FLAG(on_disk_size_for_testing, runtime);
+
+DEFINE_int64(live_row_count_for_testing, 0,
+             "Mock the live row count of metrics for testing.");
+TAG_FLAG(live_row_count_for_testing, hidden);
+TAG_FLAG(live_row_count_for_testing, runtime);
+
 DECLARE_bool(raft_prepare_replacement_before_eviction);
-DECLARE_bool(raft_attempt_to_replace_replica_without_majority);
 DECLARE_int64(tsk_rotation_seconds);
+
+METRIC_DEFINE_entity(table);
 
 using base::subtle::NoBarrier_CompareAndSwap;
 using base::subtle::NoBarrier_Load;
+using boost::make_optional;
+using boost::none;
 using boost::optional;
+using google::protobuf::Map;
 using kudu::cfile::TypeEncodingInfo;
 using kudu::consensus::ConsensusServiceProxy;
 using kudu::consensus::ConsensusStatePB;
-using kudu::consensus::GetConsensusRole;
 using kudu::consensus::IsRaftConfigMember;
-using kudu::consensus::MajorityHealthPolicy;
 using kudu::consensus::RaftConfigPB;
 using kudu::consensus::RaftConsensus;
 using kudu::consensus::RaftPeerPB;
 using kudu::consensus::StartTabletCopyRequestPB;
 using kudu::consensus::kMinimumTerm;
+using kudu::hms::HmsClientVerifyKuduSyncConfig;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
 using kudu::rpc::RpcContext;
 using kudu::security::Cert;
 using kudu::security::DataFormat;
 using kudu::security::PrivateKey;
+using kudu::security::TablePrivilegePB;
 using kudu::security::TokenSigner;
 using kudu::security::TokenSigningPrivateKey;
 using kudu::security::TokenSigningPrivateKeyPB;
 using kudu::security::TokenSigningPublicKeyPB;
+using kudu::tablet::ReportedTabletStatsPB;
 using kudu::tablet::TABLET_DATA_DELETED;
 using kudu::tablet::TABLET_DATA_TOMBSTONED;
 using kudu::tablet::TabletDataState;
@@ -341,6 +384,9 @@ class TableLoader : public TableVisitor {
     l.Commit();
 
     if (!is_deleted) {
+      // It's unnecessary to register metrics for the deleted tables.
+      table->RegisterMetrics(catalog_manager_->master_->metric_registry(),
+          CatalogManager::NormalizeTableName(metadata.name()));
       LOG(INFO) << Substitute("Loaded metadata for table $0", table->ToString());
     }
     VLOG(2) << Substitute("Metadata for table $0: $1",
@@ -686,6 +732,11 @@ CatalogManager::CatalogManager(Master* master)
       leader_ready_term_(-1),
       hms_notification_log_event_id_(-1),
       leader_lock_(RWMutex::Priority::PREFER_WRITING) {
+  if (SentryAuthzProvider::IsEnabled()) {
+    authz_provider_.reset(new SentryAuthzProvider(master_->metric_entity()));
+  } else {
+    authz_provider_.reset(new DefaultAuthzProvider);
+  }
   CHECK_OK(ThreadPoolBuilder("leader-initialization")
            // Presently, this thread pool must contain only a single thread
            // (to correctly serialize invocations of ElectedAsLeaderCb upon
@@ -735,13 +786,15 @@ Status CatalogManager::Init(bool is_first_run) {
     std::lock_guard<RWMutex> leader_lock_guard(leader_lock_);
 
     hms_catalog_.reset(new hms::HmsCatalog(std::move(master_addresses)));
-    RETURN_NOT_OK_PREPEND(hms_catalog_->Start(),
+    RETURN_NOT_OK_PREPEND(hms_catalog_->Start(HmsClientVerifyKuduSyncConfig::VERIFY),
                           "failed to start Hive Metastore catalog");
 
     hms_notification_log_listener_.reset(new HmsNotificationLogListenerTask(this));
     RETURN_NOT_OK_PREPEND(hms_notification_log_listener_->Init(),
         "failed to initialize Hive Metastore notification log listener task");
   }
+
+  RETURN_NOT_OK_PREPEND(authz_provider_->Start(), "failed to start Authz Provider");
 
   background_tasks_.reset(new CatalogManagerBgTasks(this));
   RETURN_NOT_OK_PREPEND(background_tasks_->Init(),
@@ -1061,6 +1114,17 @@ void CatalogManager::PrepareForLeadershipTask() {
       }
     }
 
+    static const char* const kTServerStatesDescription =
+        "Initializing in-progress tserver states";
+    LOG(INFO) << kTServerStatesDescription << "...";
+    LOG_SLOW_EXECUTION(WARNING, 1000, LogPrefix() + kTServerStatesDescription) {
+      if (!check(std::bind(&TSManager::ReloadTServerStates, master_->ts_manager(),
+                           sys_catalog_.get()),
+                 *consensus, term, kTServerStatesDescription).ok()) {
+        return;
+      }
+    }
+
     if (hms_catalog_) {
       static const char* const kNotificationLogEventIdDescription =
           "Loading latest processed Hive Metastore notification log event ID";
@@ -1221,6 +1285,10 @@ void CatalogManager::Shutdown() {
     background_tasks_->Shutdown();
   }
 
+  if (authz_provider_) {
+    authz_provider_->Stop();
+  }
+
   if (hms_catalog_) {
     hms_notification_log_listener_->Shutdown();
     hms_catalog_->Stop();
@@ -1278,19 +1346,15 @@ Status CatalogManager::CheckOnline() const {
 
 namespace {
 
-// Validate a table or column name to ensure that it is a valid identifier.
-Status ValidateIdentifier(const string& id) {
-  if (id.empty()) {
-    return Status::InvalidArgument("empty string not a valid identifier");
-  }
-
-  if (id.length() > FLAGS_max_identifier_length) {
+Status ValidateLengthAndUTF8(const string& id, int32_t max_length) {
+  // Id should not exceed the maximum allowed length.
+  if (id.length() > max_length) {
     return Status::InvalidArgument(Substitute(
         "identifier '$0' longer than maximum permitted length $1",
         id, FLAGS_max_identifier_length));
   }
 
-  // Identifiers should be valid UTF8.
+  // Id should be valid UTF8.
   const char* p = id.data();
   int rem = id.size();
   while (rem > 0) {
@@ -1309,15 +1373,35 @@ Status ValidateIdentifier(const string& id) {
   return Status::OK();
 }
 
+// Validate a table or column name to ensure that it is a valid identifier.
+Status ValidateIdentifier(const string& id) {
+  if (id.empty()) {
+    return Status::InvalidArgument("empty string not a valid identifier");
+  }
+
+  return ValidateLengthAndUTF8(id, FLAGS_max_identifier_length);
+}
+
+// Validate a column comment to ensure that it is a valid identifier.
+Status ValidateCommentIdentifier(const string& id) {
+  if (id.empty()) {
+    return Status::OK();
+  }
+
+  return ValidateLengthAndUTF8(id, FLAGS_max_column_comment_length);
+}
+
 // Validate the client-provided schema and name.
 Status ValidateClientSchema(const optional<string>& name,
                             const Schema& schema) {
-  if (name != boost::none) {
+  if (name) {
     RETURN_NOT_OK_PREPEND(ValidateIdentifier(name.get()), "invalid table name");
   }
   for (int i = 0; i < schema.num_columns(); i++) {
     RETURN_NOT_OK_PREPEND(ValidateIdentifier(schema.column(i).name()),
                           "invalid column name");
+    RETURN_NOT_OK_PREPEND(ValidateCommentIdentifier(schema.column(i).comment()),
+                          "invalid column comment");
   }
   if (schema.num_key_columns() <= 0) {
     return Status::InvalidArgument("must specify at least one key column");
@@ -1365,12 +1449,6 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
-  // If the HMS integration is enabled, wait for the notification log listener
-  // to catch up. This reduces the likelihood of attempting to create a table
-  // with a name that conflicts with a table that has just been deleted or
-  // renamed in the HMS.
-  RETURN_NOT_OK(WaitForNotificationLogListenerCatchUp(resp, rpc));
-
   // Copy the request, so we can fill in some defaults.
   CreateTableRequestPB req = *orig_req;
   LOG(INFO) << Substitute("Servicing CreateTable request from $0:\n$1",
@@ -1387,9 +1465,23 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   }
 
   // a. Validate the user request.
+  const string& normalized_table_name = NormalizeTableName(req.name());
+  if (rpc) {
+    const string& user = rpc->remote_user().username();
+    const string& owner = req.has_owner() ? req.owner() : user;
+    RETURN_NOT_OK(SetupError(
+        authz_provider_->AuthorizeCreateTable(normalized_table_name, user, owner),
+        resp, MasterErrorPB::NOT_AUTHORIZED));
+  }
+
+  // If the HMS integration is enabled, wait for the notification log listener
+  // to catch up. This reduces the likelihood of attempting to create a table
+  // with a name that conflicts with a table that has just been deleted or
+  // renamed in the HMS.
+  RETURN_NOT_OK(WaitForNotificationLogListenerCatchUp(resp, rpc));
+
   Schema client_schema;
   RETURN_NOT_OK(SchemaFromPB(req.schema(), &client_schema));
-  const string normalized_table_name = NormalizeTableName(req.name());
 
   RETURN_NOT_OK(SetupError(ValidateClientSchema(normalized_table_name, client_schema),
                            resp, MasterErrorPB::INVALID_SCHEMA));
@@ -1414,7 +1506,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   RowOperationsPBDecoder decoder(req.mutable_split_rows_range_bounds(),
                                  &client_schema, &schema, nullptr);
   vector<DecodedRowOperation> ops;
-  RETURN_NOT_OK(decoder.DecodeOperations(&ops));
+  RETURN_NOT_OK(decoder.DecodeOperations<DecoderMode::SPLIT_ROWS>(&ops));
 
   for (int i = 0; i < ops.size(); i++) {
     const DecodedRowOperation& op = ops[i];
@@ -1485,7 +1577,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   // Verify that the number of replicas isn't larger than the number of live tablet
   // servers.
   TSDescriptorVector ts_descs;
-  master_->ts_manager()->GetAllLiveDescriptors(&ts_descs);
+  master_->ts_manager()->GetDescriptorsAvailableForPlacement(&ts_descs);
   const auto num_live_tservers = ts_descs.size();
   if (FLAGS_catalog_manager_check_ts_count_for_create_table && num_replicas > num_live_tservers) {
     // Note: this error message is matched against in master-stress-test.
@@ -1533,6 +1625,10 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
         num_live_tservers);
   }
 
+  // Verify the table's extra configuration properties.
+  TableExtraConfigPB extra_config_pb;
+  RETURN_NOT_OK(ExtraConfigPBFromPBMap(req.extra_configs(), &extra_config_pb));
+
   scoped_refptr<TableInfo> table;
   {
     std::lock_guard<LockType> l(lock_);
@@ -1567,7 +1663,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
 
   // d. Create the in-memory representation of the new table and its tablets.
   //    It's not yet in any global maps; that will happen in step g below.
-  table = CreateTableInfo(req, schema, partition_schema);
+  table = CreateTableInfo(req, schema, partition_schema, std::move(extra_config_pb));
   vector<scoped_refptr<TabletInfo>> tablets;
   auto abort_mutations = MakeScopedCleanup([&table, &tablets]() {
     table->mutable_metadata()->AbortMutation();
@@ -1575,10 +1671,12 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
       e->mutable_metadata()->AbortMutation();
     }
   });
+  optional<string> dimension_label =
+      req.has_dimension_label() ? make_optional<string>(req.dimension_label()) : none;
   for (const Partition& partition : partitions) {
     PartitionPB partition_pb;
     partition.ToPB(&partition_pb);
-    tablets.emplace_back(CreateTabletInfo(table, partition_pb));
+    tablets.emplace_back(CreateTabletInfo(table, partition_pb, dimension_label));
   }
   TRACE("Created new table and tablet info");
 
@@ -1597,7 +1695,8 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   // It is critical that this step happen before writing the table to the sys catalog,
   // since this step validates that the table name is available in the HMS catalog.
   if (hms_catalog_) {
-    string owner = req.has_owner() ? req.owner() : rpc->remote_user().username();
+    CHECK(rpc);
+    const string& owner = req.has_owner() ? req.owner() : rpc->remote_user().username();
     Status s = hms_catalog_->CreateTable(table->id(), normalized_table_name, owner, schema);
     if (!s.ok()) {
       s = s.CloneAndPrepend(Substitute("an error occurred while creating table $0 in the HMS",
@@ -1605,6 +1704,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
       LOG(WARNING) << s.ToString();
       return SetupError(std::move(s), resp, MasterErrorPB::HIVE_METASTORE_ERROR);
     }
+    TRACE("Created new table in HMS catalog");
   }
   // Delete the new HMS entry if we exit early.
   auto abort_hms = MakeScopedCleanup([&] {
@@ -1670,14 +1770,21 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
 }
 
 Status CatalogManager::IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
-                                         IsCreateTableDoneResponsePB* resp) {
+                                         IsCreateTableDoneResponsePB* resp,
+                                         optional<const string&> user) {
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
-  // 1. Lookup the table and verify if it exists
+  // 1. Lookup the table, verify if it exists, and then check that
+  //    the user is authorized to operate on the table.
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  RETURN_NOT_OK(FindAndLockTable(*req, resp, LockMode::READ, &table, &l));
+  auto authz_func = [&] (const string& username, const string& table_name) {
+    return SetupError(authz_provider_->AuthorizeGetTableMetadata(table_name, username),
+                      resp, MasterErrorPB::NOT_AUTHORIZED);
+  };
+  RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
+                                          &table, &l));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   // 2. Verify if the create is in-progress
@@ -1687,9 +1794,11 @@ Status CatalogManager::IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
   return Status::OK();
 }
 
-scoped_refptr<TableInfo> CatalogManager::CreateTableInfo(const CreateTableRequestPB& req,
-                                                         const Schema& schema,
-                                                         const PartitionSchema& partition_schema) {
+scoped_refptr<TableInfo> CatalogManager::CreateTableInfo(
+    const CreateTableRequestPB& req,
+    const Schema& schema,
+    const PartitionSchema& partition_schema,
+    TableExtraConfigPB extra_config_pb) {
   DCHECK(schema.has_column_ids());
   scoped_refptr<TableInfo> table = new TableInfo(GenerateId());
   table->mutable_metadata()->StartMutation();
@@ -1703,36 +1812,71 @@ scoped_refptr<TableInfo> CatalogManager::CreateTableInfo(const CreateTableReques
   // whereas the user request PB does not.
   CHECK_OK(SchemaToPB(schema, metadata->mutable_schema()));
   partition_schema.ToPB(metadata->mutable_partition_schema());
+  metadata->set_create_timestamp(time(nullptr));
+  (*metadata->mutable_extra_config()) = std::move(extra_config_pb);
+  table->RegisterMetrics(master_->metric_registry(), metadata->name());
   return table;
 }
 
-scoped_refptr<TabletInfo> CatalogManager::CreateTabletInfo(const scoped_refptr<TableInfo>& table,
-                                                           const PartitionPB& partition) {
+scoped_refptr<TabletInfo> CatalogManager::CreateTabletInfo(
+    const scoped_refptr<TableInfo>& table,
+    const PartitionPB& partition,
+    const optional<string>& dimension_label) {
   scoped_refptr<TabletInfo> tablet(new TabletInfo(table, GenerateId()));
   tablet->mutable_metadata()->StartMutation();
-  SysTabletsEntryPB *metadata = &tablet->mutable_metadata()->mutable_dirty()->pb;
+  SysTabletsEntryPB* metadata = &tablet->mutable_metadata()->mutable_dirty()->pb;
   metadata->set_state(SysTabletsEntryPB::PREPARING);
   metadata->mutable_partition()->CopyFrom(partition);
   metadata->set_table_id(table->id());
+  if (dimension_label) {
+    metadata->set_dimension_label(*dimension_label);
+  }
   return tablet;
 }
 
-template<typename ReqClass, typename RespClass>
-Status CatalogManager::FindAndLockTable(const ReqClass& request,
-                                        RespClass* response,
-                                        LockMode lock_mode,
-                                        scoped_refptr<TableInfo>* table_info,
-                                        TableMetadataLock* table_lock) {
-  TRACE("Looking up and locking table");
+template<typename ReqClass, typename RespClass, typename F>
+Status CatalogManager::FindLockAndAuthorizeTable(
+    const ReqClass& request,
+    RespClass* response,
+    LockMode lock_mode,
+    F authz_func,
+    optional<const string&> user,
+    scoped_refptr<TableInfo>* table_info,
+    TableMetadataLock* table_lock) {
+  TRACE("Looking up, locking, and authorizing table");
   const TableIdentifierPB& table_identifier = request.table();
 
+  // For authorization, depends on whether the request contains table ID/name,
+  // below is the name of the table to validate against.
+  // *----------------*--------------*---------------------*-----------------*
+  // | HAS TABLE NAME | HAS TABLE ID | TABLE NAME/ID MATCH | AUTHZ NAME      |
+  // *----------------*--------------*---------------------*-----------------*
+  // | YES            | YES          | YES                 | TABLE NAME      |
+  // *----------------*--------------*---------------------*-----------------*
+  // | YES            | YES          | NO                  | TABLE NAME/ID   |
+  // *----------------*--------------*---------------------*-----------------*
+  // | YES            | NO           | N/A                 | TABLE NAME      |
+  // *----------------*--------------*---------------------*-----------------*
+  // | NO             | YES          | N/A                 | TABLE ID        |
+  // *----------------*--------------*---------------------*-----------------*
+  // | NO             | NO           | N/A                 | InvalidArgument |
+  // *----------------*--------------*---------------------*-----------------*
+  auto authorize = [&] (const string& name) {
+    if (user) {
+      return authz_func(*user, name);
+    }
+    return Status::OK();
+  };
+
   auto tnf_error = [&] {
-    return SetupError(Status::NotFound(
-          "the table does not exist", SecureShortDebugString(table_identifier)),
+    return SetupError(
+        Status::NotFound("the table does not exist", SecureShortDebugString(table_identifier)),
         response, MasterErrorPB::TABLE_NOT_FOUND);
   };
 
   scoped_refptr<TableInfo> table;
+  // Set to true if the client-provided table name and ID refer to different tables.
+  bool mismatched_table = false;
   {
     shared_lock<LockType> l(lock_);
     if (table_identifier.has_table_id()) {
@@ -1743,7 +1887,7 @@ Status CatalogManager::FindAndLockTable(const ReqClass& request,
       if (table_identifier.has_table_name() &&
           table.get() != FindPtrOrNull(normalized_table_names_map_,
                                        NormalizeTableName(table_identifier.table_name())).get()) {
-        return tnf_error();
+        mismatched_table = true;
       }
     } else if (table_identifier.has_table_name()) {
       table = FindPtrOrNull(normalized_table_names_map_,
@@ -1755,15 +1899,41 @@ Status CatalogManager::FindAndLockTable(const ReqClass& request,
   }
 
   // If the table doesn't exist, don't attempt to lock it.
+  //
+  // If the request contains table name and the user is authorized to operate
+  // on the table, then return TABLE_NOT_FOUND error. Otherwise, return
+  // NOT_AUTHORIZED error, to avoid leaking table existence.
   if (!table) {
+    if (table_identifier.has_table_name()) {
+      RETURN_NOT_OK(authorize(NormalizeTableName(table_identifier.table_name())));
+    }
     return tnf_error();
   }
 
-  // Acquire the table lock.
+  // Acquire the table lock. And validate if the operation on the table
+  // found is authorized.
   TableMetadataLock lock(table.get(), lock_mode);
+  string table_name = NormalizeTableName(lock.data().name());
+  RETURN_NOT_OK(authorize(table_name));
+
+  // If the table name and table ID refer to different tables, for example,
+  //   1. the ID maps to table A.
+  //   2. the name maps to table B.
+  //
+  // Authorize user against both tables, then return TABLE_NOT_FOUND error to
+  // avoid leaking table existence.
+  if (mismatched_table) {
+    RETURN_NOT_OK(authorize(NormalizeTableName(table_identifier.table_name())));
+    return SetupError(
+        Status::NotFound(
+            Substitute("the table ID refers to a different table '$0' than '$1'",
+                       table_name, table_identifier.table_name()),
+            SecureShortDebugString(table_identifier)),
+        response, MasterErrorPB::TABLE_NOT_FOUND);
+  }
 
   if (table_identifier.has_table_name() &&
-      NormalizeTableName(table_identifier.table_name()) != NormalizeTableName(lock.data().name())) {
+      NormalizeTableName(table_identifier.table_name()) != table_name) {
     // We've encountered the table while it's in the process of being renamed;
     // pretend it doesn't yet exist.
     return tnf_error();
@@ -1783,6 +1953,9 @@ Status CatalogManager::DeleteTableRpc(const DeleteTableRequestPB& req,
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
+  optional<const string&> user = rpc ?
+      make_optional<const string&>(rpc->remote_user().username()) : none;
+
   // If the HMS integration is enabled and the table should be deleted in the HMS,
   // then don't directly remove the table from the Kudu catalog. Instead, delete
   // the table from the HMS and wait for the notification log listener to apply
@@ -1794,10 +1967,16 @@ Status CatalogManager::DeleteTableRpc(const DeleteTableRequestPB& req,
     // renamed in the HMS.
     RETURN_NOT_OK(WaitForNotificationLogListenerCatchUp(resp, rpc));
 
-    // Look up and lock the table.
+    // Look up the table, lock it and then check that the user is authorized
+    // to operate on the table.
     scoped_refptr<TableInfo> table;
     TableMetadataLock l;
-    RETURN_NOT_OK(FindAndLockTable(req, resp, LockMode::READ, &table, &l));
+    auto authz_func = [&](const string& username, const string& table_name) {
+      return SetupError(authz_provider_->AuthorizeDropTable(table_name, username),
+                        resp, MasterErrorPB::NOT_AUTHORIZED);
+    };
+    RETURN_NOT_OK(FindLockAndAuthorizeTable(req, resp, LockMode::READ, authz_func, user,
+                                            &table, &l));
     if (l.data().is_deleted()) {
       return SetupError(Status::NotFound("the table was deleted", l.data().pb.state_msg()),
           resp, MasterErrorPB::TABLE_NOT_FOUND);
@@ -1816,7 +1995,7 @@ Status CatalogManager::DeleteTableRpc(const DeleteTableRequestPB& req,
 
   // If the HMS integration isn't enabled or the deletion should only happen in Kudu,
   // then delete the table directly from the Kudu catalog.
-  return DeleteTable(req, resp, boost::none);
+  return DeleteTable(req, resp, /*hms_notification_log_event_id=*/none, user);
 }
 
 Status CatalogManager::DeleteTableHms(const string& table_name,
@@ -1832,7 +2011,10 @@ Status CatalogManager::DeleteTableHms(const string& table_name,
   req.mutable_table()->set_table_name(table_name);
   req.mutable_table()->set_table_id(table_id);
 
-  RETURN_NOT_OK(DeleteTable(req, &resp, notification_log_event_id));
+  // Use empty user to skip the authorization validation since the operation
+  // originates from catalog manager. Moreover, this avoids duplicate effort,
+  // because we already perform authorization before making any changes to the HMS.
+  RETURN_NOT_OK(DeleteTable(req, &resp, notification_log_event_id, /*user=*/none));
 
   // Update the cached HMS notification log event ID, if it changed.
   DCHECK_GT(notification_log_event_id, hms_notification_log_event_id_);
@@ -1843,20 +2025,27 @@ Status CatalogManager::DeleteTableHms(const string& table_name,
 
 Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
                                    DeleteTableResponsePB* resp,
-                                   optional<int64_t> hms_notification_log_event_id) {
+                                   optional<int64_t> hms_notification_log_event_id,
+                                   optional<const string&> user) {
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
-  // 1. Look up the table, lock it, and mark it as removed.
+  // 1. Look up the table, lock it, and then check that the user is authorized
+  //    to operate on the table. Last, mark it as removed.
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  RETURN_NOT_OK(FindAndLockTable(req, resp, LockMode::WRITE, &table, &l));
+  auto authz_func = [&] (const string& username, const string& table_name) {
+    return SetupError(authz_provider_->AuthorizeDropTable(table_name, username),
+                      resp, MasterErrorPB::NOT_AUTHORIZED);
+  };
+  RETURN_NOT_OK(FindLockAndAuthorizeTable(req, resp, LockMode::WRITE, authz_func, user,
+                                          &table, &l));
   if (l.data().is_deleted()) {
     return SetupError(Status::NotFound("the table was deleted", l.data().pb.state_msg()),
         resp, MasterErrorPB::TABLE_NOT_FOUND);
   }
 
-  TRACE("Modifying in-memory table state")
+  TRACE("Modifying in-memory table state");
   string deletion_msg = "Table deleted at " + LocalTimeAsString();
   l.mutable_data()->set_state(SysTablesEntryPB::REMOVED, deletion_msg);
 
@@ -1897,6 +2086,7 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
                    << " from map in response to DeleteTable request: "
                    << SecureShortDebugString(req);
       }
+      table->UnregisterMetrics();
     }
 
     // 5. Commit the dirty tablet state.
@@ -1946,13 +2136,14 @@ Status CatalogManager::ApplyAlterSchemaSteps(const SysTablesEntryPB& current_pb,
         RETURN_NOT_OK(ProcessColumnPBDefaults(&new_col_pb));
 
         // Can't accept a NOT NULL column without a default.
-        ColumnSchema new_col = ColumnSchemaFromPB(new_col_pb);
-        if (!new_col.is_nullable() && !new_col.has_read_default()) {
+        boost::optional<ColumnSchema> new_col;
+        RETURN_NOT_OK(ColumnSchemaFromPB(new_col_pb, &new_col));
+        if (!new_col->is_nullable() && !new_col->has_read_default()) {
           return Status::InvalidArgument(
-              Substitute("column `$0`: NOT NULL columns must have a default", new_col.name()));
+              Substitute("column `$0`: NOT NULL columns must have a default", new_col->name()));
         }
 
-        RETURN_NOT_OK(builder.AddColumn(new_col, false));
+        RETURN_NOT_OK(builder.AddColumn(*new_col, false));
         break;
       }
 
@@ -2025,12 +2216,12 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
     if (step.type() == AlterTableRequestPB::ADD_RANGE_PARTITION) {
       RowOperationsPBDecoder decoder(&step.add_range_partition().range_bounds(),
                                      &client_schema, &schema, nullptr);
-      RETURN_NOT_OK(decoder.DecodeOperations(&ops));
+      RETURN_NOT_OK(decoder.DecodeOperations<DecoderMode::SPLIT_ROWS>(&ops));
     } else {
       CHECK_EQ(step.type(), AlterTableRequestPB::DROP_RANGE_PARTITION);
       RowOperationsPBDecoder decoder(&step.drop_range_partition().range_bounds(),
                                      &client_schema, &schema, nullptr);
-      RETURN_NOT_OK(decoder.DecodeOperations(&ops));
+      RETURN_NOT_OK(decoder.DecodeOperations<DecoderMode::SPLIT_ROWS>(&ops));
     }
 
     if (ops.size() != 2) {
@@ -2113,7 +2304,10 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
 
           PartitionPB partition_pb;
           partition.ToPB(&partition_pb);
-          new_tablets.emplace(lower_bound, CreateTabletInfo(table, partition_pb));
+          optional<string> dimension_label = step.add_range_partition().has_dimension_label() ?
+              make_optional<string>(step.add_range_partition().dimension_label()) : none;
+          new_tablets.emplace(lower_bound,
+                              CreateTabletInfo(table, partition_pb, dimension_label));
         }
         break;
       }
@@ -2185,6 +2379,9 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
   LOG(INFO) << Substitute("Servicing AlterTable request from $0:\n$1",
                           RequestorString(rpc), SecureShortDebugString(req));
 
+  optional<const string&> user = rpc ?
+      make_optional<const string&>(rpc->remote_user().username()) : none;
+
   // If the HMS integration is enabled, the alteration includes a table
   // rename and the table should be altered in the HMS, then don't directly
   // rename the table in the Kudu catalog. Instead, rename the table
@@ -2192,12 +2389,21 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
   // that event to the catalog. By 'serializing' the rename through the
   // HMS, race conditions are avoided.
   if (hms_catalog_ && req.has_new_table_name() && req.modify_external_catalogs()) {
-    // Look up the table and lock it.
+    // Look up the table, lock it and then check that the user is authorized
+    // to operate on the table.
     scoped_refptr<TableInfo> table;
     TableMetadataLock l;
-    RETURN_NOT_OK(FindAndLockTable(req, resp, LockMode::READ, &table, &l));
-    RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
     string normalized_new_table_name = NormalizeTableName(req.new_table_name());
+    auto authz_func = [&](const string& username,
+                          const string& table_name) {
+      return SetupError(authz_provider_->AuthorizeAlterTable(table_name,
+                                                             normalized_new_table_name,
+                                                             username),
+                        resp, MasterErrorPB::NOT_AUTHORIZED);
+    };
+    RETURN_NOT_OK(FindLockAndAuthorizeTable(req, resp, LockMode::READ, authz_func, user,
+                                            &table, &l));
+    RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
     // The HMS allows renaming a table to the same name (ALTER TABLE t RENAME TO t),
     // however Kudu does not, so we must enforce this constraint ourselves before
@@ -2227,15 +2433,24 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
     // Finally, apply the remaining schema and partitioning alterations to the
     // local catalog. Since Kudu holds the canonical version of table schemas
     // and partitions the HMS is not updated first.
+    //
+    // Note that we pass empty user to AlterTable() to skip the authorization
+    // validation since we already perform authorization before making any
+    // changes to the HMS. Moreover, even though a table renaming could happen
+    // before the remaining schema and partitioning alterations taking place,
+    // it is ideal from the users' point of view, to not authorize against the
+    // new table name arose from other RPCs.
     AlterTableRequestPB r(req);
     r.mutable_table()->clear_table_name();
     r.mutable_table()->set_table_id(table->id());
     r.clear_new_table_name();
 
-    return AlterTable(r, resp, boost::none);
+    return AlterTable(r, resp,
+                      /*hms_notification_log_event_id=*/none,
+                      /*user=*/none);
   }
 
-  return AlterTable(req, resp, boost::none);
+  return AlterTable(req, resp, /*hms_notification_log_event_id=*/ none, user);
 }
 
 Status CatalogManager::RenameTableHms(const string& table_id,
@@ -2248,7 +2463,10 @@ Status CatalogManager::RenameTableHms(const string& table_id,
   req.mutable_table()->set_table_name(table_name);
   req.set_new_table_name(new_table_name);
 
-  RETURN_NOT_OK(AlterTable(req, &resp, notification_log_event_id));
+  // Use empty user to skip the authorization validation since the operation
+  // originates from catalog manager. Moreover, this avoids duplicate effort,
+  // because we already perform authorization before making any changes to the HMS.
+  RETURN_NOT_OK(AlterTable(req, &resp, notification_log_event_id, /*user=*/none));
 
   // Update the cached HMS notification log event ID.
   DCHECK_GT(notification_log_event_id, hms_notification_log_event_id_);
@@ -2259,7 +2477,8 @@ Status CatalogManager::RenameTableHms(const string& table_id,
 
 Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
                                   AlterTableResponsePB* resp,
-                                  optional<int64_t> hms_notification_log_event_id) {
+                                  optional<int64_t> hms_notification_log_event_id,
+                                  optional<const string&> user) {
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
@@ -2286,15 +2505,25 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     }
   }
 
-  // 2. Lookup the table, verify if it exists, and lock it for modification.
+  // 2. Lookup the table, verify if it exists, lock it for modification, and then
+  //    checks that the user is authorized to operate on the table.
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  RETURN_NOT_OK(FindAndLockTable(req, resp, LockMode::WRITE, &table, &l));
+  auto authz_func = [&] (const string& username,
+                         const string& table_name) {
+    const string new_table = req.has_new_table_name() ?
+        NormalizeTableName(req.new_table_name()) : table_name;
+    return SetupError(authz_provider_->AuthorizeAlterTable(table_name, new_table, username),
+                      resp, MasterErrorPB::NOT_AUTHORIZED);
+  };
+  RETURN_NOT_OK(FindLockAndAuthorizeTable(req, resp, LockMode::WRITE, authz_func, user,
+                                          &table, &l));
   if (l.data().is_deleted()) {
     return SetupError(
         Status::NotFound("the table was deleted", l.data().pb.state_msg()),
         resp, MasterErrorPB::TABLE_NOT_FOUND);
   }
+  l.mutable_data()->pb.set_alter_timestamp(time(nullptr));
 
   string normalized_table_name = NormalizeTableName(l.data().name());
   *resp->mutable_table_id() = table->id();
@@ -2317,7 +2546,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
 
   // Just validate the schema, not the name (validated below).
   RETURN_NOT_OK(SetupError(
-        ValidateClientSchema(boost::none, new_schema),
+        ValidateClientSchema(none, new_schema),
         resp, MasterErrorPB::INVALID_SCHEMA));
 
   // 4. Validate and try to acquire the new table name.
@@ -2384,10 +2613,25 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
           resp, MasterErrorPB::UNKNOWN_ERROR));
   }
 
+  // 6. Alter table's extra configuration properties.
+  if (!req.new_extra_configs().empty()) {
+    TRACE("Apply alter extra-config");
+    Map<string, string> new_extra_configs;
+    RETURN_NOT_OK(ExtraConfigPBToPBMap(l.data().pb.extra_config(),
+                                       &new_extra_configs));
+    // Merge table's extra configuration properties.
+    for (auto config : req.new_extra_configs()) {
+      new_extra_configs[config.first] = config.second;
+    }
+    RETURN_NOT_OK(ExtraConfigPBFromPBMap(new_extra_configs,
+                                         l.mutable_data()->pb.mutable_extra_config()));
+  }
+
   // Set to true if columns are altered, added or dropped.
   bool has_schema_changes = !alter_schema_steps.empty();
   // Set to true if there are schema changes, or the table is renamed.
-  bool has_metadata_changes = has_schema_changes || req.has_new_table_name();
+  bool has_metadata_changes =
+      has_schema_changes || req.has_new_table_name() || !req.new_extra_configs().empty();
   // Set to true if there are partitioning changes.
   bool has_partitioning_changes = !alter_partitioning_steps.empty();
   // Set to true if metadata changes need to be applied to existing tablets.
@@ -2399,7 +2643,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     return Status::OK();
   }
 
-  // 6. Serialize the schema and increment the version number.
+  // 7. Serialize the schema and increment the version number.
   if (has_metadata_changes_for_existing_tablets && !l.data().pb.has_fully_applied_schema()) {
     l.mutable_data()->pb.mutable_fully_applied_schema()->CopyFrom(l.data().pb.schema());
   }
@@ -2420,7 +2664,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
                                            LocalTimeAsString()));
   }
 
-  // 7. Update sys-catalog with the new table schema and tablets to add/drop.
+  // 8. Update sys-catalog with the new table schema and tablets to add/drop.
   TRACE("Updating metadata on disk");
   string deletion_msg = "Partition dropped at " + LocalTimeAsString();
   SysCatalogTable::Actions actions;
@@ -2450,7 +2694,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     return s;
   }
 
-  // 8. Commit the in-memory state.
+  // 9. Commit the in-memory state.
   {
     TRACE("Committing alterations to in-memory state");
 
@@ -2469,6 +2713,9 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
                    << SecureShortDebugString(req);
       }
       InsertOrDie(&normalized_table_names_map_, normalized_new_table_name, table);
+
+      // Alter the table name in the attributes of the metrics.
+      table->UpdateMetricsAttrs(normalized_new_table_name);
     }
 
     // Insert new tablets into the global tablet map. After this, the tablets
@@ -2537,14 +2784,20 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
 
 Status CatalogManager::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
                                         IsAlterTableDoneResponsePB* resp,
-                                        rpc::RpcContext* rpc) {
+                                        optional<const string&> user) {
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
-  // 1. Lookup the table and verify if it exists
+  // 1. Lookup the table, verify if it exists, and then check that
+  //    the user is authorized to operate on the table.
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  RETURN_NOT_OK(FindAndLockTable(*req, resp, LockMode::READ, &table, &l));
+  auto authz_func = [&] (const string& username, const string& table_name) {
+    return SetupError(authz_provider_->AuthorizeGetTableMetadata(table_name, username),
+                      resp, MasterErrorPB::NOT_AUTHORIZED);
+  };
+  RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
+                                          &table, &l));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   // 2. Verify if the alter is in-progress
@@ -2556,54 +2809,145 @@ Status CatalogManager::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
 }
 
 Status CatalogManager::GetTableSchema(const GetTableSchemaRequestPB* req,
-                                      GetTableSchemaResponsePB* resp) {
+                                      GetTableSchemaResponsePB* resp,
+                                      optional<const string&> user,
+                                      const TokenSigner* token_signer) {
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
-  // Lookup the table and verify if it exists
+  // Lookup the table, verify if it exists, and then check that
+  // the user is authorized to operate on the table.
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  RETURN_NOT_OK(FindAndLockTable(*req, resp, LockMode::READ, &table, &l));
+
+  auto authz_func = [&] (const string& username, const string& table_name) {
+    return SetupError(authz_provider_->AuthorizeGetTableMetadata(table_name, username),
+                      resp, MasterErrorPB::NOT_AUTHORIZED);
+  };
+  RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
+                                          &table, &l));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
-  if (l.data().pb.has_fully_applied_schema()) {
-    // An AlterTable is in progress; fully_applied_schema is the last
-    // schema that has reached every TS.
-    CHECK_EQ(SysTablesEntryPB::ALTERING, l.data().pb.state());
-    resp->mutable_schema()->CopyFrom(l.data().pb.fully_applied_schema());
-  } else {
-    // There's no AlterTable, the regular schema is "fully applied".
-    resp->mutable_schema()->CopyFrom(l.data().pb.schema());
+  // If fully_applied_schema is set, use it, since an alter is in progress.
+  CHECK(!l.data().pb.has_fully_applied_schema() ||
+        (l.data().pb.state() == SysTablesEntryPB::ALTERING));
+  const SchemaPB& schema_pb = l.data().pb.has_fully_applied_schema() ?
+      l.data().pb.fully_applied_schema() : l.data().pb.schema();
+
+  if (token_signer && user) {
+    TablePrivilegePB table_privilege;
+    table_privilege.set_table_id(table->id());
+    RETURN_NOT_OK(
+        SetupError(authz_provider_->FillTablePrivilegePB(l.data().name(), *user, schema_pb,
+                                                         &table_privilege),
+                   resp, MasterErrorPB::UNKNOWN_ERROR));
+    security::SignedTokenPB authz_token;
+    RETURN_NOT_OK(token_signer->GenerateAuthzToken(
+        *user, std::move(table_privilege), &authz_token));
+    *resp->mutable_authz_token() = std::move(authz_token);
   }
+  resp->mutable_schema()->CopyFrom(schema_pb);
   resp->set_num_replicas(l.data().pb.num_replicas());
   resp->set_table_id(table->id());
   resp->mutable_partition_schema()->CopyFrom(l.data().pb.partition_schema());
   resp->set_table_name(l.data().pb.name());
+  RETURN_NOT_OK(ExtraConfigPBToPBMap(l.data().pb.extra_config(), resp->mutable_extra_configs()));
 
   return Status::OK();
 }
 
 Status CatalogManager::ListTables(const ListTablesRequestPB* req,
-                                  ListTablesResponsePB* resp) {
+                                  ListTablesResponsePB* resp,
+                                  optional<const string&> user) {
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
-  shared_lock<LockType> l(lock_);
-
-  for (const TableInfoMap::value_type& entry : normalized_table_names_map_) {
-    TableMetadataLock ltm(entry.second.get(), LockMode::READ);
+  vector<scoped_refptr<TableInfo>> tables_info;
+  {
+    shared_lock<LockType> l(lock_);
+    for (const TableInfoMap::value_type &entry : normalized_table_names_map_) {
+      tables_info.emplace_back(entry.second);
+    }
+  }
+  unordered_map<string, scoped_refptr<TableInfo>> table_info_by_name;
+  unordered_set<string> table_names;
+  for (const auto& table_info : tables_info) {
+    TableMetadataLock ltm(table_info.get(), LockMode::READ);
     if (!ltm.data().is_running()) continue; // implies !is_deleted() too
 
+    const string& table_name = ltm.data().name();
     if (req->has_name_filter()) {
-      size_t found = ltm.data().name().find(req->name_filter());
+      size_t found = table_name.find(req->name_filter());
       if (found == string::npos) {
         continue;
       }
     }
+    InsertOrUpdate(&table_info_by_name, table_name, table_info);
+    EmplaceIfNotPresent(&table_names, table_name);
+  }
 
-    ListTablesResponsePB::TableInfo* table = resp->add_tables();
-    table->set_id(entry.second->id());
-    table->set_name(ltm.data().name());
+  MAYBE_INJECT_FIXED_LATENCY(FLAGS_catalog_manager_inject_latency_list_authz_ms);
+  bool checked_table_names = false;
+  if (user) {
+    RETURN_NOT_OK(authz_provider_->AuthorizeListTables(
+        *user, &table_names, &checked_table_names));
+  }
+
+  // If we checked privileges, do another pass over the tables to filter out
+  // any that may have been altered while authorizing.
+  if (checked_table_names) {
+    for (const auto& table_name : table_names) {
+      const auto& table_info = FindOrDie(table_info_by_name, table_name);
+      TableMetadataLock ltm(table_info.get(), LockMode::READ);
+      if (!ltm.data().is_running()) continue;
+
+      // If we have a different table name than expected, there was a table
+      // rename and we shouldn't show the table.
+      if (table_name != ltm.data().name()) {
+        continue;
+      }
+      ListTablesResponsePB::TableInfo* table = resp->add_tables();
+      table->set_id(table_info->id());
+      table->set_name(table_name);
+    }
+  } else {
+    // Otherwise, pass all tables through.
+    for (const auto& name_and_table_info : table_info_by_name) {
+      const auto& table_name = name_and_table_info.first;
+      const auto& table_info = name_and_table_info.second;
+      ListTablesResponsePB::TableInfo* table = resp->add_tables();
+      table->set_id(table_info->id());
+      table->set_name(table_name);
+    }
+  }
+  return Status::OK();
+}
+
+Status CatalogManager::GetTableStatistics(const GetTableStatisticsRequestPB* req,
+                                          GetTableStatisticsResponsePB* resp,
+                                          optional<const string&> user) {
+  leader_lock_.AssertAcquiredForReading();
+  RETURN_NOT_OK(CheckOnline());
+
+  scoped_refptr<TableInfo> table;
+  TableMetadataLock l;
+  auto authz_func = [&] (const string& username, const string& table_name) {
+      return SetupError(authz_provider_->AuthorizeGetTableStatistics(table_name, username),
+                        resp, MasterErrorPB::NOT_AUTHORIZED);
+  };
+  RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
+                                          &table, &l));
+
+  if (PREDICT_FALSE(FLAGS_mock_table_metrics_for_testing)) {
+    resp->set_on_disk_size(FLAGS_on_disk_size_for_testing);
+    if (FLAGS_catalog_manager_support_live_row_count) {
+      resp->set_live_row_count(FLAGS_live_row_count_for_testing);
+    }
+  } else {
+    resp->set_on_disk_size(table->GetMetrics()->on_disk_size->value());
+    if (table->GetMetrics()->TableSupportsLiveRowCount()) {
+      resp->set_live_row_count(table->GetMetrics()->live_row_count->value());
+    }
   }
 
   return Status::OK();
@@ -2636,13 +2980,6 @@ Status CatalogManager::TableNameExists(const string& table_name, bool* exists) {
   shared_lock<LockType> l(lock_);
   *exists = ContainsKey(normalized_table_names_map_, NormalizeTableName(table_name));
   return Status::OK();
-}
-
-void CatalogManager::NotifyTabletDeleteSuccess(const string& permanent_uuid,
-                                               const string& tablet_id) {
-  // TODO: Clean up the stale deleted tablet data once all relevant tablet
-  // servers have responded that they have removed the remnants of the deleted
-  // tablet.
 }
 
 namespace {
@@ -2806,6 +3143,9 @@ class RetryingTSRpcTask : public MonitoredTask {
     return static_cast<State>(NoBarrier_Load(&state_));
   }
 
+  // Return the id of the tablet that is the subject of the async request.
+  virtual string tablet_id() const = 0;
+
   MonoTime start_timestamp() const override { return start_ts_; }
   MonoTime completion_timestamp() const override { return end_ts_; }
   const scoped_refptr<TableInfo>& table() const { return table_ ; }
@@ -2823,9 +3163,6 @@ class RetryingTSRpcTask : public MonitoredTask {
   //
   // Runs on the reactor thread, so must not block or perform any IO.
   virtual void HandleResponse(int attempt) = 0;
-
-  // Return the id of the tablet that is the subject of the async request.
-  virtual string tablet_id() const = 0;
 
   // Overridable log prefix with reasonable default.
   virtual string LogPrefix() const {
@@ -2922,9 +3259,9 @@ Status RetryingTSRpcTask::Run() {
 
 void RetryingTSRpcTask::RpcCallback() {
   if (!rpc_.status().ok()) {
-    LOG(WARNING) << Substitute("TS $0: $1 RPC failed for tablet $2: $3",
-                               target_ts_desc_->ToString(), type_name(),
-                               tablet_id(), rpc_.status().ToString());
+    KLOG_EVERY_N_SECS(WARNING, 1) << Substitute("TS $0: $1 RPC failed for tablet $2: $3",
+                                                target_ts_desc_->ToString(), type_name(),
+                                                tablet_id(), rpc_.status().ToString());
   } else if (state() != kStateAborted) {
     HandleResponse(attempt_); // Modifies state_.
   }
@@ -2958,8 +3295,8 @@ bool RetryingTSRpcTask::RescheduleWithBackoffDelay() {
     MarkFailed();
     return false;
   }
-  LOG(INFO) << Substitute("Scheduling retry of $0 with a delay of $1 ms (attempt = $2)",
-                          description(), delay_millis, attempt_);
+  VLOG(1) << Substitute("Scheduling retry of $0 with a delay of $1 ms (attempt = $2)",
+                        description(), delay_millis, attempt_);
   master_->messenger()->ScheduleOnReactor(
       boost::bind(&RetryingTSRpcTask::RunDelayedTask, this, _1),
       MonoDelta::FromMilliseconds(delay_millis));
@@ -2977,20 +3314,14 @@ void RetryingTSRpcTask::RunDelayedTask(const Status& status) {
   string desc = description();  // Save in case we need to log after deletion.
   Status s = Run();             // May delete this.
   if (!s.ok()) {
-    LOG(WARNING) << Substitute("Async tablet task $0 failed: $1",
-                               desc, s.ToString());
+    KLOG_EVERY_N_SECS(WARNING, 1) << Substitute("Async tablet task $0 failed: $1",
+                                                desc, s.ToString());
   }
 }
 
 void RetryingTSRpcTask::UnregisterAsyncTask() {
   end_ts_ = MonoTime::Now();
-  if (table_ != nullptr) {
-    table_->RemoveTask(this);
-  } else {
-    // This is a floating task (since the table does not exist)
-    // created as response to a tablet report.
-    Release();  // May call "delete this";
-  }
+  table_->RemoveTask(tablet_id(), this);
 }
 
 Status RetryingTSRpcTask::ResetTSProxy() {
@@ -3007,6 +3338,12 @@ Status RetryingTSRpcTask::ResetTSProxy() {
   // This assumes that TSDescriptors are never deleted by the master,
   // so the task need not take ownership of the returned pointer.
   target_ts_desc_ = ts_desc.get();
+
+  // We may be called by a reactor thread, and creating proxies may trigger DNS
+  // resolution.
+  //
+  // TODO(adar): make the DNS resolution asynchronous.
+  ThreadRestrictions::ScopedAllowWait allow_wait;
 
   shared_ptr<tserver::TabletServerAdminServiceProxy> ts_proxy;
   RETURN_NOT_OK(target_ts_desc_->GetTSAdminProxy(master_->messenger(), &ts_proxy));
@@ -3063,9 +3400,12 @@ class AsyncCreateReplica : public RetrySpecificTSRpcTask {
         table_lock.data().pb.partition_schema());
     req_.mutable_config()->CopyFrom(
         tablet_lock.data().pb.consensus_state().committed_config());
+    req_.mutable_extra_config()->CopyFrom(
+        table_lock.data().pb.extra_config());
+    req_.set_dimension_label(tablet_lock.data().pb.dimension_label());
   }
 
-  string type_name() const override { return "Create Tablet"; }
+  string type_name() const override { return "CreateTablet"; }
 
   string description() const override {
     return "CreateTablet RPC for tablet " + tablet_id_ + " on TS " + permanent_uuid_;
@@ -3085,15 +3425,17 @@ class AsyncCreateReplica : public RetrySpecificTSRpcTask {
             target_ts_desc_->ToString(), s.ToString());
         MarkComplete();
       } else {
-        LOG(WARNING) << Substitute("CreateTablet RPC for tablet $0 on TS $1 failed: $2",
-                                   tablet_id_, target_ts_desc_->ToString(), s.ToString());
+        KLOG_EVERY_N_SECS(WARNING, 1) <<
+            Substitute("CreateTablet RPC for tablet $0 on TS $1 failed: $2",
+                       tablet_id_, target_ts_desc_->ToString(), s.ToString());
       }
     }
   }
 
   bool SendRequest(int attempt) override {
-    VLOG(1) << Substitute("Send create tablet request to $0 (attempt = $1): $2",
-                          target_ts_desc_->ToString(), attempt, SecureDebugString(req_));
+    VLOG(1) << Substitute("Sending $0 request to $1 (attempt $2): $3",
+                          type_name(), target_ts_desc_->ToString(), attempt,
+                          SecureDebugString(req_));
     ts_proxy_->CreateTabletAsync(req_, &resp_, &rpc_,
                                  boost::bind(&AsyncCreateReplica::RpcCallback, this));
     return true;
@@ -3121,10 +3463,12 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
             std::move(cas_config_opid_index_less_or_equal)),
         reason_(std::move(reason)) {}
 
-  string type_name() const override { return "Delete Tablet"; }
+  string type_name() const override {
+    return Substitute("DeleteTablet:$0", TabletDataState_Name(delete_type_));
+  }
 
   string description() const override {
-    return tablet_id_ + " Delete Tablet RPC for TS=" + permanent_uuid_;
+    return "DeleteTablet RPC for tablet " + tablet_id_ + " on TS " + permanent_uuid_;
   }
 
  protected:
@@ -3143,20 +3487,27 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
               target_ts_desc_->ToString(), tablet_id_, status.ToString());
           MarkComplete();
           break;
+        // Do not retry on a CAS error
         case TabletServerErrorPB::CAS_FAILED:
           LOG(WARNING) << Substitute("TS $0: delete failed for tablet $1 "
               "because of a CAS failure. No further retry: $2",
               target_ts_desc_->ToString(), tablet_id_, status.ToString());
+          MarkFailed();
+          break;
+        case TabletServerErrorPB::ALREADY_INPROGRESS:
+          LOG(WARNING) << Substitute("TS $0: delete failed for tablet $1 "
+            "because tablet deleting was already in progress. No further retry: $2",
+            target_ts_desc_->ToString(), tablet_id_, status.ToString());
           MarkComplete();
           break;
         default:
-          LOG(WARNING) << Substitute("TS $0: delete failed for tablet $1 "
-              "with error code $2: $3", target_ts_desc_->ToString(), tablet_id_,
-              TabletServerErrorPB::Code_Name(code), status.ToString());
+          KLOG_EVERY_N_SECS(WARNING, 1) <<
+              Substitute("TS $0: delete failed for tablet $1 with error code $2: $3",
+                         target_ts_desc_->ToString(), tablet_id_,
+                         TabletServerErrorPB::Code_Name(code), status.ToString());
           break;
       }
     } else {
-      master_->catalog_manager()->NotifyTabletDeleteSuccess(permanent_uuid_, tablet_id_);
       if (table_) {
         LOG(INFO) << Substitute("TS $0: tablet $1 (table $2) successfully deleted",
                                 target_ts_desc_->ToString(), tablet_id_, table_->ToString());
@@ -3180,9 +3531,9 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
       req.set_cas_config_opid_index_less_or_equal(*cas_config_opid_index_less_or_equal_);
     }
 
-    LOG(INFO) << Substitute("Sending DeleteTablet($0) for tablet $1 on $2 ($3)",
-                            TabletDataState_Name(delete_type_), tablet_id_,
-                            target_ts_desc_->ToString(), reason_);
+    VLOG(1) << Substitute("Sending $0 request to $1 (attempt $2): $3",
+                          type_name(), target_ts_desc_->ToString(), attempt,
+                          SecureDebugString(req));
     ts_proxy_->DeleteTabletAsync(req, &resp_, &rpc_,
                                  boost::bind(&AsyncDeleteReplica::RpcCallback, this));
     return true;
@@ -3212,10 +3563,11 @@ class AsyncAlterTable : public RetryingTSRpcTask {
       tablet_(std::move(tablet)) {
   }
 
-  string type_name() const override { return "Alter Table"; }
+  string type_name() const override { return "AlterTable"; }
 
   string description() const override {
-    return tablet_->ToString() + " Alter Table RPC";
+    return Substitute("AlterTable RPC for tablet $0 (table $1, current schema version=$2)",
+                      tablet_->id(), table_->ToString(), table_->schema_version());
   }
 
  private:
@@ -3236,9 +3588,10 @@ class AsyncAlterTable : public RetryingTSRpcTask {
           MarkComplete();
           break;
         default:
-          LOG(WARNING) << Substitute("TS $0: alter failed for tablet $1: $2",
-                                     target_ts_desc_->ToString(), tablet_->ToString(),
-                                     status.ToString());
+          KLOG_EVERY_N_SECS(WARNING, 1) <<
+              Substitute("TS $0: alter failed for tablet $1: $2",
+                         target_ts_desc_->ToString(), tablet_->ToString(),
+                         status.ToString());
           break;
       }
     } else {
@@ -3261,11 +3614,13 @@ class AsyncAlterTable : public RetryingTSRpcTask {
     req.set_new_table_name(l.data().pb.name());
     req.set_schema_version(l.data().pb.version());
     req.mutable_schema()->CopyFrom(l.data().pb.schema());
+    req.mutable_new_extra_config()->CopyFrom(l.data().pb.extra_config());
 
     l.Unlock();
 
-    VLOG(1) << Substitute("Sending alter table request to $0 (attempt $1): $2",
-                          target_ts_desc_->ToString(), attempt, SecureDebugString(req));
+    VLOG(1) << Substitute("Sending $0 request to $1 (attempt $2): $3",
+                          type_name(), target_ts_desc_->ToString(), attempt,
+                          SecureDebugString(req));
     ts_proxy_->AlterSchemaAsync(req, &resp_, &rpc_,
                                 boost::bind(&AsyncAlterTable::RpcCallback, this));
     return true;
@@ -3338,10 +3693,11 @@ void AsyncChangeConfigTask::HandleResponse(int attempt) {
       MarkFailed();
       break;
     default:
-      LOG_WITH_PREFIX(INFO) << Substitute("$0 failed with leader $1 "
-          "due to error $2; will retry: $3",
-          type_name(), target_ts_desc_->ToString(),
-          TabletServerErrorPB::Code_Name(resp_.error().code()), status.ToString());
+      KLOG_EVERY_N_SECS(WARNING, 1) << LogPrefix() <<
+          Substitute("$0 failed with leader $1 due to error $2; will retry: $3",
+                     type_name(), target_ts_desc_->ToString(),
+                     TabletServerErrorPB::Code_Name(resp_.error().code()),
+                     status.ToString());
       break;
   }
 }
@@ -3406,9 +3762,6 @@ bool AsyncAddReplicaTask::SendRequest(int attempt) {
     return false;
   }
 
-  LOG(INFO) << Substitute("Sending $0 on tablet $1 (attempt $2)",
-                          type_name(), tablet_->id(), attempt);
-
   Status s;
   shared_ptr<TSDescriptor> extra_replica;
   {
@@ -3425,7 +3778,16 @@ bool AsyncAddReplicaTask::SendRequest(int attempt) {
     }
 
     TSDescriptorVector ts_descs;
-    master_->ts_manager()->GetAllLiveDescriptors(&ts_descs);
+    master_->ts_manager()->GetDescriptorsAvailableForPlacement(&ts_descs);
+
+    // Get the dimension of the tablet. Otherwise, it will be none.
+    optional<string> dimension = none;
+    {
+      TabletMetadataLock l(tablet_.get(), LockMode::READ);
+      if (tablet_->metadata().state().pb.has_dimension_label()) {
+        dimension = tablet_->metadata().state().pb.dimension_label();
+      }
+    }
 
     // Some of the tablet servers hosting the current members of the config
     // (see the 'existing' populated above) might be presumably dead.
@@ -3436,7 +3798,7 @@ bool AsyncAddReplicaTask::SendRequest(int attempt) {
     // to host the extra replica is 'ts_descs' after blacklisting all elements
     // common with 'existing'.
     PlacementPolicy policy(std::move(ts_descs), rng_);
-    s = policy.PlaceExtraTabletReplica(std::move(existing), &extra_replica);
+    s = policy.PlaceExtraTabletReplica(std::move(existing), dimension, &extra_replica);
   }
   if (PREDICT_FALSE(!s.ok())) {
     auto msg = Substitute("no extra replica candidate found for tablet $0: $1",
@@ -3486,8 +3848,9 @@ bool AsyncAddReplicaTask::SendRequest(int attempt) {
   CHECK_GT(peer_reg.rpc_addresses_size(), 0);
   *peer->mutable_last_known_addr() = peer_reg.rpc_addresses(0);
   peer->set_member_type(member_type_);
-  VLOG(1) << Substitute("Sending $0 request to $1: $2",
-                        type_name(), target_ts_desc_->ToString(), SecureDebugString(req));
+  VLOG(1) << Substitute("Sending $0 request to $1 (attempt $2): $3",
+                        type_name(), target_ts_desc_->ToString(), attempt,
+                        SecureDebugString(req));
   consensus_proxy_->ChangeConfigAsync(req, &resp_, &rpc_,
                                       boost::bind(&AsyncAddReplicaTask::RpcCallback, this));
   return true;
@@ -3529,9 +3892,6 @@ bool AsyncEvictReplicaTask::SendRequest(int attempt) {
     return false;
   }
 
-  LOG(INFO) << Substitute("Sending $0 on tablet $1 (attempt $2)",
-                          type_name(), tablet_->id(), attempt);
-
   consensus::ChangeConfigRequestPB req;
   req.set_dest_uuid(target_ts_desc_->permanent_uuid());
   req.set_tablet_id(tablet_->id());
@@ -3539,8 +3899,9 @@ bool AsyncEvictReplicaTask::SendRequest(int attempt) {
   req.set_cas_config_opid_index(cstate_.committed_config().opid_index());
   RaftPeerPB* peer = req.mutable_server();
   peer->set_permanent_uuid(peer_uuid_to_evict_);
-  VLOG(1) << Substitute("Sending $0 request to $1: $2",
-                        type_name(), target_ts_desc_->ToString(), SecureDebugString(req));
+  VLOG(1) << Substitute("Sending $0 request to $1 (attempt $2): $3",
+                        type_name(), target_ts_desc_->ToString(), attempt,
+                        SecureDebugString(req));
   consensus_proxy_->ChangeConfigAsync(req, &resp_, &rpc_,
                                       boost::bind(&AsyncEvictReplicaTask::RpcCallback, this));
   return true;
@@ -3578,7 +3939,7 @@ Status CatalogManager::ProcessTabletReport(
   unordered_map<string, scoped_refptr<TabletInfo>> tablet_infos;
 
   // Keeps track of all RPCs that should be sent when we're done.
-  vector<unique_ptr<RetryingTSRpcTask>> rpcs;
+  vector<scoped_refptr<RetryingTSRpcTask>> rpcs;
 
   // Locks the referenced tables (for READ) and tablets (for WRITE).
   //
@@ -3642,6 +4003,8 @@ Status CatalogManager::ProcessTabletReport(
   // 3. Process each tablet. This may not be in the order that the tablets
   // appear in 'full_report', but that has no bearing on correctness.
   vector<scoped_refptr<TabletInfo>> mutated_tablets;
+  unordered_set<string> uuids_ignored_for_underreplication =
+      master_->ts_manager()->GetUuidsToIgnoreForUnderreplication();
   for (const auto& e : tablet_infos) {
     const string& tablet_id = e.first;
     const scoped_refptr<TabletInfo>& tablet = e.second;
@@ -3655,14 +4018,13 @@ Status CatalogManager::ProcessTabletReport(
         table->metadata().state().is_deleted()) {
       const string& msg = tablet->metadata().state().pb.state_msg();
       update->set_state_msg(msg);
-      LOG(INFO) << Substitute("Got report from deleted tablet $0 ($1): Sending "
-          "delete request for this tablet", tablet->ToString(), msg);
+      VLOG(1) << Substitute("Got report from deleted tablet $0 ($1)", tablet->ToString(), msg);
 
       // TODO(unknown): Cancel tablet creation, instead of deleting, in cases
       // where that might be possible (tablet creation timeout & replacement).
       rpcs.emplace_back(new AsyncDeleteReplica(
           master_, ts_desc->permanent_uuid(), table, tablet_id,
-          TABLET_DATA_DELETED, boost::none, msg));
+          TABLET_DATA_DELETED, none, msg));
       continue;
     }
 
@@ -3845,18 +4207,15 @@ Status CatalogManager::ProcessTabletReport(
                  !cstate.leader_uuid().empty() &&
                  cstate.leader_uuid() == ts_desc->permanent_uuid()) {
         const auto& config = cstate.committed_config();
-        const auto policy =
-            PREDICT_FALSE(FLAGS_raft_attempt_to_replace_replica_without_majority)
-            ? MajorityHealthPolicy::IGNORE : MajorityHealthPolicy::HONOR;
         string to_evict;
         if (PREDICT_TRUE(FLAGS_catalog_manager_evict_excess_replicas) &&
-            ShouldEvictReplica(config, cstate.leader_uuid(), replication_factor,
-                               policy, &to_evict)) {
+            ShouldEvictReplica(config, cstate.leader_uuid(), replication_factor, &to_evict)) {
           DCHECK(!to_evict.empty());
           rpcs.emplace_back(new AsyncEvictReplicaTask(
               master_, tablet, cstate, std::move(to_evict)));
         } else if (FLAGS_master_add_server_when_underreplicated &&
-                   ShouldAddReplica(config, replication_factor, policy)) {
+                   ShouldAddReplica(config, replication_factor,
+                                    uuids_ignored_for_underreplication)) {
           rpcs.emplace_back(new AsyncAddReplicaTask(
               master_, tablet, cstate, RaftPeerPB::NON_VOTER, &rng_));
         }
@@ -3890,12 +4249,23 @@ Status CatalogManager::ProcessTabletReport(
     if (tablet_was_mutated) {
       mutated_tablets.push_back(tablet);
     }
+
+    // 10. Process the report's tablet statistics.
+    if (report.has_stats() && report.has_consensus_state()) {
+      DCHECK_EQ(ts_desc->permanent_uuid(), report.consensus_state().leader_uuid());
+
+      // Now the tserver only reports the LEADER replicas its own.
+      // First, update table's stats.
+      tablet->table()->UpdateMetrics(tablet_id, tablet->GetStats(), report.stats());
+      // Then, update tablet's stats.
+      tablet->UpdateStats(report.stats());
+    }
   }
 
-  // 10. Unlock the tables; we no longer need to access their state.
+  // 11. Unlock the tables; we no longer need to access their state.
   tables_lock.Unlock();
 
-  // 11. Write all tablet mutations to the catalog table.
+  // 12. Write all tablet mutations to the catalog table.
   //
   // SysCatalogTable::Write will short-circuit the case where the data has not
   // in fact changed since the previous version and avoid any unnecessary mutations.
@@ -3912,10 +4282,10 @@ Status CatalogManager::ProcessTabletReport(
   // Having successfully written the tablet mutations, this function cannot
   // fail from here on out.
 
-  // 12. Publish the in-memory tablet mutations and release the locks.
+  // 13. Publish the in-memory tablet mutations and release the locks.
   tablets_lock.Commit();
 
-  // 13. Process all tablet schema version changes.
+  // 14. Process all tablet schema version changes.
   //
   // This is separate from tablet state mutations because only tablet in-memory
   // state (and table on-disk state) is changed.
@@ -3928,17 +4298,17 @@ Status CatalogManager::ProcessTabletReport(
     }
   }
 
-  // 14. Send all queued RPCs.
+  // 15. Send all queued RPCs.
   for (auto& rpc : rpcs) {
-    if (rpc->table() != nullptr) {
-      rpc->table()->AddTask(rpc.get());
-    } else {
-      // This is a floating task (since the table does not exist) created in
-      // response to a tablet report.
-      rpc->AddRef();
+    if (rpc->table()->ContainsTask(rpc->tablet_id(), rpc->description())) {
+      // There are some tasks with the same tablet_id, alter type (and permanent_uuid
+      // for some specific tasks) already running, here we just ignore the rpc to avoid
+      // sending duplicate requests, maybe it will be sent the next time the tserver heartbeats.
+      VLOG(1) << Substitute("Not sending duplicate request: $0", rpc->description());
+      continue;
     }
+    rpc->table()->AddTask(rpc->tablet_id(), rpc);
     WARN_NOT_OK(rpc->Run(), Substitute("Failed to send $0", rpc->description()));
-    rpc.release();
   }
 
   return Status::OK();
@@ -3988,9 +4358,9 @@ void CatalogManager::SendAlterTableRequest(const scoped_refptr<TableInfo>& table
   table->GetAllTablets(&tablets);
 
   for (const scoped_refptr<TabletInfo>& tablet : tablets) {
-    auto call = new AsyncAlterTable(master_, tablet);
-    table->AddTask(call);
-    WARN_NOT_OK(call->Run(), "Failed to send alter table request");
+    scoped_refptr<AsyncAlterTable> task = new AsyncAlterTable(master_, tablet);
+    table->AddTask(tablet->id(), task);
+    WARN_NOT_OK(task->Run(), "Failed to send alter table request");
   }
 }
 
@@ -4021,11 +4391,11 @@ void CatalogManager::SendDeleteTabletRequest(const scoped_refptr<TabletInfo>& ta
       << "Sending DeleteTablet for " << cstate.committed_config().peers().size()
       << " replicas of tablet " << tablet->id();
   for (const auto& peer : cstate.committed_config().peers()) {
-    AsyncDeleteReplica* call = new AsyncDeleteReplica(
+    scoped_refptr<AsyncDeleteReplica> task = new AsyncDeleteReplica(
         master_, peer.permanent_uuid(), tablet->table(), tablet->id(),
-        TABLET_DATA_DELETED, boost::none, deletion_msg);
-    tablet->table()->AddTask(call);
-    WARN_NOT_OK(call->Run(), Substitute(
+        TABLET_DATA_DELETED, none, deletion_msg);
+    tablet->table()->AddTask(tablet->id(), task);
+    WARN_NOT_OK(task->Run(), Substitute(
         "Failed to send DeleteReplica request for tablet $0", tablet->id()));
   }
 }
@@ -4159,10 +4529,13 @@ void CatalogManager::HandleAssignCreatingTablet(const scoped_refptr<TabletInfo>&
 
   const PersistentTabletInfo& old_info = tablet->metadata().state();
 
+  optional<string> dimension_label = old_info.pb.has_dimension_label() ?
+      make_optional<string>(old_info.pb.dimension_label()) : none;
   // The "tablet creation" was already sent, but we didn't receive an answer
   // within the timeout. So the tablet will be replaced by a new one.
   scoped_refptr<TabletInfo> replacement = CreateTabletInfo(tablet->table(),
-                                                           old_info.pb.partition());
+                                                           old_info.pb.partition(),
+                                                           dimension_label);
   LOG_WITH_PREFIX(WARNING) << Substitute("Tablet $0 was not created within the "
       "allowed timeout. Replacing with a new tablet $1",
       tablet->ToString(), replacement->id());
@@ -4285,7 +4658,7 @@ Status CatalogManager::ProcessPendingAssignments(
   // For those tablets which need to be created in this round, assign replicas.
   {
     TSDescriptorVector ts_descs;
-    master_->ts_manager()->GetAllLiveDescriptors(&ts_descs);
+    master_->ts_manager()->GetDescriptorsAvailableForPlacement(&ts_descs);
     PlacementPolicy policy(std::move(ts_descs), &rng_);
     for (auto& tablet : deferred.needs_create_rpc) {
       // NOTE: if we fail to select replicas on the first pass (due to
@@ -4370,9 +4743,15 @@ Status CatalogManager::SelectReplicasForTablet(const PlacementPolicy& policy,
   config->set_obsolete_local(nreplicas == 1);
   config->set_opid_index(consensus::kInvalidOpIdIndex);
 
+  // Get the dimension of the tablet. Otherwise, it will be none.
+  optional<string> dimension = none;
+  if (tablet->metadata().state().pb.has_dimension_label()) {
+    dimension = tablet->metadata().state().pb.dimension_label();
+  }
+
   // Select the set of replicas for the tablet.
   TSDescriptorVector descriptors;
-  RETURN_NOT_OK_PREPEND(policy.PlaceTabletReplicas(nreplicas, &descriptors),
+  RETURN_NOT_OK_PREPEND(policy.PlaceTabletReplicas(nreplicas, dimension, &descriptors),
                         Substitute("failed to place replicas for tablet $0 "
                                    "(table '$1')",
                                    tablet->id(), table_guard.data().name()));
@@ -4398,18 +4777,18 @@ void CatalogManager::SendCreateTabletRequest(const scoped_refptr<TabletInfo>& ta
       tablet_lock.data().pb.consensus_state().committed_config();
   tablet->set_last_create_tablet_time(MonoTime::Now());
   for (const RaftPeerPB& peer : config.peers()) {
-    AsyncCreateReplica* task = new AsyncCreateReplica(master_,
-                                                      peer.permanent_uuid(),
-                                                      tablet, tablet_lock);
-    tablet->table()->AddTask(task);
+    scoped_refptr<AsyncCreateReplica> task = new AsyncCreateReplica(
+        master_, peer.permanent_uuid(), tablet, tablet_lock);
+    tablet->table()->AddTask(tablet->id(), task);
     WARN_NOT_OK(task->Run(), "Failed to send new tablet request");
   }
 }
 
 Status CatalogManager::BuildLocationsForTablet(
     const scoped_refptr<TabletInfo>& tablet,
-    master::ReplicaTypeFilter filter,
-    TabletLocationsPB* locs_pb) {
+    ReplicaTypeFilter filter,
+    TabletLocationsPB* locs_pb,
+    TSInfosDict* ts_infos_dict) {
   TabletMetadataLock l_tablet(tablet.get(), LockMode::READ);
   if (PREDICT_FALSE(l_tablet.data().is_deleted())) {
     return Status::NotFound("Tablet deleted", l_tablet.data().pb.state_msg());
@@ -4425,8 +4804,6 @@ Status CatalogManager::BuildLocationsForTablet(
   const ConsensusStatePB& cstate = l_tablet.data().pb.consensus_state();
   for (const consensus::RaftPeerPB& peer : cstate.committed_config().peers()) {
     DCHECK(!peer.has_health_report()); // Health report shouldn't be persisted.
-    // TODO(adar): GetConsensusRole() iterates over all of the peers, making this an
-    // O(n^2) loop. If replication counts get high, it should be optimized.
     switch (filter) {
       case VOTER_REPLICA:
         if (!peer.has_member_type() ||
@@ -4448,24 +4825,52 @@ Status CatalogManager::BuildLocationsForTablet(
         }
     }
 
-    TabletLocationsPB_ReplicaPB* replica_pb = locs_pb->add_replicas();
-    replica_pb->set_role(GetConsensusRole(peer.permanent_uuid(), cstate));
+    // Helper function to create a TSInfoPB.
+    auto make_tsinfo_pb = [this, &peer]() {
+      unique_ptr<TSInfoPB> tsinfo_pb(new TSInfoPB());
+      tsinfo_pb->set_permanent_uuid(peer.permanent_uuid());
+      shared_ptr<TSDescriptor> ts_desc;
+      if (master_->ts_manager()->LookupTSByUUID(peer.permanent_uuid(), &ts_desc)) {
+        ServerRegistrationPB reg;
+        ts_desc->GetRegistration(&reg);
+        tsinfo_pb->mutable_rpc_addresses()->Swap(reg.mutable_rpc_addresses());
+        if (ts_desc->location()) tsinfo_pb->set_location(*(ts_desc->location()));
+      } else {
+        // If we've never received a heartbeat from the tserver, we'll fall back
+        // to the last known RPC address in the RaftPeerPB.
+        //
+        // TODO(wdberkeley): We should track these RPC addresses in the master table itself.
+        tsinfo_pb->add_rpc_addresses()->CopyFrom(peer.last_known_addr());
+      }
+      return tsinfo_pb;
+    };
 
-    TSInfoPB* tsinfo_pb = replica_pb->mutable_ts_info();
-    tsinfo_pb->set_permanent_uuid(peer.permanent_uuid());
+    auto role = GetParticipantRole(peer, cstate);
+    optional<string> dimension = none;
+    if (l_tablet.data().pb.has_dimension_label()) {
+      dimension = l_tablet.data().pb.dimension_label();
+    }
+    if (ts_infos_dict) {
+      int idx = *ComputePairIfAbsent(
+          &ts_infos_dict->uuid_to_idx, peer.permanent_uuid(),
+          [&]() -> pair<StringPiece, int> {
+            auto& ts_info_pbs = ts_infos_dict->ts_info_pbs;
+            auto pb = make_tsinfo_pb();
+            int ts_info_idx = ts_info_pbs.size();
+            ts_info_pbs.emplace_back(pb.release());
+            return { ts_info_pbs.back()->permanent_uuid(), ts_info_idx };
+          });
 
-    shared_ptr<TSDescriptor> ts_desc;
-    if (master_->ts_manager()->LookupTSByUUID(peer.permanent_uuid(), &ts_desc)) {
-      ServerRegistrationPB reg;
-      ts_desc->GetRegistration(&reg);
-      tsinfo_pb->mutable_rpc_addresses()->Swap(reg.mutable_rpc_addresses());
-      if (ts_desc->location()) tsinfo_pb->set_location(*(ts_desc->location()));
+      auto* interned_replica_pb = locs_pb->add_interned_replicas();
+      interned_replica_pb->set_ts_info_idx(idx);
+      interned_replica_pb->set_role(role);
+      if (dimension) {
+        interned_replica_pb->set_dimension_label(*dimension);
+      }
     } else {
-      // If we've never received a heartbeat from the tserver, we'll fall back
-      // to the last known RPC address in the RaftPeerPB.
-      //
-      // TODO: We should track these RPC addresses in the master table itself.
-      tsinfo_pb->add_rpc_addresses()->CopyFrom(peer.last_known_addr());
+      TabletLocationsPB_DEPRECATED_ReplicaPB* replica_pb = locs_pb->add_deprecated_replicas();
+      replica_pb->set_allocated_ts_info(make_tsinfo_pb().release());
+      replica_pb->set_role(role);
     }
   }
 
@@ -4479,21 +4884,33 @@ Status CatalogManager::BuildLocationsForTablet(
 }
 
 Status CatalogManager::GetTabletLocations(const string& tablet_id,
-                                          master::ReplicaTypeFilter filter,
-                                          TabletLocationsPB* locs_pb) {
+                                          ReplicaTypeFilter filter,
+                                          TabletLocationsPB* locs_pb,
+                                          TSInfosDict* ts_infos_dict,
+                                          optional<const string&> user) {
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
-  locs_pb->mutable_replicas()->Clear();
+  locs_pb->mutable_deprecated_replicas()->Clear();
+  locs_pb->mutable_interned_replicas()->Clear();
   scoped_refptr<TabletInfo> tablet_info;
   {
     shared_lock<LockType> l(lock_);
+    // It's OK to return NOT_FOUND back to the client, even with authorization enabled,
+    // because tablet IDs are randomly generated and don't carry user data.
     if (!FindCopy(tablet_map_, tablet_id, &tablet_info)) {
       return Status::NotFound(Substitute("Unknown tablet $0", tablet_id));
     }
   }
+  if (user) {
+    // Acquire the table lock and then check that the user is authorized to operate on
+    // the table that the tablet belongs to.
+    TableMetadataLock table_lock(tablet_info->table().get(), LockMode::READ);
+    RETURN_NOT_OK(authz_provider_->AuthorizeGetTableMetadata(
+        NormalizeTableName(table_lock.data().name()), *user));
+  }
 
-  return BuildLocationsForTablet(tablet_info, filter, locs_pb);
+  return BuildLocationsForTablet(tablet_info, filter, locs_pb, ts_infos_dict);
 }
 
 Status CatalogManager::ReplaceTablet(const string& tablet_id, ReplaceTabletResponsePB* resp) {
@@ -4528,6 +4945,9 @@ Status CatalogManager::ReplaceTablet(const string& tablet_id, ReplaceTabletRespo
   new_metadata->set_state(SysTabletsEntryPB::PREPARING);
   new_metadata->mutable_partition()->CopyFrom(replaced_pb.partition());
   new_metadata->set_table_id(table->id());
+  if (replaced_pb.has_dimension_label()) {
+    new_metadata->set_dimension_label(replaced_pb.dimension_label());
+  }
 
   const string replace_msg = Substitute("replaced by tablet $0", new_tablet->id());
   old_tablet->mutable_metadata()->mutable_dirty()->set_state(SysTabletsEntryPB::DELETED,
@@ -4581,8 +5001,9 @@ Status CatalogManager::ReplaceTablet(const string& tablet_id, ReplaceTabletRespo
 }
 
 Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
-                                         GetTableLocationsResponsePB* resp) {
-  // If start-key is > end-key report an error instead of swap the two
+                                         GetTableLocationsResponsePB* resp,
+                                         optional<const string&> user) {
+  // If start-key is > end-key report an error instead of swapping the two
   // since probably there is something wrong app-side.
   if (req->has_partition_key_start() && req->has_partition_key_end()
       && req->partition_key_start() > req->partition_key_end()) {
@@ -4595,18 +5016,27 @@ Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
-  // Lookup the table and verify if it exists
+  // Lookup the table, verify if it exists, and then check that
+  // the user is authorized to operate on the table.
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  RETURN_NOT_OK(FindAndLockTable(*req, resp, LockMode::READ, &table, &l));
+  auto authz_func = [&] (const string& username, const string& table_name) {
+    return SetupError(authz_provider_->AuthorizeGetTableMetadata(table_name, username),
+                      resp, MasterErrorPB::NOT_AUTHORIZED);
+  };
+  RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
+                                          &table, &l));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   vector<scoped_refptr<TabletInfo>> tablets_in_range;
   table->GetTabletsInRange(req, &tablets_in_range);
 
+  TSInfosDict infos_dict;
+
   for (const auto& tablet : tablets_in_range) {
     Status s = BuildLocationsForTablet(
-        tablet, req->replica_type_filter(), resp->add_tablet_locations());
+        tablet, req->replica_type_filter(), resp->add_tablet_locations(),
+        req->intern_ts_infos_in_response() ? &infos_dict : nullptr);
     if (s.ok()) {
       continue;
     }
@@ -4629,6 +5059,9 @@ Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
           << "Unexpected error while building tablet locations: "
           << s.ToString();
     }
+  }
+  for (auto& pb : infos_dict.ts_info_pbs) {
+    resp->mutable_ts_infos()->AddAllocated(pb.release());
   }
   resp->set_ttl_millis(FLAGS_table_locations_ttl_ms);
   return Status::OK();
@@ -4718,6 +5151,7 @@ template<typename RespClass>
 Status CatalogManager::WaitForNotificationLogListenerCatchUp(RespClass* resp,
                                                              rpc::RpcContext* rpc) {
   if (hms_catalog_) {
+    CHECK(rpc);
     Status s = hms_notification_log_listener_->WaitForCatchUp(rpc->GetClientDeadline());
     // ServiceUnavailable indicates the master has lost leadership.
     MasterErrorPB::Code code = s.IsServiceUnavailable() ?
@@ -4856,6 +5290,7 @@ INITTED_OR_RESPOND(ConnectToMasterResponsePB);
 INITTED_OR_RESPOND(GetMasterRegistrationResponsePB);
 INITTED_OR_RESPOND(TSHeartbeatResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(AlterTableResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(ChangeTServerStateResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(CreateTableResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(DeleteTableResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(IsAlterTableDoneResponsePB);
@@ -4863,6 +5298,7 @@ INITTED_AND_LEADER_OR_RESPOND(IsCreateTableDoneResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(ListTablesResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(GetTableLocationsResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(GetTableSchemaResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(GetTableStatisticsResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(GetTabletLocationsResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(ReplaceTabletResponsePB);
 
@@ -4952,6 +5388,17 @@ string TabletInfo::ToString() const {
                     (table_ != nullptr ? table_->ToString() : "MISSING"));
 }
 
+
+void TabletInfo::UpdateStats(ReportedTabletStatsPB stats) {
+  std::lock_guard<simple_spinlock> l(lock_);
+  stats_ = std::move(stats);
+}
+
+ReportedTabletStatsPB TabletInfo::GetStats() const {
+  std::lock_guard<simple_spinlock> l(lock_);
+  return stats_;
+}
+
 void PersistentTabletInfo::set_state(SysTabletsEntryPB::State state, const string& msg) {
   pb.set_state(state);
   pb.set_state_msg(msg);
@@ -4971,6 +5418,11 @@ string TableInfo::ToString() const {
   return Substitute("$0 [id=$1]", l.data().pb.name(), table_id_);
 }
 
+uint32_t TableInfo::schema_version() const {
+  TableMetadataLock l(this, LockMode::READ);
+  return l.data().pb.version();
+}
+
 void TableInfo::AddRemoveTablets(const vector<scoped_refptr<TabletInfo>>& tablets_to_add,
                                  const vector<scoped_refptr<TabletInfo>>& tablets_to_drop) {
   std::lock_guard<rw_spinlock> l(lock_);
@@ -4978,6 +5430,8 @@ void TableInfo::AddRemoveTablets(const vector<scoped_refptr<TabletInfo>>& tablet
     const auto& lower_bound = tablet->metadata().state().pb.partition().partition_key_start();
     CHECK(EraseKeyReturnValuePtr(&tablet_map_, lower_bound) != nullptr);
     DecrementSchemaVersionCountUnlocked(tablet->reported_schema_version());
+    // Remove the table metrics for the deleted tablets.
+    RemoveMetrics(tablet->id(), tablet->GetStats());
   }
   for (const auto& tablet : tablets_to_add) {
     TabletInfo* old = nullptr;
@@ -5057,29 +5511,26 @@ bool TableInfo::IsCreateInProgress() const {
   return false;
 }
 
-void TableInfo::AddTask(MonitoredTask* task) {
-  task->AddRef();
-  {
-    std::lock_guard<rw_spinlock> l(lock_);
-    pending_tasks_.insert(task);
-  }
+void TableInfo::AddTask(const string& tablet_id, const scoped_refptr<MonitoredTask>& task) {
+  std::lock_guard<rw_spinlock> l(lock_);
+  pending_tasks_.emplace(tablet_id, task);
 }
 
-void TableInfo::RemoveTask(MonitoredTask* task) {
-  {
-    std::lock_guard<rw_spinlock> l(lock_);
-    pending_tasks_.erase(task);
+void TableInfo::RemoveTask(const string& tablet_id, MonitoredTask* task) {
+  std::lock_guard<rw_spinlock> l(lock_);
+  auto range = pending_tasks_.equal_range(tablet_id);
+  for (auto it = range.first; it != range.second; ++it) {
+    if (it->second.get() == task) {
+      pending_tasks_.erase(it);
+      break;
+    }
   }
-
-  // Done outside the lock so that if Release() drops the last ref to this
-  // TableInfo, RemoveTask() won't unlock a freed lock.
-  task->Release();
 }
 
 void TableInfo::AbortTasks() {
   shared_lock<rw_spinlock> l(lock_);
-  for (MonitoredTask* task : pending_tasks_) {
-    task->Abort();
+  for (auto& task : pending_tasks_) {
+    task.second->Abort();
   }
 }
 
@@ -5097,10 +5548,24 @@ void TableInfo::WaitTasksCompletion() {
   }
 }
 
-void TableInfo::GetTaskList(vector<scoped_refptr<MonitoredTask>>* ret) {
+bool TableInfo::ContainsTask(const string& tablet_id, const string& task_description) {
   shared_lock<rw_spinlock> l(lock_);
-  for (MonitoredTask* task : pending_tasks_) {
-    ret->push_back(make_scoped_refptr(task));
+  auto range = pending_tasks_.equal_range(tablet_id);
+  for (auto it = range.first; it != range.second; ++it) {
+    if (it->second->description() == task_description) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void TableInfo::GetTaskList(vector<scoped_refptr<MonitoredTask>>* tasks) {
+  tasks->clear();
+  {
+    shared_lock<rw_spinlock> l(lock_);
+    for (const auto& task : pending_tasks_) {
+      tasks->push_back(task.second);
+    }
   }
 }
 
@@ -5110,6 +5575,86 @@ void TableInfo::GetAllTablets(vector<scoped_refptr<TabletInfo>>* ret) const {
   for (const auto& e : tablet_map_) {
     ret->emplace_back(make_scoped_refptr(e.second));
   }
+}
+
+void TableInfo::RegisterMetrics(MetricRegistry* metric_registry, const string& table_name) {
+  if (metric_registry) {
+    MetricEntity::AttributeMap attrs;
+    attrs["table_name"] = table_name;
+    metric_entity_ = METRIC_ENTITY_table.Instantiate(metric_registry, table_id_, attrs);
+    metrics_.reset(new TableMetrics(metric_entity_));
+    METRIC_merged_entities_count_of_table.InstantiateHidden(metric_entity_, 1);
+  }
+}
+
+void TableInfo::UnregisterMetrics() {
+  if (metric_entity_) {
+    metric_entity_->Unpublish();
+  }
+}
+
+void TableInfo::UpdateMetrics(const string& tablet_id,
+                              const tablet::ReportedTabletStatsPB& old_stats,
+                              const tablet::ReportedTabletStatsPB& new_stats) {
+  if (metrics_) {
+    metrics_->on_disk_size->IncrementBy(
+        static_cast<int64_t>(new_stats.on_disk_size())
+        - static_cast<int64_t>(old_stats.on_disk_size()));
+    if (new_stats.has_live_row_count()) {
+      DCHECK(!metrics_->ContainsTabletNoLiveRowCount(tablet_id));
+
+      // The function "IncrementBy" makes the metric visible by validating the epoch.
+      // So, it's very important to skip calling it while the metric is invisible.
+      if (!metrics_->live_row_count->IsInvisible()) {
+        metrics_->live_row_count->IncrementBy(
+            static_cast<int64_t>(new_stats.live_row_count())
+            - static_cast<int64_t>(old_stats.live_row_count()));
+      }
+    } else if (!old_stats.has_on_disk_size()) {
+      // For an existing tablet, either it supports 'live_row_count' or not. Obviously,
+      // it doesn't support this feature in this branch. So we gather the tablet uuid to
+      // make sure later that the table doesn't support this either. But the new_stats
+      // will keep coming, so it's necessary to limit the operation to one time only.
+      // Thus, we use the 'on_disk_size' metric of the old_stats as a switch when it is
+      // transitioned from "uninitialized stats" to "has_on_disk_size()".
+      metrics_->AddTabletNoLiveRowCount(tablet_id);
+
+      // Make the metric invisible by invalidating the epoch.
+      metrics_->live_row_count->InvalidateEpoch();
+    }
+  }
+}
+
+void TableInfo::RemoveMetrics(const string& tablet_id,
+                              const tablet::ReportedTabletStatsPB& old_stats) {
+  if (metrics_) {
+    metrics_->on_disk_size->IncrementBy(-static_cast<int64_t>(old_stats.on_disk_size()));
+    if (old_stats.has_live_row_count()) {
+      DCHECK(!metrics_->ContainsTabletNoLiveRowCount(tablet_id));
+      metrics_->live_row_count->IncrementBy(-static_cast<int64_t>(old_stats.live_row_count()));
+    } else {
+      metrics_->DeleteTabletNoLiveRowCount(tablet_id);
+
+      // Make the metric visible again after all of the legacy tablets are deleted.
+      if (metrics_->TableSupportsLiveRowCount()) {
+        uint64_t live_row_count = 0;
+        for (const auto& e : tablet_map_) {
+          live_row_count += e.second->GetStats().live_row_count();
+        }
+        metrics_->live_row_count->IncrementBy(static_cast<int64_t>(live_row_count));
+      }
+    }
+  }
+}
+
+void TableInfo::UpdateMetricsAttrs(const string& new_table_name) {
+  if (metric_entity_) {
+    metric_entity_->SetAttribute("table_name", new_table_name);
+  }
+}
+
+const TableMetrics* TableInfo::GetMetrics() const {
+  return metrics_.get();
 }
 
 void TableInfo::IncrementSchemaVersionCountUnlocked(int64_t version) {

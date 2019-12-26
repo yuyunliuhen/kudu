@@ -26,6 +26,7 @@
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 
+#include "kudu/common/common.pb.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/opid.pb.h"
@@ -90,6 +91,9 @@ Status TabletMetadata::CreateNew(FsManager* fs_manager,
                                  const Partition& partition,
                                  const TabletDataState& initial_tablet_data_state,
                                  boost::optional<OpId> tombstone_last_logged_opid,
+                                 bool supports_live_row_count,
+                                 boost::optional<TableExtraConfigPB> extra_config,
+                                 boost::optional<string> dimension_label,
                                  scoped_refptr<TabletMetadata>* metadata) {
 
   // Verify that no existing tablet exists with the same ID.
@@ -110,7 +114,10 @@ Status TabletMetadata::CreateNew(FsManager* fs_manager,
                                                        partition_schema,
                                                        partition,
                                                        initial_tablet_data_state,
-                                                       std::move(tombstone_last_logged_opid)));
+                                                       std::move(tombstone_last_logged_opid),
+                                                       supports_live_row_count,
+                                                       std::move(extra_config),
+                                                       std::move(dimension_label)));
   RETURN_NOT_OK(ret->Flush());
   dir_group_cleanup.cancel();
 
@@ -136,6 +143,8 @@ Status TabletMetadata::LoadOrCreate(FsManager* fs_manager,
                                     const Partition& partition,
                                     const TabletDataState& initial_tablet_data_state,
                                     boost::optional<OpId> tombstone_last_logged_opid,
+                                    boost::optional<TableExtraConfigPB> extra_config,
+                                    boost::optional<string> dimension_label,
                                     scoped_refptr<TabletMetadata>* metadata) {
   Status s = Load(fs_manager, tablet_id, metadata);
   if (s.ok()) {
@@ -149,7 +158,11 @@ Status TabletMetadata::LoadOrCreate(FsManager* fs_manager,
   if (s.IsNotFound()) {
     return CreateNew(fs_manager, tablet_id, table_name, table_id, schema,
                      partition_schema, partition, initial_tablet_data_state,
-                     std::move(tombstone_last_logged_opid), metadata);
+                     std::move(tombstone_last_logged_opid),
+                     /*supports_live_row_count=*/ true,
+                     std::move(extra_config),
+                     std::move(dimension_label),
+                     metadata);
   }
   return s;
 }
@@ -176,11 +189,11 @@ vector<BlockIdPB> TabletMetadata::CollectBlockIdPBs(const TabletSuperBlockPB& su
   return block_ids;
 }
 
-vector<BlockId> TabletMetadata::CollectBlockIds() {
-  vector<BlockId> block_ids;
+BlockIdContainer TabletMetadata::CollectBlockIds() {
+  BlockIdContainer block_ids;
   for (const auto& r : rowsets_) {
-    vector<BlockId> rowset_block_ids = r->GetAllBlocks();
-    block_ids.insert(block_ids.begin(),
+    BlockIdContainer rowset_block_ids = r->GetAllBlocks();
+    block_ids.insert(block_ids.end(),
                      rowset_block_ids.begin(),
                      rowset_block_ids.end());
   }
@@ -266,7 +279,10 @@ TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id,
                                const Schema& schema, PartitionSchema partition_schema,
                                Partition partition,
                                const TabletDataState& tablet_data_state,
-                               boost::optional<OpId> tombstone_last_logged_opid)
+                               boost::optional<OpId> tombstone_last_logged_opid,
+                               bool supports_live_row_count,
+                               boost::optional<TableExtraConfigPB> extra_config,
+                               boost::optional<string> dimension_label)
     : state_(kNotWrittenYet),
       tablet_id_(std::move(tablet_id)),
       table_id_(std::move(table_id)),
@@ -280,10 +296,13 @@ TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id,
       partition_schema_(std::move(partition_schema)),
       tablet_data_state_(tablet_data_state),
       tombstone_last_logged_opid_(std::move(tombstone_last_logged_opid)),
+      extra_config_(std::move(extra_config)),
+      dimension_label_(std::move(dimension_label)),
       num_flush_pins_(0),
       needs_flush_(false),
       flush_count_for_tests_(0),
-      pre_flush_callback_(Bind(DoNothingStatusClosure)) {
+      pre_flush_callback_(Bind(DoNothingStatusClosure)),
+      supports_live_row_count_(supports_live_row_count) {
   CHECK(schema_->has_column_ids());
   CHECK_GT(schema_->num_key_columns(), 0);
 }
@@ -302,7 +321,8 @@ TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id)
       num_flush_pins_(0),
       needs_flush_(false),
       flush_count_for_tests_(0),
-      pre_flush_callback_(Bind(DoNothingStatusClosure)) {}
+      pre_flush_callback_(Bind(DoNothingStatusClosure)),
+      supports_live_row_count_(false) {}
 
 Status TabletMetadata::LoadFromDisk() {
   TRACE_EVENT1("tablet", "TabletMetadata::LoadFromDisk",
@@ -328,7 +348,7 @@ Status TabletMetadata::UpdateOnDiskSize() {
 }
 
 Status TabletMetadata::LoadFromSuperBlock(const TabletSuperBlockPB& superblock) {
-  vector<BlockId> orphaned_blocks;
+  BlockIdContainer orphaned_blocks;
 
   VLOG(2) << "Loading TabletMetadata from SuperBlockPB:" << std::endl
           << SecureDebugString(superblock);
@@ -386,6 +406,9 @@ Status TabletMetadata::LoadFromSuperBlock(const TabletSuperBlockPB& superblock) 
 
     tablet_data_state_ = superblock.tablet_data_state();
 
+    // This field should be parsed before parsing RowSetDataPB.
+    supports_live_row_count_ = superblock.supports_live_row_count();
+
     rowsets_.clear();
     for (const RowSetDataPB& rowset_pb : superblock.rowsets()) {
       unique_ptr<RowSetMetadata> rowset_meta;
@@ -441,6 +464,18 @@ Status TabletMetadata::LoadFromSuperBlock(const TabletSuperBlockPB& superblock) 
     } else {
       tombstone_last_logged_opid_ = boost::none;
     }
+
+    if (superblock.has_extra_config()) {
+      extra_config_ = superblock.extra_config();
+    } else {
+      extra_config_ = boost::none;
+    }
+
+    if (superblock.has_dimension_label()) {
+      dimension_label_ = superblock.dimension_label();
+    } else {
+      dimension_label_ = boost::none;
+    }
   }
 
   // Now is a good time to clean up any orphaned blocks that may have been
@@ -462,17 +497,17 @@ Status TabletMetadata::UpdateAndFlush(const RowSetMetadataIds& to_remove,
   return Flush();
 }
 
-void TabletMetadata::AddOrphanedBlocks(const vector<BlockId>& blocks) {
+void TabletMetadata::AddOrphanedBlocks(const BlockIdContainer& block_ids) {
   std::lock_guard<LockType> l(data_lock_);
-  AddOrphanedBlocksUnlocked(blocks);
+  AddOrphanedBlocksUnlocked(block_ids);
 }
 
-void TabletMetadata::AddOrphanedBlocksUnlocked(const vector<BlockId>& blocks) {
+void TabletMetadata::AddOrphanedBlocksUnlocked(const BlockIdContainer& block_ids) {
   DCHECK(data_lock_.is_locked());
-  orphaned_blocks_.insert(blocks.begin(), blocks.end());
+  orphaned_blocks_.insert(block_ids.begin(), block_ids.end());
 }
 
-void TabletMetadata::DeleteOrphanedBlocks(const vector<BlockId>& blocks) {
+void TabletMetadata::DeleteOrphanedBlocks(const BlockIdContainer& blocks) {
   if (PREDICT_FALSE(!FLAGS_enable_tablet_orphaned_block_deletion)) {
     LOG_WITH_PREFIX(WARNING) << "Not deleting " << blocks.size()
         << " block(s) from disk. Block deletion disabled via "
@@ -489,10 +524,13 @@ void TabletMetadata::DeleteOrphanedBlocks(const vector<BlockId>& blocks) {
   WARN_NOT_OK(transaction->CommitDeletedBlocks(&deleted),
               "not all orphaned blocks were deleted");
 
-  // Remove the successfully-deleted blocks from the set.
+  // Regardless of whether we deleted all the blocks or not, remove them from
+  // the orphaned blocks list. If we failed to delete the blocks due to
+  // hardware issues, there's not much we can do and we assume the disk isn't
+  // coming back. At worst, this leaves some untracked orphaned blocks.
   {
     std::lock_guard<LockType> l(data_lock_);
-    for (const BlockId& b : deleted) {
+    for (const BlockId& b : blocks) {
       orphaned_blocks_.erase(b);
     }
   }
@@ -521,7 +559,7 @@ Status TabletMetadata::Flush() {
                "tablet_id", tablet_id_);
 
   MutexLock l_flush(flush_lock_);
-  vector<BlockId> orphaned;
+  BlockIdContainer orphaned;
   TabletSuperBlockPB pb;
   {
     std::lock_guard<LockType> l(data_lock_);
@@ -677,6 +715,16 @@ Status TabletMetadata::ToSuperBlockUnlocked(TabletSuperBlockPB* super_block,
     pb.mutable_data_dir_group()->Swap(&group_pb);
   }
 
+  pb.set_supports_live_row_count(supports_live_row_count_);
+
+  if (extra_config_) {
+    *pb.mutable_extra_config() = *extra_config_;
+  }
+
+  if (dimension_label_) {
+    pb.set_dimension_label(*dimension_label_);
+  }
+
   super_block->Swap(&pb);
   return Status::OK();
 }
@@ -760,6 +808,21 @@ string TabletMetadata::LogPrefix() const {
 TabletDataState TabletMetadata::tablet_data_state() const {
   std::lock_guard<LockType> l(data_lock_);
   return tablet_data_state_;
+}
+
+void TabletMetadata::SetExtraConfig(TableExtraConfigPB extra_config) {
+  std::lock_guard<LockType> l(data_lock_);
+  extra_config_ = std::move(extra_config);
+}
+
+boost::optional<TableExtraConfigPB> TabletMetadata::extra_config() const {
+  std::lock_guard<LockType> l(data_lock_);
+  return extra_config_;
+}
+
+boost::optional<string> TabletMetadata::dimension_label() const {
+  std::lock_guard<LockType> l(data_lock_);
+  return dimension_label_;
 }
 
 } // namespace tablet

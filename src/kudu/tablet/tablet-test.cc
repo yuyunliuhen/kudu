@@ -40,6 +40,7 @@
 #include "kudu/common/rowblock.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/timestamp.h"
+#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/gutil/gscoped_ptr.h"
@@ -91,13 +92,18 @@ template<class SETUP>
 class TestTablet : public TabletTestBase<SETUP> {
   typedef SETUP Type;
 
- public:
+public:
   // Verify that iteration doesn't fail
   void CheckCanIterate() {
     vector<string> out_rows;
     ASSERT_OK(this->IterateToStringList(&out_rows));
   }
 
+  void CheckLiveRowsCount(int64_t expect) {
+    uint64_t count = 0;
+    ASSERT_OK(this->tablet()->CountLiveRows(&count));
+    ASSERT_EQ(expect, count);
+  }
 };
 TYPED_TEST_CASE(TestTablet, TabletTestHelperTypes);
 
@@ -111,6 +117,7 @@ TYPED_TEST(TestTablet, TestFlush) {
   ASSERT_EQ(0, this->tablet()->OnDiskDataSize());
   ASSERT_GT(this->tablet()->OnDiskSize(), 0);
   ASSERT_EQ(this->tablet()->metadata()->on_disk_size(), this->tablet()->OnDiskSize());
+  NO_FATALS(this->CheckLiveRowsCount(max_rows));
 
   // Flush it.
   ASSERT_OK(this->tablet()->Flush());
@@ -120,6 +127,7 @@ TYPED_TEST(TestTablet, TestFlush) {
   // on-disk data size due to per-diskrowset metadata and tablet metadata.
   ASSERT_GT(this->tablet()->OnDiskDataSize(), 0);
   ASSERT_GT(this->tablet()->OnDiskSize(), this->tablet()->OnDiskDataSize());
+  NO_FATALS(this->CheckLiveRowsCount(max_rows));
 
   // Make sure the files were created as expected.
   RowSetMetadata* rowset_meta = tablet_meta->GetRowSetForTests(0);
@@ -210,6 +218,7 @@ TYPED_TEST(TestTablet, TestInsertsAndMutationsAreUndoneWithMVCCAfterFlush) {
   // now flush and the compact everything
   ASSERT_OK(this->tablet()->Flush());
   ASSERT_OK(this->tablet()->Compact(Tablet::FORCE_COMPACT_ALL));
+  NO_FATALS(this->CheckLiveRowsCount(4));
 
   // Now verify that with undos and redos we get the same thing.
   VerifySnapshotsHaveSameResult(this->tablet().get(), this->client_schema_,
@@ -244,6 +253,8 @@ TYPED_TEST(TestTablet, TestGhostRowsOnDiskRowSets) {
 
   // Should still be able to update, since the row is live.
   ASSERT_OK(this->UpdateTestRow(&writer, 0, 1));
+
+  NO_FATALS(this->CheckLiveRowsCount(1));
 }
 
 // Test that inserting a row which already exists causes an AlreadyPresent
@@ -259,15 +270,18 @@ TYPED_TEST(TestTablet, TestInsertDuplicateKey) {
   ASSERT_STR_CONTAINS(s.ToString(), "key already present");
 
   ASSERT_EQ(1, this->TabletCount());
+  NO_FATALS(this->CheckLiveRowsCount(1));
 
   // Flush, and make sure that inserting duplicate still fails
   ASSERT_OK(this->tablet()->Flush());
 
   ASSERT_EQ(1, this->TabletCount());
+  NO_FATALS(this->CheckLiveRowsCount(1));
 
   s = this->InsertTestRow(&writer, 12345, 0);
   ASSERT_STR_CONTAINS(s.ToString(), "key already present");
   ASSERT_EQ(1, this->TabletCount());
+  NO_FATALS(this->CheckLiveRowsCount(1));
 }
 
 // Tests that we are able to handle reinserts properly.
@@ -330,7 +344,7 @@ TYPED_TEST(TestTablet, TestReinserts) {
   ASSERT_STR_CONTAINS((*expected_rows[3])[0], "int32 key_idx=1, int32 val=1)");
   ASSERT_EQ(expected_rows[4]->size(), 0) << "Got the wrong result from snap: "
                                          << snaps[4].ToString();
-
+  NO_FATALS(this->CheckLiveRowsCount(0));
   STLDeleteElements(&expected_rows);
 }
 
@@ -372,6 +386,7 @@ TYPED_TEST(TestTablet, TestDeleteWithFlushAndCompact) {
   ASSERT_EQ(0L, writer.last_op_result().mutated_stores(0).dms_id());
   ASSERT_OK(this->IterateToStringList(&rows));
   ASSERT_EQ(0, rows.size());
+  NO_FATALS(this->CheckLiveRowsCount(0));
 
   // We now have an INSERT in the MemRowSet and the
   // deleted row in the DiskRowSet. The new version
@@ -392,6 +407,7 @@ TYPED_TEST(TestTablet, TestDeleteWithFlushAndCompact) {
   ASSERT_OK(this->IterateToStringList(&rows));
   ASSERT_EQ(1, rows.size());
   EXPECT_EQ(this->setup_.FormatDebugRow(0, 2, false), rows[0]);
+  NO_FATALS(this->CheckLiveRowsCount(1));
 }
 
 // Test flushes dealing with REINSERT mutations in the MemRowSet.
@@ -485,13 +501,13 @@ TYPED_TEST(TestTablet, TestRowIteratorSimple) {
   CHECK_OK(this->InsertTestRow(&writer, kInMemRowSet, 0));
 
   // Now iterate the tablet and make sure the rows show up
-  gscoped_ptr<RowwiseIterator> iter;
+  unique_ptr<RowwiseIterator> iter;
   ASSERT_OK(this->tablet()->NewRowIterator(this->client_schema_, &iter));
   ASSERT_OK(iter->Init(nullptr));
 
   ASSERT_TRUE(iter->HasNext());
 
-  RowBlock block(this->schema_, 100, &this->arena_);
+  RowBlock block(&this->schema_, 100, &this->arena_);
 
   // First call to CopyNextRows should fetch the whole memrowset.
   ASSERT_OK_FAST(iter->NextBlock(&block));
@@ -553,15 +569,18 @@ TYPED_TEST(TestTablet, TestRowIteratorOrdered) {
     for (int numBlocks = 1; numBlocks < 5; numBlocks*=2) {
       const int rowsPerBlock = kNumRows / numBlocks;
       // Make a new ordered iterator for the current snapshot.
-      gscoped_ptr<RowwiseIterator> iter;
-
-      ASSERT_OK(this->tablet()->NewRowIterator(this->client_schema_, snap, ORDERED, &iter));
+      RowIteratorOptions opts;
+      opts.projection = &this->client_schema_;
+      opts.snap_to_include = snap;
+      opts.order = ORDERED;
+      unique_ptr<RowwiseIterator> iter;
+      ASSERT_OK(this->tablet()->NewRowIterator(std::move(opts), &iter));
       ASSERT_OK(iter->Init(nullptr));
 
       // Iterate the tablet collecting rows.
       vector<shared_ptr<faststring> > rows;
       for (int i = 0; i < numBlocks; i++) {
-        RowBlock block(this->schema_, rowsPerBlock, &this->arena_);
+        RowBlock block(&this->schema_, rowsPerBlock, &this->arena_);
         ASSERT_TRUE(iter->HasNext());
         ASSERT_OK(iter->NextBlock(&block));
         ASSERT_EQ(rowsPerBlock, block.nrows()) << "unexpected number of rows returned";
@@ -655,7 +674,7 @@ TYPED_TEST(TestTablet, TestRowIteratorComplex) {
   }
 
   // Now iterate the tablet and make sure the rows show up.
-  gscoped_ptr<RowwiseIterator> iter;
+  unique_ptr<RowwiseIterator> iter;
   const Schema& schema = this->client_schema_;
   ASSERT_OK(this->tablet()->NewRowIterator(schema, &iter));
   ASSERT_OK(iter->Init(nullptr));
@@ -664,7 +683,7 @@ TYPED_TEST(TestTablet, TestRowIteratorComplex) {
   vector<bool> seen(max_rows, false);
   int seen_count = 0;
 
-  RowBlock block(schema, 100, &this->arena_);
+  RowBlock block(&schema, 100, &this->arena_);
   while (iter->HasNext()) {
     this->arena_.Reset();
     ASSERT_OK(iter->NextBlock(&block));
@@ -705,6 +724,7 @@ TYPED_TEST(TestTablet, TestInsertsPersist) {
 
   this->InsertTestRows(0, max_rows, 0);
   ASSERT_EQ(max_rows, this->TabletCount());
+  NO_FATALS(this->CheckLiveRowsCount(max_rows));
 
   // Get current timestamp.
   Timestamp t = this->tablet()->clock()->Now();
@@ -713,17 +733,19 @@ TYPED_TEST(TestTablet, TestInsertsPersist) {
   ASSERT_OK(this->tablet()->Flush());
 
   ASSERT_EQ(max_rows, this->TabletCount());
+  NO_FATALS(this->CheckLiveRowsCount(max_rows));
 
   // Close and re-open tablet.
-  // TODO: Should we be reopening the tablet in a different way to persist the
+  // TODO(unknown): Should we be reopening the tablet in a different way to persist the
   // clock / timestamps?
   this->TabletReOpen();
 
   // Ensure that rows exist
   ASSERT_EQ(max_rows, this->TabletCount());
+  NO_FATALS(this->CheckLiveRowsCount(max_rows));
   this->VerifyTestRowsWithTimestampAndVerifier(0, max_rows, t, boost::none);
 
-  // TODO: add some more data, re-flush
+  // TODO(unknown): add some more data, re-flush
 }
 
 TYPED_TEST(TestTablet, TestUpsert) {
@@ -751,6 +773,7 @@ TYPED_TEST(TestTablet, TestUpsert) {
   EXPECT_EQ(2, upserts_as_updates->value());
   ASSERT_OK(this->IterateToStringList(&rows));
   EXPECT_EQ(vector<string>{ this->setup_.FormatDebugRow(0, 1002, false) }, rows);
+  NO_FATALS(this->CheckLiveRowsCount(1));
 }
 
 
@@ -863,6 +886,7 @@ TYPED_TEST(TestTablet, TestCompaction) {
     // Compaction does not swap the memrowsets so we should still get 3
     ASSERT_EQ(3, this->tablet()->CurrentMrsIdForTests());
     ASSERT_EQ(n_rows * 3, this->TabletCount());
+    NO_FATALS(this->CheckLiveRowsCount(n_rows * 3));
 
     const RowSetMetadata *rowset_meta = this->tablet()->metadata()->GetRowSetForTests(3);
     ASSERT_TRUE(rowset_meta != nullptr);
@@ -875,6 +899,24 @@ TYPED_TEST(TestTablet, TestCompaction) {
     const RowSetMetadata *rowset_meta = this->tablet()->metadata()->GetRowSetForTests(i);
     ASSERT_TRUE(rowset_meta == nullptr);
   }
+}
+
+TYPED_TEST(TestTablet, TestCountLiveRowsAfterShutdown) {
+  // Insert 1000 rows into memrowset
+  uint64_t max_rows = this->ClampRowCount(FLAGS_testflush_num_inserts);
+  this->InsertTestRows(0, max_rows, 0);
+  ASSERT_OK(this->tablet()->Flush());
+  NO_FATALS(this->CheckLiveRowsCount(max_rows));
+
+  // Save the tablet's reference.
+  std::shared_ptr<Tablet> tablet = this->tablet();
+
+  // Shutdown the tablet.
+  NO_FATALS(this->tablet()->Shutdown());
+
+  // Call the CountLiveRows().
+  uint64_t count = 0;
+  ASSERT_TRUE(tablet->CountLiveRows(&count).IsRuntimeError());
 }
 
 enum MutationType {
@@ -1101,12 +1143,18 @@ TYPED_TEST(TestTablet, TestMetricsInit) {
   // Create a tablet, but do not open it
   this->CreateTestTablet();
   MetricRegistry* registry = this->harness()->metrics_registry();
-  std::ostringstream out;
-  JsonWriter writer(&out, JsonWriter::PRETTY);
-  ASSERT_OK(registry->WriteAsJson(&writer, { "*" }, MetricJsonOptions()));
+  {
+    std::ostringstream out;
+    JsonWriter writer(&out, JsonWriter::PRETTY);
+    ASSERT_OK(registry->WriteAsJson(&writer, MetricJsonOptions()));
+  }
   // Open tablet, should still work
   this->harness()->Open();
-  ASSERT_OK(registry->WriteAsJson(&writer, { "*" }, MetricJsonOptions()));
+  {
+    std::ostringstream out;
+    JsonWriter writer(&out, JsonWriter::PRETTY);
+    ASSERT_OK(registry->WriteAsJson(&writer, MetricJsonOptions()));
+  }
 }
 
 // Test that we find the correct log segment size for different indexes.
@@ -1398,6 +1446,91 @@ TEST_F(TestTabletStringKey, TestSplitKeyRangeWithMinimumValueRowSet) {
     tablet->SplitKeyRange(nullptr, nullptr, col_ids, 3000, &range);
     AssertChunks(result, range);
   }
+}
+
+TYPED_TEST(TestTablet, TestDiffScanUnobservableOperations) {
+  LocalTabletWriter writer(this->tablet().get(), &this->client_schema());
+  vector<LocalTabletWriter::Op> ops;
+
+  // Row 0: INSERT -> DELETE.
+
+  KuduPartialRow insert_row0(&this->client_schema());
+  this->setup_.BuildRow(&insert_row0, 0);
+  ops.emplace_back(RowOperationsPB::INSERT, &insert_row0);
+
+  KuduPartialRow delete_row0(&this->client_schema());
+  this->setup_.BuildRowKey(&delete_row0, 0);
+  ops.emplace_back(RowOperationsPB::DELETE, &delete_row0);
+
+  // Row 1: INSERT -> UPDATE -> DELETE.
+
+  KuduPartialRow insert_row1(&this->client_schema());
+  this->setup_.BuildRow(&insert_row1, 1);
+  ops.emplace_back(RowOperationsPB::INSERT, &insert_row1);
+
+  KuduPartialRow update_row1(&this->client_schema());
+  this->setup_.BuildRowKey(&update_row1, 1);
+  int col_idx = this->client_schema().num_key_columns() == 1 ? 2 : 3;
+  ASSERT_OK(update_row1.SetInt32(col_idx, 10));
+  ops.emplace_back(RowOperationsPB::UPDATE, &update_row1);
+
+  KuduPartialRow delete_row1(&this->client_schema());
+  this->setup_.BuildRowKey(&delete_row1, 1);
+  ops.emplace_back(RowOperationsPB::DELETE, &delete_row1);
+
+  // Row 2: INSERT -> DELETE -> REINSERT -> DELETE.
+
+  KuduPartialRow insert_row2(&this->client_schema());
+  this->setup_.BuildRow(&insert_row2, 2);
+  ops.emplace_back(RowOperationsPB::INSERT, &insert_row2);
+
+  KuduPartialRow first_delete_row2(&this->client_schema());
+  this->setup_.BuildRowKey(&first_delete_row2, 2);
+  ops.emplace_back(RowOperationsPB::DELETE, &first_delete_row2);
+
+  KuduPartialRow reinsert_row2(&this->client_schema());
+  this->setup_.BuildRow(&reinsert_row2, 2);
+  ops.emplace_back(RowOperationsPB::INSERT, &reinsert_row2);
+
+  KuduPartialRow second_delete_row2(&this->client_schema());
+  this->setup_.BuildRowKey(&second_delete_row2, 2);
+  ops.emplace_back(RowOperationsPB::DELETE, &second_delete_row2);
+
+  // Write all operations to the tablet as part of the same batch. This means
+  // that they will all be assigned the same timestamp.
+  ASSERT_OK(writer.WriteBatch(ops));
+
+  // Performs a diff scan, expecting an empty result set because all three rows
+  // are deleted at all times.
+  auto diff_scan_no_rows = [&]() {
+    // Create a projection with an IS_DELETED virtual column.
+    vector<ColumnSchema> col_schemas(this->client_schema().columns());
+    bool read_default = false;
+    col_schemas.emplace_back("is_deleted", IS_DELETED, /*is_nullable=*/ false,
+                             &read_default);
+    Schema projection(col_schemas, this->client_schema().num_key_columns());
+
+    // Do the diff scan.
+    RowIteratorOptions opts;
+    opts.projection = &projection;
+    opts.snap_to_exclude = MvccSnapshot(Timestamp(1));
+    opts.snap_to_include = MvccSnapshot(Timestamp(2));
+    opts.include_deleted_rows = true;
+    unique_ptr<RowwiseIterator> iter;
+    ASSERT_OK(this->tablet()->NewRowIterator(std::move(opts), &iter));
+    ASSERT_OK(iter->Init(nullptr));
+    vector<string> lines;
+    ASSERT_OK(IterateToStringList(iter.get(), &lines));
+
+    // Test the results.
+    SCOPED_TRACE(JoinStrings(lines, "\n"));
+    ASSERT_TRUE(lines.empty());
+  };
+
+  NO_FATALS(diff_scan_no_rows());
+
+  ASSERT_OK(this->tablet()->Flush());
+  NO_FATALS(diff_scan_no_rows());
 }
 
 } // namespace tablet

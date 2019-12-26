@@ -78,6 +78,7 @@ _MUTED_FILES = set([
   "src/kudu/server/webserver.cc",
   "src/kudu/util/bit-util-test.cc",
   "src/kudu/util/group_varint-test.cc",
+  "src/kudu/util/metrics.h",
   "src/kudu/util/minidump.cc",
   "src/kudu/util/mt-metrics-test.cc",
   "src/kudu/util/process_memory.cc",
@@ -88,7 +89,8 @@ _MUTED_FILES = set([
 _FIX_INCLUDES_STYLE_FLAGS = [
   '--blank_lines',
   '--blank_line_between_c_and_cxx_includes',
-  '--separate_project_includes=kudu/'
+  '--separate_project_includes=kudu/',
+  '--reorder'
 ]
 
 # Directory containin the compilation database
@@ -268,9 +270,9 @@ def main(argv):
   # For correct results, IWYU depends on the generated header files.
   logging.info("Ensuring IWYU dependencies are built...")
   if os.path.exists('Makefile'):
-    subprocess.check_call(['make', 'iwyu-generated-headers'])
+    subprocess.check_call(['make', 'generated-headers'])
   elif os.path.exists('build.ninja'):
-    subprocess.check_call(['ninja', 'iwyu-generated-headers'])
+    subprocess.check_call(['ninja', 'generated-headers'])
   else:
     logging.error('No Makefile or build.ninja found in build directory %s',
                   _BUILD_DIR)

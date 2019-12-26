@@ -43,7 +43,6 @@
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/fs-test-util.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/delta_key.h"
@@ -146,7 +145,7 @@ class TestDeltaFile : public KuduTest {
     return DeltaFileReader::Open(std::move(block), REDO, ReaderOptions(), out);
   }
 
-  Status OpenDeltaFileIterator(const BlockId& block_id, gscoped_ptr<DeltaIterator>* out) {
+  Status OpenDeltaFileIterator(const BlockId& block_id, unique_ptr<DeltaIterator>* out) {
     shared_ptr<DeltaFileReader> reader;
     RETURN_NOT_OK(OpenDeltaFileReader(block_id, &reader));
     return OpenDeltaFileIteratorFromReader(REDO, reader, out);
@@ -154,16 +153,13 @@ class TestDeltaFile : public KuduTest {
 
   Status OpenDeltaFileIteratorFromReader(DeltaType type,
                                          const shared_ptr<DeltaFileReader>& reader,
-                                         gscoped_ptr<DeltaIterator>* out) {
+                                         unique_ptr<DeltaIterator>* out) {
     RowIteratorOptions opts;
     opts.snap_to_include = type == REDO ?
                 MvccSnapshot::CreateSnapshotIncludingAllTransactions() :
                 MvccSnapshot::CreateSnapshotIncludingNoTransactions();
     opts.projection = &schema_;
-    DeltaIterator* raw_iter;
-    RETURN_NOT_OK(reader->NewDeltaIterator(opts, &raw_iter));
-    out->reset(raw_iter);
-    return Status::OK();
+    return reader->NewDeltaIterator(opts, out);
   }
 
   void VerifyTestFile() {
@@ -172,7 +168,7 @@ class TestDeltaFile : public KuduTest {
     ASSERT_EQ(((FLAGS_last_row_to_update - FLAGS_first_row_to_update) / 2) + 1,
               reader->delta_stats().update_count_for_col_id(schema_.column_id(0)));
     ASSERT_EQ(0, reader->delta_stats().delete_count());
-    gscoped_ptr<DeltaIterator> it;
+    unique_ptr<DeltaIterator> it;
     Status s = OpenDeltaFileIteratorFromReader(REDO, reader, &it);
     if (s.IsNotFound()) {
       FAIL() << "Iterator fell outside of the range of an include-all snapshot";
@@ -180,7 +176,7 @@ class TestDeltaFile : public KuduTest {
     ASSERT_OK(s);
     ASSERT_OK(it->Init(nullptr));
 
-    RowBlock block(schema_, 100, &arena_);
+    RowBlock block(&schema_, 100, &arena_);
 
     // Iterate through the faked table, starting with batches that
     // come before all of the updates, and extending a bit further
@@ -221,7 +217,7 @@ class TestDeltaFile : public KuduTest {
   }
 
  protected:
-  gscoped_ptr<FsManager> fs_manager_;
+  unique_ptr<FsManager> fs_manager_;
   Schema schema_;
   Arena arena_;
   BlockId test_block_;
@@ -230,7 +226,7 @@ class TestDeltaFile : public KuduTest {
 TEST_F(TestDeltaFile, TestDumpDeltaFileIterator) {
   WriteTestFile();
 
-  gscoped_ptr<DeltaIterator> it;
+  unique_ptr<DeltaIterator> it;
   Status s = OpenDeltaFileIterator(test_block_, &it);
   if (s.IsNotFound()) {
     FAIL() << "Iterator fell outside of the range of an include-all snapshot";
@@ -251,7 +247,7 @@ TEST_F(TestDeltaFile, TestDumpDeltaFileIterator) {
 
 TEST_F(TestDeltaFile, TestWriteDeltaFileIteratorToFile) {
   WriteTestFile();
-  gscoped_ptr<DeltaIterator> it;
+  unique_ptr<DeltaIterator> it;
   Status s = OpenDeltaFileIterator(test_block_, &it);
   if (s.IsNotFound()) {
     FAIL() << "Iterator fell outside of the range of an include-all snapshot";
@@ -303,7 +299,7 @@ TEST_F(TestDeltaFile, TestCollectMutations) {
   WriteTestFile();
 
   {
-    gscoped_ptr<DeltaIterator> it;
+    unique_ptr<DeltaIterator> it;
     Status s = OpenDeltaFileIterator(test_block_, &it);
     if (s.IsNotFound()) {
       FAIL() << "Iterator fell outside of the range of an include-all snapshot";
@@ -344,32 +340,26 @@ TEST_F(TestDeltaFile, TestSkipsDeltasOutOfRange) {
   shared_ptr<DeltaFileReader> reader;
   ASSERT_OK(OpenDeltaFileReader(test_block_, &reader));
 
-  gscoped_ptr<DeltaIterator> iter;
-
   RowIteratorOptions opts;
   opts.projection = &schema_;
 
   // should skip
   opts.snap_to_include = MvccSnapshot(Timestamp(9));
   ASSERT_FALSE(opts.snap_to_include.MayHaveCommittedTransactionsAtOrAfter(Timestamp(10)));
-  DeltaIterator* raw_iter = nullptr;
-  Status s = reader->NewDeltaIterator(opts, &raw_iter);
+  unique_ptr<DeltaIterator> iter;
+  Status s = reader->NewDeltaIterator(opts, &iter);
   ASSERT_TRUE(s.IsNotFound());
-  ASSERT_TRUE(raw_iter == nullptr);
+  ASSERT_EQ(nullptr, iter);
 
   // should include
-  raw_iter = nullptr;
   opts.snap_to_include = MvccSnapshot(Timestamp(15));
-  ASSERT_OK(reader->NewDeltaIterator(opts, &raw_iter));
-  ASSERT_TRUE(raw_iter != nullptr);
-  iter.reset(raw_iter);
+  ASSERT_OK(reader->NewDeltaIterator(opts, &iter));
+  ASSERT_NE(nullptr, iter);
 
   // should include
-  raw_iter = nullptr;
   opts.snap_to_include = MvccSnapshot(Timestamp(21));
-  ASSERT_OK(reader->NewDeltaIterator(opts, &raw_iter));
-  ASSERT_TRUE(raw_iter != nullptr);
-  iter.reset(raw_iter);
+  ASSERT_OK(reader->NewDeltaIterator(opts, &iter));
+  ASSERT_NE(nullptr, iter);
 }
 
 TEST_F(TestDeltaFile, TestLazyInit) {
@@ -442,23 +432,27 @@ TYPED_TEST(DeltaTypeTestDeltaFile, TestFuzz) {
   const int kNumDeltas = 10000;
   const std::pair<uint64_t, uint64_t> kTimestampRange(0, 100);
 
-  // Build a schema with kNumColumns columns.
+  // Build a schema with kNumColumns columns, some of which are nullable.
+  Random prng(SeedRandom());
   SchemaBuilder sb;
   for (int i = 0; i < kNumColumns; i++) {
-    ASSERT_OK(sb.AddColumn(Substitute("col$0", i), UINT32));
+    if (prng.Uniform(10) == 0) {
+      ASSERT_OK(sb.AddNullableColumn(Substitute("col$0", i), UINT32));
+    } else {
+      ASSERT_OK(sb.AddColumn(Substitute("col$0", i), UINT32));
+    }
   }
   Schema schema(sb.Build());
 
-  Random r(SeedRandom());
   MirroredDeltas<TypeParam> deltas(&schema);
 
   shared_ptr<DeltaFileReader> reader;
   ASSERT_OK(CreateRandomDeltaFile<TypeParam>(
-      schema, this->fs_manager_.get(), &r,
+      schema, this->fs_manager_.get(), &prng,
       kNumDeltas, { 0, kNumRows }, kTimestampRange, &deltas, &reader));
 
   NO_FATALS(RunDeltaFuzzTest<TypeParam>(
-      *reader, &r, &deltas, kTimestampRange,
+      *reader, &prng, &deltas, kTimestampRange,
       /*test_filter_column_ids_and_collect_deltas=*/true));
 }
 
@@ -503,14 +497,13 @@ TYPED_TEST(DeltaTypeTestDeltaFile, BenchmarkPrepareAndApply) {
     RowIteratorOptions opts;
     opts.projection = &projection;
     opts.snap_to_include = MvccSnapshot(ts);
-    DeltaIterator* raw_iter;
-    Status s = reader->NewDeltaIterator(opts, &raw_iter);
+    unique_ptr<DeltaIterator> iter;
+    Status s = reader->NewDeltaIterator(opts, &iter);
     if (s.IsNotFound()) {
       ASSERT_STR_CONTAINS(s.ToString(), "MvccSnapshot outside the range of this delta");
       continue;
     }
     ASSERT_OK(s);
-    unique_ptr<DeltaIterator> iter(raw_iter);
     ASSERT_OK(iter->Init(nullptr));
 
     // Scan from the iterator as if we were a DeltaApplier.

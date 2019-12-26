@@ -14,7 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
+
+import static org.apache.kudu.test.ClientTestUtil.countRowsInScan;
+import static org.apache.kudu.test.ClientTestUtil.createBasicSchemaInsert;
+import static org.apache.kudu.test.ClientTestUtil.getBasicSchema;
+import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -23,7 +29,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.ImmutableList;
-import org.apache.kudu.test.KuduTestHarness;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Rule;
@@ -31,10 +36,8 @@ import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
-import static org.apache.kudu.test.ClientTestUtil.countRowsInScan;
-import static org.apache.kudu.test.ClientTestUtil.createBasicSchemaInsert;
-import static org.apache.kudu.test.ClientTestUtil.getBasicSchema;
+import org.apache.kudu.test.KuduTestHarness;
+import org.apache.kudu.test.RandomUtils;
 
 /**
  * Integration test for the client. RPCs are sent to Kudu from multiple threads while processes
@@ -50,22 +53,24 @@ public class ITClient {
 
   private static final String RUNTIME_PROPERTY_NAME = "itclient.runtime.seconds";
   private static final long DEFAULT_RUNTIME_SECONDS = 60;
-  // Time we'll spend waiting at the end of the test for things to settle. Also the minimum this
-  // test can run for.
+
+  // Time we'll spend waiting at the end of the test for things to settle. Also
+  // the minimum this test can run for.
   private static final long TEST_MIN_RUNTIME_SECONDS = 2;
+
   private static final long TEST_TIMEOUT_SECONDS = 600000;
 
   private static final String TABLE_NAME =
       ITClient.class.getName() + "-" + System.currentTimeMillis();
-  // One error and we stop the test.
-  private static final CountDownLatch KEEP_RUNNING_LATCH = new CountDownLatch(1);
-  // Latch used to track if an error occurred and we need to stop the test early.
-  private static final CountDownLatch ERROR_LATCH = new CountDownLatch(1);
 
-  private static KuduClient localClient;
-  private static AsyncKuduClient localAsyncClient;
-  private static KuduTable table;
-  private static long runtimeInSeconds;
+  // Tracks whether it's time for the test to end or not.
+  private CountDownLatch keepRunningLatch;
+
+  // If the test fails, will contain an exception that describes the failure.
+  private Exception failureException;
+
+  private KuduTable table;
+  private long runtimeInSeconds;
 
   private volatile long sharedWriteTimestamp;
 
@@ -74,73 +79,71 @@ public class ITClient {
 
   @Before
   public void setUp() throws Exception {
+    // Set (or reset, in the event of a retry) test state.
+    keepRunningLatch = new CountDownLatch(1);
+    failureException = null;
+    sharedWriteTimestamp = 0;
 
+    // Extract and verify the test's running time.
     String runtimeProp = System.getProperty(RUNTIME_PROPERTY_NAME);
     runtimeInSeconds = runtimeProp == null ? DEFAULT_RUNTIME_SECONDS : Long.parseLong(runtimeProp);
-
     if (runtimeInSeconds < TEST_MIN_RUNTIME_SECONDS || runtimeInSeconds > TEST_TIMEOUT_SECONDS) {
       Assert.fail("This test needs to run more than " + TEST_MIN_RUNTIME_SECONDS + " seconds" +
           " and less than " + TEST_TIMEOUT_SECONDS + " seconds");
     }
+    LOG.info("Test will run for {} seconds", runtimeInSeconds);
 
-    LOG.info ("Test running for {} seconds", runtimeInSeconds);
-
-    // Client we're using has low tolerance for read timeouts but a
-    // higher overall operation timeout.
-    localAsyncClient = new AsyncKuduClient.AsyncKuduClientBuilder(harness.getMasterAddressesAsString())
-        .defaultSocketReadTimeoutMs(500)
-        .build();
-    localClient = new KuduClient(localAsyncClient);
-
+    // Create the test table.
     CreateTableOptions builder = new CreateTableOptions().setNumReplicas(3);
     builder.setRangePartitionColumns(ImmutableList.of("key"));
-    table = localClient.createTable(TABLE_NAME, getBasicSchema(), builder);
+    table = harness.getClient().createTable(TABLE_NAME, getBasicSchema(), builder);
   }
 
   @Test(timeout = TEST_TIMEOUT_SECONDS)
   public void test() throws Exception {
-
-    UncaughtExceptionHandler uncaughtExceptionHandler = new UncaughtExceptionHandler();
-
-    ArrayList<Thread> threads = new ArrayList<>();
-    Thread chaosThread = new Thread(new ChaosThread());
-    Thread writerThread = new Thread(new WriterThread());
-    Thread scannerThread = new Thread(new ScannerThread());
-
-    threads.add(chaosThread);
-    threads.add(writerThread);
-    threads.add(scannerThread);
+    List<Thread> threads = new ArrayList<>();
+    threads.add(new Thread(new ChaosThread(), "chaos-test-thread"));
+    threads.add(new Thread(new WriterThread(), "writer-test-thread"));
+    threads.add(new Thread(new ScannerThread(), "scanner-test-thread"));
 
     for (Thread thread : threads) {
-      thread.setUncaughtExceptionHandler(uncaughtExceptionHandler);
+      thread.setUncaughtExceptionHandler(new UncaughtExceptionHandler());
       thread.start();
     }
 
-    // await() returns yes if the latch reaches 0, we don't want that.
-    Assert.assertFalse("Look for the last ERROR line in the log that comes from ITCLient",
-        ERROR_LATCH.await(runtimeInSeconds, TimeUnit.SECONDS));
-
-    // Indicate we want to stop, then wait a little bit for it to happen.
-    KEEP_RUNNING_LATCH.countDown();
+    // If we time out here, the test ran to completion and passed. Otherwise, a
+    // count down was triggered from an error and the test failed.
+    boolean failure = keepRunningLatch.await(runtimeInSeconds, TimeUnit.SECONDS);
+    if (!failure) {
+      // The test passed but the threads are still running; tell them to stop.
+      keepRunningLatch.countDown();
+    }
 
     for (Thread thread : threads) {
       // Give plenty of time for threads to stop.
       thread.join(DEFAULT_SLEEP);
     }
 
-    AsyncKuduScanner scannerBuilder = localAsyncClient.newScannerBuilder(table).build();
+    if (failure) {
+      throw failureException;
+    }
+
+    // If the test passed, do some extra validation at the end.
+    AsyncKuduScanner scannerBuilder = harness.getAsyncClient()
+                                             .newScannerBuilder(table)
+                                             .build();
     int rowCount = countRowsInScan(scannerBuilder);
     Assert.assertTrue(rowCount + " should be higher than 0", rowCount > 0);
   }
 
   /**
-   * Logs an error message and triggers the error count down latch, stopping this test.
+   * Logs an error message and triggers the count down latch, stopping this test.
    * @param message error message to print
    * @param exception optional exception to print
    */
   private void reportError(String message, Exception exception) {
-    LOG.error(message, exception);
-    ERROR_LATCH.countDown();
+    failureException = new Exception(message, exception);
+    keepRunningLatch.countDown();
   }
 
   /**
@@ -148,16 +151,16 @@ public class ITClient {
    */
   class ChaosThread implements Runnable {
 
-    private final Random random = new Random();
+    private final Random random = RandomUtils.getRandom();
 
     @Override
     public void run() {
       try {
-        KEEP_RUNNING_LATCH.await(2, TimeUnit.SECONDS);
+        keepRunningLatch.await(2, TimeUnit.SECONDS);
       } catch (InterruptedException e) {
         return;
       }
-      while (KEEP_RUNNING_LATCH.getCount() > 0) {
+      while (keepRunningLatch.getCount() > 0) {
         try {
           boolean shouldContinue;
           int randomInt = random.nextInt(3);
@@ -172,7 +175,7 @@ public class ITClient {
           if (!shouldContinue) {
             return;
           }
-          KEEP_RUNNING_LATCH.await(5, TimeUnit.SECONDS);
+          keepRunningLatch.await(5, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
           return;
         }
@@ -188,14 +191,13 @@ public class ITClient {
      */
     private boolean disconnectNode() {
       try {
-        final List<Connection> connections = localAsyncClient.getConnectionListCopy();
+        final List<Connection> connections = harness.getAsyncClient().getConnectionListCopy();
         if (connections.isEmpty()) {
           return true;
         }
         connections.get(random.nextInt(connections.size())).disconnect();
-
       } catch (Exception e) {
-        if (KEEP_RUNNING_LATCH.getCount() == 0) {
+        if (keepRunningLatch.getCount() == 0) {
           // Likely shutdown() related.
           return false;
         }
@@ -241,14 +243,14 @@ public class ITClient {
    */
   class WriterThread implements Runnable {
 
-    private final KuduSession session = localClient.newSession();
-    private final Random random = new Random();
+    private final KuduSession session = harness.getClient().newSession();
+    private final Random random = RandomUtils.getRandom();
     private int currentRowKey = 0;
 
     @Override
     public void run() {
       session.setExternalConsistencyMode(ExternalConsistencyMode.CLIENT_PROPAGATED);
-      while (KEEP_RUNNING_LATCH.getCount() > 0) {
+      while (keepRunningLatch.getCount() > 0) {
         try {
           OperationResponse resp = session.apply(createBasicSchemaInsert(table, currentRowKey));
           if (hasRowErrorAndReport(resp)) {
@@ -276,7 +278,7 @@ public class ITClient {
             }
           }
         } catch (Exception e) {
-          if (KEEP_RUNNING_LATCH.getCount() == 0) {
+          if (keepRunningLatch.getCount() == 0) {
             // Likely shutdown() related.
             return;
           }
@@ -308,22 +310,21 @@ public class ITClient {
    */
   class ScannerThread implements Runnable {
 
-    private final Random random = new Random();
+    private final Random random = RandomUtils.getRandom();
 
     // Updated by calling a full scan.
     private int lastRowCount = 0;
 
     @Override
     public void run() {
-      while (KEEP_RUNNING_LATCH.getCount() > 0) {
-
+      while (keepRunningLatch.getCount() > 0) {
         boolean shouldContinue;
 
         // First check if we've written at least one row.
         if (sharedWriteTimestamp == 0) {
           shouldContinue = true;
         } else if (lastRowCount == 0 || // Need to full scan once before random reading
-            random.nextBoolean()) {
+                   random.nextBoolean()) {
           shouldContinue = fullScan();
         } else {
           shouldContinue = randomGet();
@@ -335,7 +336,7 @@ public class ITClient {
 
         if (lastRowCount == 0) {
           try {
-            KEEP_RUNNING_LATCH.await(50, TimeUnit.MILLISECONDS);
+            keepRunningLatch.await(50, TimeUnit.MILLISECONDS);
           } catch (InterruptedException e) {
             // Test is stopping.
             return;
@@ -357,18 +358,10 @@ public class ITClient {
           .build();
 
       List<RowResult> results = new ArrayList<>();
-      while (scanner.hasMoreRows()) {
-        try {
-          RowResultIterator ite = scanner.nextRows();
-          for (RowResult row : ite) {
-            results.add(row);
-          }
-        } catch (KuduException e) {
-          return checkAndReportError("Got error while getting row " + key, e);
-        }
+      for (RowResult row : scanner) {
+        results.add(row);
       }
-
-      if (results.isEmpty() || results.size() > 1) {
+      if (results.size() != 1) {
         reportError("Random get got 0 or many rows " + results.size() + " for key " + key, null);
         return false;
       }
@@ -387,10 +380,10 @@ public class ITClient {
      */
     private boolean fullScan() {
       int rowCount;
-      DeadlineTracker deadlineTracker = new DeadlineTracker();
-      deadlineTracker.setDeadline(DEFAULT_SLEEP);
+      TimeoutTracker timeoutTracker = new TimeoutTracker();
+      timeoutTracker.setTimeout(DEFAULT_SLEEP);
 
-      while (KEEP_RUNNING_LATCH.getCount() > 0 && !deadlineTracker.timedOut()) {
+      while (keepRunningLatch.getCount() > 0 && !timeoutTracker.timedOut()) {
         KuduScanner scanner = getScannerBuilder().build();
 
         try {
@@ -406,22 +399,22 @@ public class ITClient {
           }
           return true;
         } else {
-          reportError("Row count unexpectedly decreased from " + lastRowCount + "to " + rowCount,
+          reportError("Row count unexpectedly decreased from " + lastRowCount + " to " + rowCount,
               null);
         }
 
         // Due to the lack of KUDU-430, we need to loop for a while.
         try {
-          KEEP_RUNNING_LATCH.await(50, TimeUnit.MILLISECONDS);
+          keepRunningLatch.await(50, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
           // No need to do anything, we'll exit the loop once we test getCount() in the condition.
         }
       }
-      return !deadlineTracker.timedOut();
+      return !timeoutTracker.timedOut();
     }
 
     private KuduScanner.KuduScannerBuilder getScannerBuilder() {
-      return localClient.newScannerBuilder(table)
+      return harness.getClient().newScannerBuilder(table)
           .readMode(AsyncKuduScanner.ReadMode.READ_AT_SNAPSHOT)
           .snapshotTimestampRaw(sharedWriteTimestamp)
           .setFaultTolerant(true);
@@ -462,7 +455,7 @@ public class ITClient {
     @Override
     public void uncaughtException(Thread t, Throwable e) {
       // Only report an error if we're still running, else we'll spam the log.
-      if (KEEP_RUNNING_LATCH.getCount() != 0) {
+      if (keepRunningLatch.getCount() != 0) {
         reportError("Uncaught exception", new Exception(e));
       }
     }

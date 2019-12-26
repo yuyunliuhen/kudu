@@ -14,12 +14,19 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
+import org.apache.kudu.test.junit.RetryRule;
+
 public class TestErrorCollector {
+
+  @Rule
+  public RetryRule retryRule = new RetryRule();
 
   @Test
   public void testErrorCollector() {

@@ -30,7 +30,6 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/bind.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #ifdef TCMALLOC_ENABLED
@@ -78,7 +77,29 @@ DEFINE_int64(web_log_bytes, 1024 * 1024,
 TAG_FLAG(web_log_bytes, advanced);
 TAG_FLAG(web_log_bytes, runtime);
 
+DEFINE_string(metrics_default_level, "debug",
+              "The default severity level to use when filtering the metrics. "
+              "Valid choices are 'debug', 'info', and 'warn'. "
+              "The levels are ordered and lower levels include the levels above them. "
+              "This value can be overridden by passing the level query parameter to the "
+              "'/metrics' endpoint.");
+TAG_FLAG(metrics_default_level, advanced);
+TAG_FLAG(metrics_default_level, runtime);
+TAG_FLAG(metrics_default_level, evolving);
+DEFINE_validator(metrics_default_level, [](const char* flag_name, const string& value) {
+  if (boost::iequals(value, "debug") ||
+      boost::iequals(value, "info") ||
+      boost::iequals(value, "warn")) {
+    return true;
+  }
+  LOG(ERROR) << Substitute("unknown value for --$0 flag: '$1' "
+                           "(expected one of 'debug', 'info', or 'warn')",
+                           flag_name, value);
+  return false;
+});
+
 // For configuration dashboard
+DECLARE_bool(webserver_require_spnego);
 DECLARE_string(redact);
 DECLARE_string(rpc_encryption);
 DECLARE_string(rpc_authentication);
@@ -113,7 +134,7 @@ struct Tags {
 // Writes the last FLAGS_web_log_bytes of the INFO logfile to a webpage
 // Note to get best performance, set GLOG_logbuflevel=-1 to prevent log buffering
 static void LogsHandler(const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
-  EasyJson* output = resp->output;
+  EasyJson* output = &resp->output;
   (*output)["raw"] = (req.parsed_args.find("raw") != req.parsed_args.end());
   string logfile;
   GetFullLogFilename(google::INFO, &logfile);
@@ -141,7 +162,7 @@ static void LogsHandler(const Webserver::WebRequest& req, Webserver::WebResponse
 // escaped if in the raw text mode, e.g. "/varz?raw".
 static void FlagsHandler(const Webserver::WebRequest& req,
                          Webserver::PrerenderedWebResponse* resp) {
-  ostringstream* output = resp->output;
+  ostringstream* output = &resp->output;
   bool as_text = (req.parsed_args.find("raw") != req.parsed_args.end());
   Tags tags(as_text);
 
@@ -156,7 +177,7 @@ static void FlagsHandler(const Webserver::WebRequest& req,
 // Prints out the current stack trace of all threads in the process.
 static void StacksHandler(const Webserver::WebRequest& /*req*/,
                           Webserver::PrerenderedWebResponse* resp) {
-  ostringstream* output = resp->output;
+  ostringstream* output = &resp->output;
 
   StackTraceSnapshot snap;
   auto start = MonoTime::Now();
@@ -189,7 +210,7 @@ static void StacksHandler(const Webserver::WebRequest& /*req*/,
 // Registered to handle "/memz", and prints out memory allocation statistics.
 static void MemUsageHandler(const Webserver::WebRequest& req,
                             Webserver::PrerenderedWebResponse* resp) {
-  ostringstream* output = resp->output;
+  ostringstream* output = &resp->output;
   bool as_text = (req.parsed_args.find("raw") != req.parsed_args.end());
   Tags tags(as_text);
 
@@ -210,7 +231,7 @@ static void MemUsageHandler(const Webserver::WebRequest& req,
 // Registered to handle "/mem-trackers", and prints out memory tracker information.
 static void MemTrackersHandler(const Webserver::WebRequest& /*req*/,
                                Webserver::PrerenderedWebResponse* resp) {
-  ostringstream* output = resp->output;
+  ostringstream* output = &resp->output;
   int64_t current_consumption = process_memory::CurrentConsumption();
   int64_t hard_limit = process_memory::HardLimit();
   *output << "<h1>Process memory usage</h1>\n";
@@ -269,7 +290,7 @@ static void MemTrackersHandler(const Webserver::WebRequest& /*req*/,
 
 static void ConfigurationHandler(const Webserver::WebRequest& /* req */,
                                  Webserver::WebResponse* resp) {
-  EasyJson* output = resp->output;
+  EasyJson* output = &resp->output;
   EasyJson security_configs = output->Set("security_configs", EasyJson::kArray);
 
   EasyJson rpc_encryption = security_configs.PushBack(EasyJson::kObject);
@@ -302,6 +323,13 @@ static void ConfigurationHandler(const Webserver::WebRequest& /* req */,
   webserver_redaction["secure"] = boost::iequals(FLAGS_redact, "all");
   webserver_redaction["id"] = "webserver_redaction";
   webserver_redaction["explanation"] = "Configure with --redact. Most secure value is 'all'.";
+
+  EasyJson webserver_spnego = security_configs.PushBack(EasyJson::kObject);
+  webserver_spnego["name"] = "Webserver Kerberos Authentication via SPNEGO";
+  webserver_spnego["value"] = FLAGS_webserver_require_spnego ? "on" : "off";
+  webserver_spnego["secure"] = FLAGS_webserver_require_spnego;
+  webserver_spnego["id"] = "webserver_spnego";
+  webserver_spnego["explanation"] = "Configure with --webserver_require_spnego.";
 }
 
 void AddDefaultPathHandlers(Webserver* webserver) {
@@ -318,46 +346,62 @@ void AddDefaultPathHandlers(Webserver* webserver) {
 
   webserver->RegisterPrerenderedPathHandler("/stacks", "Stacks", StacksHandler,
                                             /*is_styled=*/false,
-                                            /*is_on_nav_bar=*/false);
+                                            /*is_on_nav_bar=*/true);
 
   AddPprofPathHandlers(webserver);
 }
 
+static bool ParseBool(const Webserver::ArgumentMap& args, const string& key) {
+  string arg = FindWithDefault(args, key, "false");
+  return ParseLeadingBoolValue(arg.c_str(), false);
+}
+
+static vector<string> ParseArray(const Webserver::ArgumentMap& args, const string& key) {
+  vector<string> value;
+  const string* arg = FindOrNull(args, key);
+  if (arg != nullptr) {
+    SplitStringUsing(*arg, ",", &value);
+  }
+  return value;
+}
 
 static void WriteMetricsAsJson(const MetricRegistry* const metrics,
                                const Webserver::WebRequest& req,
                                Webserver::PrerenderedWebResponse* resp) {
-  ostringstream* output = resp->output;
-  const string* requested_metrics_param = FindOrNull(req.parsed_args, "metrics");
-  vector<string> requested_metrics;
   MetricJsonOptions opts;
+  opts.include_raw_histograms = ParseBool(req.parsed_args, "include_raw_histograms");
+  opts.include_schema_info = ParseBool(req.parsed_args, "include_schema");
 
-  {
-    string arg = FindWithDefault(req.parsed_args, "include_raw_histograms", "false");
-    opts.include_raw_histograms = ParseLeadingBoolValue(arg.c_str(), false);
+  MetricFilters& filters = opts.filters;
+  filters.entity_types = ParseArray(req.parsed_args, "types");
+  filters.entity_ids = ParseArray(req.parsed_args, "ids");
+  filters.entity_attrs = ParseArray(req.parsed_args, "attributes");
+  filters.entity_metrics = ParseArray(req.parsed_args, "metrics");
+  filters.entity_level = FindWithDefault(req.parsed_args, "level", FLAGS_metrics_default_level);
+  vector<string> merge_rules = ParseArray(req.parsed_args, "merge_rules");
+  for (const auto& merge_rule : merge_rules) {
+    vector<string> values;
+    SplitStringUsing(merge_rule, "|", &values);
+    if (values.size() == 3) {
+      // Index 0: entity type needed to be merged.
+      // Index 1: 'merge_to' field of MergeAttributes.
+      // Index 2: 'attribute_to_merge_by' field of MergeAttributes.
+      EmplaceIfNotPresent(&opts.merge_rules, values[0], MergeAttributes(values[1], values[2]));
+    }
   }
-  {
-    string arg = FindWithDefault(req.parsed_args, "include_schema", "false");
-    opts.include_schema_info = ParseLeadingBoolValue(arg.c_str(), false);
-  }
-  JsonWriter::Mode json_mode;
-  {
-    string arg = FindWithDefault(req.parsed_args, "compact", "false");
-    json_mode = ParseLeadingBoolValue(arg.c_str(), false) ?
+
+  JsonWriter::Mode json_mode = ParseBool(req.parsed_args, "compact") ?
       JsonWriter::COMPACT : JsonWriter::PRETTY;
-  }
 
-  JsonWriter writer(output, json_mode);
-
-  if (requested_metrics_param != nullptr) {
-    SplitStringUsing(*requested_metrics_param, ",", &requested_metrics);
+  // The number of entity_attrs should always be even because
+  // each pair represents a key and a value.
+  if (filters.entity_attrs.size() % 2 != 0) {
+    resp->status_code = HttpStatusCode::BadRequest;
+    WARN_NOT_OK(Status::InvalidArgument(""), "The parameter of 'attributes' is wrong");
   } else {
-    // Default to including all metrics.
-    requested_metrics.emplace_back("*");
+    JsonWriter writer(&resp->output, json_mode);
+    WARN_NOT_OK(metrics->WriteAsJson(&writer, opts), "Couldn't write JSON metrics over HTTP");
   }
-
-  WARN_NOT_OK(metrics->WriteAsJson(&writer, requested_metrics, opts),
-              "Couldn't write JSON metrics over HTTP");
 }
 
 void RegisterMetricsJsonHandler(Webserver* webserver, const MetricRegistry* const metrics) {

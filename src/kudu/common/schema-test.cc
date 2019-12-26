@@ -118,10 +118,21 @@ TEST_F(TestSchema, TestSchemaToStringMode) {
             "    key INT32 NOT NULL,\n"
             "    PRIMARY KEY (key)\n"
             ")",
-            schema.ToString(Schema::ToStringMode::WITHOUT_COLUMN_IDS));
+            schema.ToString(Schema::ToStringMode::BASE_INFO));
 }
 
-TEST_F(TestSchema, TestCopyAndMove) {
+enum IncludeColumnIds {
+  INCLUDE_COL_IDS,
+  NO_COL_IDS
+};
+
+class ParameterizedSchemaTest : public KuduTest,
+                                public ::testing::WithParamInterface<IncludeColumnIds> {};
+
+INSTANTIATE_TEST_CASE_P(SchemaTypes, ParameterizedSchemaTest,
+                        ::testing::Values(INCLUDE_COL_IDS, NO_COL_IDS));
+
+TEST_P(ParameterizedSchemaTest, TestCopyAndMove) {
   auto check_schema = [](const Schema& schema) {
     ASSERT_EQ(sizeof(Slice) + sizeof(uint32_t) + sizeof(int32_t),
               schema.byte_size());
@@ -129,12 +140,15 @@ TEST_F(TestSchema, TestCopyAndMove) {
     ASSERT_EQ(0, schema.column_offset(0));
     ASSERT_EQ(sizeof(Slice), schema.column_offset(1));
 
-    EXPECT_EQ("(\n"
-              "    key STRING NOT NULL,\n"
-              "    uint32val UINT32 NULLABLE,\n"
-              "    int32val INT32 NOT NULL,\n"
-              "    PRIMARY KEY (key)\n"
-              ")",
+    EXPECT_EQ(Substitute("(\n"
+                         "    $0key STRING NOT NULL,\n"
+                         "    $1uint32val UINT32 NULLABLE,\n"
+                         "    $2int32val INT32 NOT NULL,\n"
+                         "    PRIMARY KEY (key)\n"
+                         ")",
+                         schema.has_column_ids() ? "0:" : "",
+                         schema.has_column_ids() ? "1:" : "",
+                         schema.has_column_ids() ? "2:" : ""),
               schema.ToString());
     EXPECT_EQ("key STRING NOT NULL", schema.column(0).ToString());
     EXPECT_EQ("UINT32 NULLABLE", schema.column(1).TypeToString());
@@ -145,38 +159,44 @@ TEST_F(TestSchema, TestCopyAndMove) {
   ColumnSchema col3("int32val", INT32);
 
   vector<ColumnSchema> cols = { col1, col2, col3 };
-  Schema schema(cols, 1);
-  check_schema(schema);
+  vector<ColumnId> ids = { ColumnId(0), ColumnId(1), ColumnId(2) };
+  const int kNumKeyCols = 1;
+
+  Schema schema = GetParam() == INCLUDE_COL_IDS ?
+                      Schema(cols, ids, kNumKeyCols) :
+                      Schema(cols, kNumKeyCols);
+
+  NO_FATALS(check_schema(schema));
 
   // Check copy- and move-assignment.
   Schema moved_schema;
   {
     Schema copied_schema = schema;
-    check_schema(copied_schema);
-    ASSERT_TRUE(copied_schema.Equals(schema));
+    NO_FATALS(check_schema(copied_schema));
+    ASSERT_TRUE(copied_schema.Equals(schema, Schema::COMPARE_ALL));
 
     // Move-assign to 'moved_to_schema' from 'copied_schema' and then let
-    // 'copied_schema' go out of scope to make sure none of 'moved_to_schema''s
+    // 'copied_schema' go out of scope to make sure none of the 'moved_schema'
     // resources are incorrectly freed.
     moved_schema = std::move(copied_schema);
 
     // 'copied_schema' is moved from so it should still be valid to call
     // ToString(), though we can't expect any particular result.
-    NO_FATALS(copied_schema.ToString()); // NOLINT(*)
+    copied_schema.ToString(); // NOLINT(*)
   }
-  check_schema(moved_schema);
-  ASSERT_TRUE(moved_schema.Equals(schema));
+  NO_FATALS(check_schema(moved_schema));
+  ASSERT_TRUE(moved_schema.Equals(schema, Schema::COMPARE_ALL));
 
   // Check copy- and move-construction.
   {
     Schema copied_schema(schema);
-    check_schema(copied_schema);
-    ASSERT_TRUE(copied_schema.Equals(schema));
+    NO_FATALS(check_schema(copied_schema));
+    ASSERT_TRUE(copied_schema.Equals(schema, Schema::COMPARE_ALL));
 
     Schema moved_schema(std::move(copied_schema));
-    NO_FATALS(copied_schema.ToString()); // NOLINT(*)
-    check_schema(moved_schema);
-    ASSERT_TRUE(moved_schema.Equals(schema));
+    copied_schema.ToString(); // NOLINT(*)
+    NO_FATALS(check_schema(moved_schema));
+    ASSERT_TRUE(moved_schema.Equals(schema, Schema::COMPARE_ALL));
   }
 }
 
@@ -253,9 +273,9 @@ TEST_F(TestSchema, TestColumnSchemaEquals) {
   ASSERT_TRUE(col1.Equals(col2, ColumnSchema::COMPARE_TYPE));
   ASSERT_TRUE(col1.Equals(col3, ColumnSchema::COMPARE_NAME));
   ASSERT_FALSE(col1.Equals(col3, ColumnSchema::COMPARE_TYPE));
-  ASSERT_TRUE(col1.Equals(col3, ColumnSchema::COMPARE_DEFAULTS));
-  ASSERT_FALSE(col3.Equals(col4, ColumnSchema::COMPARE_DEFAULTS));
-  ASSERT_TRUE(col4.Equals(col4, ColumnSchema::COMPARE_DEFAULTS));
+  ASSERT_TRUE(col1.Equals(col3, ColumnSchema::COMPARE_OTHER));
+  ASSERT_FALSE(col3.Equals(col4, ColumnSchema::COMPARE_OTHER));
+  ASSERT_TRUE(col4.Equals(col4, ColumnSchema::COMPARE_OTHER));
 }
 
 TEST_F(TestSchema, TestSchemaEquals) {
@@ -283,8 +303,7 @@ TEST_F(TestSchema, TestSchemaEquals) {
   ASSERT_FALSE(schema2.KeyTypeEquals(schema3));
   ASSERT_FALSE(schema3.Equals(schema4));
   ASSERT_TRUE(schema4.Equals(schema4));
-  ASSERT_TRUE(schema3.KeyEquals(schema4,
-              ColumnSchema::COMPARE_NAME | ColumnSchema::COMPARE_TYPE));
+  ASSERT_TRUE(schema3.KeyEquals(schema4, ColumnSchema::COMPARE_NAME_AND_TYPE));
 }
 
 TEST_F(TestSchema, TestReset) {
@@ -421,6 +440,60 @@ TEST_F(TestSchema, TestProjectRename) {
   ASSERT_EQ(row_projector.projection_defaults()[0], 2);      // non_present schema2
 }
 
+// Test that we can map a projection schema (no column ids) onto a tablet
+// schema (column ids).
+TEST_F(TestSchema, TestGetMappedReadProjection) {
+  Schema tablet_schema({ ColumnSchema("key", STRING),
+                         ColumnSchema("val", INT32) },
+                       { ColumnId(0),
+                         ColumnId(1) },
+                       1);
+  const bool kReadDefault = false;
+  Schema projection({ ColumnSchema("key", STRING),
+                      ColumnSchema("deleted", IS_DELETED,
+                                   /*is_nullable=*/false, /*read_default=*/&kReadDefault) },
+                    1);
+
+  Schema mapped;
+  ASSERT_OK(tablet_schema.GetMappedReadProjection(projection, &mapped));
+  ASSERT_EQ(1, mapped.num_key_columns());
+  ASSERT_EQ(2, mapped.num_columns());
+  ASSERT_TRUE(mapped.has_column_ids());
+  ASSERT_FALSE(mapped.Equals(projection, Schema::COMPARE_ALL));
+
+  // The column id for the 'key' column in the mapped projection should match
+  // the one from the tablet schema.
+  ASSERT_EQ("key", mapped.column(0).name());
+  ASSERT_EQ(0, mapped.column_id(0));
+
+  // Since 'deleted' is a virtual column and thus does not appear in the tablet
+  // schema, in the mapped schema it should have been assigned a higher column
+  // id than the highest column id in the tablet schema.
+  ASSERT_EQ("deleted", mapped.column(1).name());
+  ASSERT_GT(mapped.column_id(1), tablet_schema.column_id(1));
+  ASSERT_GT(mapped.max_col_id(), tablet_schema.max_col_id());
+
+  // Ensure that virtual columns that are nullable or that do not have read
+  // defaults are rejected.
+  Schema nullable_projection;
+  Status s = nullable_projection.Reset({ ColumnSchema("key", STRING),
+                                         ColumnSchema("deleted", IS_DELETED,
+                                                      /*is_nullable=*/true,
+                                                      /*read_default=*/&kReadDefault) },
+                                       1);
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "must not be nullable");
+
+  Schema no_default_projection;
+  s = no_default_projection.Reset({ ColumnSchema("key", STRING),
+                                    ColumnSchema("deleted", IS_DELETED,
+                                                 /*is_nullable=*/false,
+                                                 /*read_default=*/nullptr) },
+                                  1);
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "must have a default value for read");
+}
+
 // Test that the schema can be used to compare and stringify rows.
 TEST_F(TestSchema, TestRowOperations) {
   Schema schema({ ColumnSchema("col1", STRING),
@@ -431,7 +504,7 @@ TEST_F(TestSchema, TestRowOperations) {
 
   Arena arena(1024);
 
-  RowBuilder rb(schema);
+  RowBuilder rb(&schema);
   rb.AddString(string("row_a_1"));
   rb.AddString(string("row_a_2"));
   rb.AddUint32(3);
@@ -584,14 +657,29 @@ TEST_F(TestSchema, TestCreateProjection) {
             partial_schema.ToString());
 }
 
+TEST_F(TestSchema, TestFindColumn) {
+  Schema schema({ ColumnSchema("col1", STRING),
+                  ColumnSchema("col2", INT32) },
+                1);
+
+  int col_idx;
+  ASSERT_OK(schema.FindColumn("col1", &col_idx));
+  ASSERT_EQ(0, col_idx);
+  ASSERT_OK(schema.FindColumn("col2", &col_idx));
+  ASSERT_EQ(1, col_idx);
+  Status s = schema.FindColumn("col3", &col_idx);
+  ASSERT_TRUE(s.IsNotFound());
+  ASSERT_EQ(s.ToString(), "Not found: No such column: col3");
+}
+
 #ifdef NDEBUG
 TEST(TestKeyEncoder, BenchmarkSimpleKey) {
   faststring fs;
   Schema schema({ ColumnSchema("col1", STRING) }, 1);
 
-  RowBuilder rb(schema);
+  RowBuilder rb(&schema);
   rb.AddString(Slice("hello world"));
-  ConstContiguousRow row(&rb.schema(), rb.data());
+  ConstContiguousRow row(rb.schema(), rb.data());
 
   LOG_TIMING(INFO, "Encoding") {
     for (int i = 0; i < 10000000; i++) {

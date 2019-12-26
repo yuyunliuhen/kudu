@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include <gflags/gflags.h>
 #include <gflags/gflags_declare.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/common/common.pb.h"
@@ -29,13 +33,17 @@
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/mini_master.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/util/hdr_histogram.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/path_util.h"
@@ -57,6 +65,12 @@ using std::unique_ptr;
 using std::vector;
 
 DECLARE_string(location_mapping_cmd);
+DECLARE_int32(max_create_tablets_per_ts);
+METRIC_DECLARE_histogram(handler_latency_kudu_master_MasterService_GetTableLocations);
+
+DEFINE_int32(benchmark_runtime_secs, 5, "Number of seconds to run the benchmark");
+DEFINE_int32(benchmark_num_threads, 16, "Number of threads to run the benchmark");
+DEFINE_int32(benchmark_num_tablets, 60, "Number of tablets to create");
 
 namespace kudu {
 namespace master {
@@ -72,6 +86,7 @@ class TableLocationsTest : public KuduTest {
   void SetUp() override {
     KuduTest::SetUp();
 
+    FLAGS_max_create_tablets_per_ts = 1000;
     SetUpConfig();
 
     InternalMiniClusterOptions opts;
@@ -139,6 +154,7 @@ void TableLocationsTest::CheckMasterTableCreation(const string &table_name,
   GetTableLocationsRequestPB req;
   GetTableLocationsResponsePB resp;
   RpcController controller;
+  req.set_max_returned_locations(1000);
   req.mutable_table()->set_table_name(table_name);
 
   for (int i = 1; ; i++) {
@@ -230,6 +246,68 @@ TEST_F(TableLocationsTest, TestGetTableLocations) {
     EXPECT_EQ("a", resp.tablet_locations(0).partition().partition_key_start());
     EXPECT_EQ("aa", resp.tablet_locations(1).partition().partition_key_start());
     EXPECT_EQ("ab", resp.tablet_locations(2).partition().partition_key_start());
+
+    auto get_tablet_location = [](MasterServiceProxy* proxy, const string& tablet_id) {
+      rpc::RpcController rpc_old;
+      GetTabletLocationsRequestPB req_old;
+      GetTabletLocationsResponsePB resp_old;
+      *req_old.add_tablet_ids() = tablet_id;
+      ASSERT_OK(proxy->GetTabletLocations(req_old, &resp_old, &rpc_old));
+      const auto& loc_old = resp_old.tablet_locations(0);
+      ASSERT_GT(loc_old.deprecated_replicas_size(), 0);
+      ASSERT_EQ(0, loc_old.interned_replicas_size());
+
+      rpc::RpcController rpc_new;
+      GetTabletLocationsRequestPB req_new;
+      GetTabletLocationsResponsePB resp_new;
+      *req_new.add_tablet_ids() = tablet_id;
+      req_new.set_intern_ts_infos_in_response(true);
+      ASSERT_OK(proxy->GetTabletLocations(req_new, &resp_new, &rpc_new));
+      const auto& loc_new = resp_new.tablet_locations(0);
+      ASSERT_GT(loc_new.interned_replicas_size(), 0);
+      ASSERT_EQ(0, loc_new.deprecated_replicas_size());
+
+      ASSERT_EQ(loc_old.tablet_id(), loc_new.tablet_id());
+    };
+
+    // Check that a UUID was returned for every replica
+    for (const auto& loc : resp.tablet_locations()) {
+      NO_FATALS(get_tablet_location(proxy_.get(), loc.tablet_id()));
+      ASSERT_GT(loc.deprecated_replicas_size(), 0);
+      ASSERT_EQ(0, loc.interned_replicas_size());
+      for (const auto& replica : loc.deprecated_replicas()) {
+        ASSERT_NE("", replica.ts_info().permanent_uuid());
+      }
+    }
+  }
+
+  { // from "", with TSInfo interning enabled.
+    GetTableLocationsRequestPB req;
+    GetTableLocationsResponsePB resp;
+    RpcController controller;
+    req.mutable_table()->set_table_name(table_name);
+    req.set_partition_key_start("");
+    req.set_max_returned_locations(3);
+    req.set_intern_ts_infos_in_response(true);
+    ASSERT_OK(proxy_->GetTableLocations(req, &resp, &controller));
+    SCOPED_TRACE(SecureDebugString(resp));
+
+    ASSERT_TRUE(!resp.has_error());
+    ASSERT_EQ(3, resp.tablet_locations().size());
+    EXPECT_EQ("a", resp.tablet_locations(0).partition().partition_key_start());
+    EXPECT_EQ("aa", resp.tablet_locations(1).partition().partition_key_start());
+    EXPECT_EQ("ab", resp.tablet_locations(2).partition().partition_key_start());
+    // Check that a UUID was returned for every replica
+    for (const auto& loc : resp.tablet_locations()) {
+      ASSERT_EQ(loc.deprecated_replicas_size(), 0);
+      ASSERT_GT(loc.interned_replicas_size(), 0);
+      for (const auto& replica : loc.interned_replicas()) {
+        int idx = replica.ts_info_idx();
+        ASSERT_GE(idx, 0);
+        ASSERT_LE(idx, resp.ts_infos_size());
+        ASSERT_NE("", resp.ts_infos(idx).permanent_uuid());
+      }
+    }
   }
 
   { // from "b"
@@ -270,14 +348,16 @@ TEST_F(TableLocationsTest, TestGetTableLocations) {
     RpcController controller;
     req.mutable_table()->set_table_name(table_name);
     req.set_max_returned_locations(1);
+    req.set_intern_ts_infos_in_response(true);
     ASSERT_OK(proxy_->GetTableLocations(req, &resp, &controller));
     SCOPED_TRACE(SecureDebugString(resp));
 
     ASSERT_TRUE(!resp.has_error());
     ASSERT_EQ(1, resp.tablet_locations().size());
-    ASSERT_EQ(3, resp.tablet_locations(0).replicas_size());
-    for (int i = 0; i < 3; i++) {
-      EXPECT_EQ("", resp.tablet_locations(0).replicas(i).ts_info().location());
+    ASSERT_EQ(3, resp.tablet_locations(0).interned_replicas_size());
+    const auto& loc = resp.tablet_locations(0);
+    for (const auto& replica : loc.interned_replicas()) {
+      EXPECT_EQ("", resp.ts_infos(replica.ts_info_idx()).location());
     }
   }
 }
@@ -294,16 +374,86 @@ TEST_F(TableLocationsWithTSLocationTest, TestGetTSLocation) {
     GetTableLocationsResponsePB resp;
     RpcController controller;
     req.mutable_table()->set_table_name(table_name);
+    req.set_intern_ts_infos_in_response(true);
     ASSERT_OK(proxy_->GetTableLocations(req, &resp, &controller));
     SCOPED_TRACE(SecureDebugString(resp));
 
     ASSERT_TRUE(!resp.has_error());
     ASSERT_EQ(1, resp.tablet_locations().size());
-    ASSERT_EQ(3, resp.tablet_locations(0).replicas_size());
-    for (int i = 0; i < 3; i++) {
-      ASSERT_EQ("/foo", resp.tablet_locations(0).replicas(i).ts_info().location());
+    ASSERT_EQ(3, resp.tablet_locations(0).interned_replicas_size());
+    const auto& loc = resp.tablet_locations(0);
+    for (const auto& replica : loc.interned_replicas()) {
+      ASSERT_EQ("/foo", resp.ts_infos(replica.ts_info_idx()).location());
     }
   }
+}
+
+TEST_F(TableLocationsTest, GetTableLocationsBenchmark) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+  const int kNumSplits = FLAGS_benchmark_num_tablets - 1;
+  const int kNumThreads = FLAGS_benchmark_num_threads;
+  const auto kRuntime = MonoDelta::FromSeconds(FLAGS_benchmark_runtime_secs);
+
+  const string table_name = "test";
+  Schema schema({ ColumnSchema("key", INT32) }, 1);
+  KuduPartialRow row(&schema);
+
+  vector<KuduPartialRow> splits(kNumSplits, row);
+  for (int i = 0; i < kNumSplits; i++) {
+    ASSERT_OK(splits[i].SetInt32(0, i*1000));
+  }
+
+  ASSERT_OK(CreateTable(table_name, schema, splits));
+
+  NO_FATALS(CheckMasterTableCreation(table_name, kNumSplits + 1));
+
+  // Make one proxy per thread, so each thread gets its own messenger and
+  // reactor. If there were only one messenger, then only one reactor thread
+  // would be used for the connection to the master, so this benchmark would
+  // probably be testing the serialization and network code rather than the
+  // master GTL code.
+  vector<unique_ptr<MasterServiceProxy>> proxies;
+  proxies.reserve(kNumThreads);
+  for (int i = 0; i < kNumThreads; i++) {
+    MessengerBuilder bld("Client");
+    bld.set_num_reactors(1);
+    shared_ptr<Messenger> msg;
+    ASSERT_OK(bld.Build(&msg));
+    const auto& addr = cluster_->mini_master()->bound_rpc_addr();
+    proxies.emplace_back(new MasterServiceProxy(std::move(msg), addr, addr.host()));
+  }
+
+  std::atomic<bool> stop { false };
+  vector<std::thread> threads;
+  threads.reserve(kNumThreads);
+  for (int i = 0; i < kNumThreads; i++) {
+    threads.emplace_back([&, i]() {
+        while (!stop) {
+          GetTableLocationsRequestPB req;
+          GetTableLocationsResponsePB resp;
+          RpcController controller;
+          req.mutable_table()->set_table_name(table_name);
+          req.set_max_returned_locations(1000);
+          req.set_intern_ts_infos_in_response(true);
+          CHECK_OK(proxies[i]->GetTableLocations(req, &resp, &controller));
+          CHECK_EQ(resp.tablet_locations_size(), kNumSplits + 1);
+        }
+      });
+  }
+
+  SleepFor(kRuntime);
+  stop = true;
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  const auto& ent = cluster_->mini_master()->master()->metric_entity();
+  auto hist = METRIC_handler_latency_kudu_master_MasterService_GetTableLocations
+      .Instantiate(ent);
+
+  cluster_->Shutdown();
+
+  hist->histogram()->DumpHumanReadable(&LOG(INFO));
 }
 
 } // namespace master

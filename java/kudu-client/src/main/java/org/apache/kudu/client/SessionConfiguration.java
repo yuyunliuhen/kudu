@@ -102,6 +102,7 @@ public interface SessionConfiguration {
    *                             the low watermark since it's the same as the high one
    * @throws IllegalArgumentException if the buffer isn't empty or if the watermark isn't between
    * 0 and 1
+   * @deprecated The low watermark no longer has any effect.
    */
   void setMutationBufferLowWatermark(float mutationBufferLowWatermarkPercentage);
 
@@ -151,14 +152,38 @@ public interface SessionConfiguration {
 
   /**
    * Configures the option to ignore all the row errors if they are all of the AlreadyPresent type.
-   * This can be needed when facing KUDU-568. The effect of enabling this is that operation
-   * responses that match this pattern will be cleared of their row errors, meaning that we consider
-   * them successful.
+   * This can be useful when it is possible for INSERT operations to be retried and fail.
+   * The effect of enabling this is that operation responses that match this pattern will be
+   * cleared of their row errors, meaning that we consider them successful.
+   *
+   * TODO(KUDU-1563): Implement server side ignore capabilities to improve performance and
+   *  reliability of INSERT ignore operations.
    *
    * <p>Disabled by default.
    * @param ignoreAllDuplicateRows true if this session should enforce this, else false
    */
   void setIgnoreAllDuplicateRows(boolean ignoreAllDuplicateRows);
+
+  /**
+   * Tells if the session is currently ignoring row errors when the whole list returned by a tablet
+   * server is of the NotFound type.
+   * @return true if the session is enforcing this, else false
+   */
+  boolean isIgnoreAllNotFoundRows();
+
+  /**
+   * Configures the option to ignore all the row errors if they are all of the NotFound type.
+   * This can be useful when it is possible for DELETE operations to be retried and fail.
+   * The effect of enabling this is that operation responses that match this pattern will be
+   * cleared of their row errors, meaning that we consider them successful.
+   *
+   * TODO(KUDU-1563): Implement server side ignore capabilities to improve performance and
+   *  reliability of DELETE ignore operations.
+   *
+   * <p>Disabled by default.
+   * @param ignoreAllNotFoundRows true if this session should enforce this, else false
+   */
+  void setIgnoreAllNotFoundRows(boolean ignoreAllNotFoundRows);
 
   /**
    * Return the number of errors which are pending. Errors may accumulate when

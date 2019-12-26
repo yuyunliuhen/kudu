@@ -20,6 +20,7 @@ package org.apache.kudu.client;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
+import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
 
 import com.google.common.base.Preconditions;
@@ -35,6 +36,7 @@ public class ServerInfo {
   private final String uuid;
   private final HostAndPort hostPort;
   private final InetSocketAddress resolvedAddr;
+  private final String location;
   private final boolean local;
   private static final ConcurrentHashMap<InetAddress, Boolean> isLocalAddressCache =
       new ConcurrentHashMap<>();
@@ -45,19 +47,19 @@ public class ServerInfo {
    * @param uuid server's UUID
    * @param hostPort server's hostname and port
    * @param resolvedAddr resolved address used to check if the server is local
+   * @param location the location assigned by the leader master, or an empty string if no location
+   *                 is assigned
    */
-  public ServerInfo(String uuid, HostAndPort hostPort, InetAddress resolvedAddr) {
+  public ServerInfo(String uuid, HostAndPort hostPort, InetAddress resolvedAddr, String location) {
     Preconditions.checkNotNull(uuid);
     Preconditions.checkArgument(hostPort.getPort() > 0);
+    Preconditions.checkNotNull(location);
     this.uuid = uuid;
     this.hostPort = hostPort;
     this.resolvedAddr = new InetSocketAddress(resolvedAddr, hostPort.getPort());
-    Boolean isLocal = isLocalAddressCache.get(resolvedAddr);
-    if (isLocal == null) {
-      isLocal = NetUtil.isLocalAddress(resolvedAddr);
-      isLocalAddressCache.put(resolvedAddr, isLocal);
-    }
-    this.local = isLocal;
+    this.location = location;
+    this.local = isLocalAddressCache.computeIfAbsent(resolvedAddr,
+        inetAddress -> NetUtil.isLocalAddress(resolvedAddr));
   }
 
   /**
@@ -74,10 +76,19 @@ public class ServerInfo {
    */
   public String getAndCanonicalizeHostname() {
     try {
-      return InetAddress.getByName(hostPort.getHost()).getCanonicalHostName().toLowerCase();
+      return InetAddress.getByName(
+          hostPort.getHost()).getCanonicalHostName().toLowerCase(Locale.ENGLISH);
     } catch (UnknownHostException e) {
       return hostPort.getHost();
     }
+  }
+
+  /**
+   * Returns this server's hostname and port.
+   * @return a HostAndPort that describes where this server can be reached.
+   */
+  public HostAndPort getHostAndPort() {
+    return hostPort;
   }
 
   /**
@@ -86,6 +97,24 @@ public class ServerInfo {
    */
   public int getPort() {
     return hostPort.getPort();
+  }
+
+  /**
+   * Returns this server's location. If no location is assigned, returns an empty string.
+   * @return the server's location
+   */
+  public String getLocation() {
+    return location;
+  }
+
+  /**
+   * Returns true if the server is in the same location as 'location'.
+   * @return true if the server is in 'location'.
+   */
+  public boolean inSameLocation(String loc) {
+    Preconditions.checkNotNull(loc);
+    return !loc.isEmpty() &&
+           loc.equals(location);
   }
 
   /**

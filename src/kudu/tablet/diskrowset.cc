@@ -183,8 +183,8 @@ Status DiskRowSetWriter::InitAdHocIndexWriter() {
 
 }
 
-Status DiskRowSetWriter::AppendBlock(const RowBlock &block) {
-  DCHECK_EQ(block.schema().num_columns(), schema_->num_columns());
+Status DiskRowSetWriter::AppendBlock(const RowBlock &block, int live_row_count) {
+  DCHECK_EQ(block.schema()->num_columns(), schema_->num_columns());
   CHECK(!finished_);
 
   // If this is the very first block, encode the first key and save it as metadata
@@ -200,6 +200,9 @@ Status DiskRowSetWriter::AppendBlock(const RowBlock &block) {
 
   // Write the batch to each of the columns
   RETURN_NOT_OK(col_writer_->AppendBlock(block));
+
+  // Increase the live row count if necessary.
+  rowset_metadata_->IncrementLiveRows(live_row_count);
 
 #ifndef NDEBUG
     faststring prev_key;
@@ -383,9 +386,9 @@ Status RollingDiskRowSetWriter::RollIfNecessary() {
   return Status::OK();
 }
 
-Status RollingDiskRowSetWriter::AppendBlock(const RowBlock &block) {
+Status RollingDiskRowSetWriter::AppendBlock(const RowBlock &block, int live_row_count) {
   DCHECK_EQ(state_, kStarted);
-  RETURN_NOT_OK(cur_writer_->AppendBlock(block));
+  RETURN_NOT_OK(cur_writer_->AppendBlock(block, live_row_count));
 
   written_count_ += block.nrows();
 
@@ -464,13 +467,12 @@ Status RollingDiskRowSetWriter::FinishCurrentWriter() {
     s = cur_redo_writer_->FinishAndReleaseBlock(block_transaction_.get());
     if (!s.IsAborted()) {
       RETURN_NOT_OK(s);
-      cur_drs_metadata_->CommitRedoDeltaDataBlock(0, cur_redo_ds_block_id_);
+      cur_drs_metadata_->CommitRedoDeltaDataBlock(0, 0, cur_redo_ds_block_id_);
     } else {
       DCHECK_EQ(cur_redo_delta_stats->min_timestamp(), Timestamp::kMax);
     }
 
     written_size_ += cur_writer_->written_size();
-
     written_drs_metas_.push_back(cur_drs_metadata_);
   }
 
@@ -479,7 +481,6 @@ Status RollingDiskRowSetWriter::FinishCurrentWriter() {
   cur_redo_writer_.reset(nullptr);
 
   cur_drs_metadata_.reset();
-
   return Status::OK();
 }
 
@@ -534,7 +535,8 @@ DiskRowSet::DiskRowSet(shared_ptr<RowSetMetadata> rowset_metadata,
 Status DiskRowSet::Open(const IOContext* io_context) {
   TRACE_EVENT0("tablet", "DiskRowSet::Open");
   RETURN_NOT_OK(CFileSet::Open(rowset_metadata_,
-                               mem_trackers_.tablet_tracker,
+                               mem_trackers_.bloomfile_tracker,
+                               mem_trackers_.cfile_reader_tracker,
                                io_context,
                                &base_data_));
 
@@ -575,7 +577,7 @@ Status DiskRowSet::MajorCompactDeltaStores(const IOContext* io_context,
 Status DiskRowSet::MajorCompactDeltaStoresWithColumnIds(const vector<ColumnId>& col_ids,
                                                         const IOContext* io_context,
                                                         HistoryGcOpts history_gc_opts) {
-  LOG_WITH_PREFIX(INFO) << "Major compacting REDO delta stores (cols: " << col_ids << ")";
+  VLOG_WITH_PREFIX(1) << "Major compacting REDO delta stores (cols: " << col_ids << ")";
   TRACE_EVENT0("tablet", "DiskRowSet::MajorCompactDeltaStoresWithColumnIds");
   std::lock_guard<Mutex> l(*delta_tracker()->compact_flush_lock());
   RETURN_NOT_OK(delta_tracker()->CheckWritableUnlocked());
@@ -599,14 +601,15 @@ Status DiskRowSet::MajorCompactDeltaStoresWithColumnIds(const vector<ColumnId>& 
   // Prepare the changes to the metadata.
   RowSetMetadataUpdate update;
   compaction->CreateMetadataUpdate(&update);
-  vector<BlockId> removed_blocks;
+  BlockIdContainer removed_blocks;
   rowset_metadata_->CommitUpdate(update, &removed_blocks);
 
   // Now that the metadata has been updated, open a new cfile set with the
   // appropriate blocks to match the update.
   shared_ptr<CFileSet> new_base;
   RETURN_NOT_OK(CFileSet::Open(rowset_metadata_,
-                               mem_trackers_.tablet_tracker,
+                               mem_trackers_.bloomfile_tracker,
+                               mem_trackers_.cfile_reader_tracker,
                                io_context,
                                &new_base));
   {
@@ -656,17 +659,16 @@ Status DiskRowSet::NewMajorDeltaCompaction(const vector<ColumnId>& col_ids,
 }
 
 Status DiskRowSet::NewRowIterator(const RowIteratorOptions& opts,
-                                  gscoped_ptr<RowwiseIterator>* out) const {
+                                  unique_ptr<RowwiseIterator>* out) const {
   DCHECK(open_);
   shared_lock<rw_spinlock> l(component_lock_);
 
   shared_ptr<CFileSet::Iterator> base_iter(base_data_->NewIterator(opts.projection,
                                                                    opts.io_context));
-  gscoped_ptr<ColumnwiseIterator> col_iter;
+  unique_ptr<ColumnwiseIterator> col_iter;
   RETURN_NOT_OK(delta_tracker_->WrapIterator(base_iter, opts, &col_iter));
 
-  out->reset(new MaterializingIterator(
-      shared_ptr<ColumnwiseIterator>(col_iter.release())));
+  *out = NewMaterializingIterator(std::move(col_iter));
   return Status::OK();
 }
 
@@ -751,6 +753,12 @@ Status DiskRowSet::CountRows(const IOContext* io_context, rowid_t *count) const 
     RETURN_NOT_OK(base_data_->CountRows(io_context, count));
     num_rows_.store(*count);
   }
+  return Status::OK();
+}
+
+Status DiskRowSet::CountLiveRows(uint64_t* count) const {
+  DCHECK_GE(rowset_metadata_->live_row_count(), delta_tracker_->CountDeletedRows());
+  *count = rowset_metadata_->live_row_count() - delta_tracker_->CountDeletedRows();
   return Status::OK();
 }
 

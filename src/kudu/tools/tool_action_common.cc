@@ -17,11 +17,9 @@
 
 #include "kudu/tools/tool_action_common.h"
 
-#include <unistd.h>
+#include <stdlib.h>
 
 #include <algorithm>
-#include <cerrno>
-#include <cstddef>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -35,10 +33,12 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <google/protobuf/util/json_util.h>
+// IWYU pragma: no_include <yaml-cpp/node/impl.h>
+// IWYU pragma: no_include <yaml-cpp/node/node.h>
 
 #include "kudu/client/client-internal.h"  // IWYU pragma: keep
 #include "kudu/client/client.h"
+#include "kudu/client/master_proxy_rpc.h"
 #include "kudu/client/shared_ptr.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/row_operations.h"
@@ -49,7 +49,6 @@
 #include "kudu/consensus/log.pb.h"
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/opid.pb.h"
-#include "kudu/gutil/endian.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/join.h"
@@ -60,6 +59,8 @@
 #include "kudu/gutil/strings/util.h"
 #include "kudu/master/master.proxy.h" // IWYU pragma: keep
 #include "kudu/rpc/messenger.h"
+#include "kudu/rpc/response_callback.h"
+#include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/server/server_base.pb.h"
@@ -69,15 +70,18 @@
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_admin.proxy.h"   // IWYU pragma: keep
 #include "kudu/tserver/tserver_service.proxy.h" // IWYU pragma: keep
-#include "kudu/util/faststring.h"
+#include "kudu/util/async_util.h"
+#include "kudu/util/env.h"
 #include "kudu/util/jsonwriter.h"
 #include "kudu/util/mem_tracker.pb.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/status.h"
+#include "kudu/util/yamlreader.h"
 
 DEFINE_bool(force, false, "If true, allows the set_flag command to set a flag "
             "which is not explicitly marked as runtime-settable. Such flag "
@@ -92,6 +96,9 @@ DEFINE_string(print_entries, "decoded",
               "  id = print only their ids");
 DEFINE_string(table_name, "",
               "Restrict output to a specific table by name");
+DEFINE_string(tablets, "",
+              "Tablets to check (comma-separated list of IDs) "
+              "If not specified, checks all tablets.");
 DEFINE_int64(timeout_ms, 1000 * 60, "RPC timeout in milliseconds");
 DEFINE_int32(truncate_data, 100,
              "Truncate the data fields to the given number of bytes "
@@ -106,6 +113,9 @@ DEFINE_string(flag_tags, "", "Comma-separated list of tags used to restrict whic
                              "flags are returned. An empty value matches all tags");
 DEFINE_bool(all_flags, false, "Whether to return all flags, or only flags that "
                               "were explicitly set.");
+DEFINE_string(flags, "", "Comma-separated list of flags used to restrict which "
+                         "flags are returned. An empty value means no restriction. "
+                         "If non-empty, all_flags is ignored.");
 DEFINE_string(tables, "", "Tables to include (comma-separated list of table names)"
                           "If not specified, includes all tables.");
 
@@ -113,55 +123,49 @@ DEFINE_string(memtracker_output, "table",
               "One of 'json', 'json_compact' or 'table'. Table output flattens "
               "the memtracker hierarchy.");
 
-namespace boost {
-template <typename Signature>
-class function;
-} // namespace boost
+DEFINE_int32(num_threads, 2,
+             "Number of threads to run. Each thread runs its own "
+             "KuduSession.");
+static bool ValidateNumThreads(const char* flag_name, int32_t flag_value) {
+  if (flag_value <= 0) {
+    LOG(ERROR) << strings::Substitute("'$0' flag should have a positive value",
+                                      flag_name);
+    return false;
+  }
+  return true;
+}
+DEFINE_validator(num_threads, &ValidateNumThreads);
 
-namespace kudu {
-
-namespace master {
-class ListMastersRequestPB;
-class ListMastersResponsePB;
-class ListTabletServersRequestPB;
-class ListTabletServersResponsePB;
-class ReplaceTabletRequestPB;
-class ReplaceTabletResponsePB;
-} // namespace master
-
-namespace tools {
-
-using client::KuduClient;
-using client::KuduClientBuilder;
-using client::KuduTable;
-using consensus::ConsensusServiceProxy; // NOLINT
-using consensus::ReplicateMsg;
-using log::LogEntryPB;
-using log::LogEntryReader;
-using log::ReadableLogSegment;
-using master::ListMastersRequestPB;
-using master::ListMastersResponsePB;
-using master::ListTabletServersRequestPB;
-using master::ListTabletServersResponsePB;
-using master::MasterServiceProxy;
-using master::ReplaceTabletRequestPB;
-using master::ReplaceTabletResponsePB;
-using pb_util::SecureDebugString;
-using pb_util::SecureShortDebugString;
-using rpc::Messenger;
-using rpc::MessengerBuilder;
-using rpc::RequestIdPB;
-using rpc::RpcController;
-using server::GenericServiceProxy;
-using server::GetFlagsRequestPB;
-using server::GetFlagsResponsePB;
-using server::GetStatusRequestPB;
-using server::GetStatusResponsePB;
-using server::ServerClockRequestPB;
-using server::ServerClockResponsePB;
-using server::ServerStatusPB;
-using server::SetFlagRequestPB;
-using server::SetFlagResponsePB;
+using kudu::client::KuduClient;
+using kudu::client::KuduClientBuilder;
+using kudu::client::internal::AsyncLeaderMasterRpc;
+using kudu::consensus::ConsensusServiceProxy; // NOLINT
+using kudu::consensus::ReplicateMsg;
+using kudu::log::LogEntryPB;
+using kudu::log::LogEntryReader;
+using kudu::log::ReadableLogSegment;
+using kudu::master::MasterServiceProxy;
+using kudu::pb_util::SecureDebugString;
+using kudu::pb_util::SecureShortDebugString;
+using kudu::rpc::BackoffType;
+using kudu::rpc::Messenger;
+using kudu::rpc::MessengerBuilder;
+using kudu::rpc::RequestIdPB;
+using kudu::rpc::ResponseCallback;
+using kudu::rpc::RpcController;
+using kudu::server::GenericServiceProxy;
+using kudu::server::GetFlagsRequestPB;
+using kudu::server::GetFlagsResponsePB;
+using kudu::server::GetStatusRequestPB;
+using kudu::server::GetStatusResponsePB;
+using kudu::server::ServerClockRequestPB;
+using kudu::server::ServerClockResponsePB;
+using kudu::server::ServerStatusPB;
+using kudu::server::SetFlagRequestPB;
+using kudu::server::SetFlagResponsePB;
+using kudu::tserver::TabletServerAdminServiceProxy; // NOLINT
+using kudu::tserver::TabletServerServiceProxy; // NOLINT
+using kudu::tserver::WriteRequestPB;
 using std::cout;
 using std::endl;
 using std::ostream;
@@ -171,14 +175,26 @@ using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 using std::vector;
+using strings::Split;
 using strings::Substitute;
-using tserver::TabletServerAdminServiceProxy;
-using tserver::TabletServerServiceProxy;
-using tserver::WriteRequestPB;
+
+namespace boost {
+template <typename Signature>
+class function;
+} // namespace boost
+
+namespace kudu {
+namespace tools {
 
 const char* const kMasterAddressesArg = "master_addresses";
-const char* const kMasterAddressesArgDesc = "Comma-separated list of Kudu "
-    "Master addresses where each address is of form 'hostname:port'";
+const char* const kMasterAddressesArgDesc = "Either comma-separated list of Kudu "
+    "master addresses where each address is of form 'hostname:port', or a cluster name if it has "
+    "been configured in ${KUDU_CONFIG}/kudurc";
+const char* const kDestMasterAddressesArg = "dest_master_addresses";
+const char* const kDestMasterAddressesArgDesc = "Either comma-separated list of destination Kudu "
+    "master addresses where each address is of form 'hostname:port', or a cluster name if it has "
+    "been configured in ${KUDU_CONFIG}/kudurc";
+const char* const kTableNameArg = "table_name";
 const char* const kTabletIdArg = "tablet_id";
 const char* const kTabletIdArgDesc = "Tablet Identifier";
 
@@ -239,7 +255,7 @@ Status PrintDecodedWriteRequestPB(const string& indent,
   Arena arena(32 * 1024);
   RowOperationsPBDecoder dec(&write.row_operations(), &request_schema, &tablet_schema, &arena);
   vector<DecodedRowOperation> ops;
-  RETURN_NOT_OK(dec.DecodeOperations(&ops));
+  RETURN_NOT_OK(dec.DecodeOperations<DecoderMode::WRITE_OPS>(&ops));
 
   cout << indent << "Tablet: " << write.tablet_id() << endl;
   cout << indent << "RequestId: "
@@ -283,6 +299,19 @@ Status PrintDecoded(const LogEntryPB& entry, const Schema& tablet_schema) {
   }
 
   return Status::OK();
+}
+
+// A valid 'cluster name' is beginning with a special character '@'.
+// '@' is a character which has no special significance in shells and
+// it's an invalid character in hostname list, so we can use it to
+// distinguish cluster name from master addresses.
+bool GetClusterName(const string& master_addresses_str, string* cluster_name) {
+  CHECK(cluster_name);
+  if (HasPrefixString(master_addresses_str, "@")) {
+    *cluster_name = master_addresses_str.substr(1);  // Trim the first '@'.
+    return true;
+  }
+  return false;
 }
 
 } // anonymous namespace
@@ -378,11 +407,12 @@ Status PrintSegment(const scoped_refptr<ReadableLogSegment>& segment) {
   return Status::OK();
 }
 
-Status GetServerFlags(const std::string& address,
+Status GetServerFlags(const string& address,
                       uint16_t default_port,
                       bool all_flags,
-                      const std::string& flag_tags,
-                      std::vector<server::GetFlagsResponsePB_Flag>* flags) {
+                      const string& flags_to_get,
+                      const string& flag_tags,
+                      vector<server::GetFlagsResponsePB_Flag>* flags) {
   unique_ptr<GenericServiceProxy> proxy;
   RETURN_NOT_OK(BuildProxy(address, default_port, &proxy));
 
@@ -395,6 +425,10 @@ Status GetServerFlags(const std::string& address,
   for (StringPiece tag : strings::Split(flag_tags, ",", strings::SkipEmpty())) {
     req.add_tags(tag.as_string());
   }
+  for (StringPiece flag: strings::Split(flags_to_get, ",", strings::SkipEmpty())) {
+    req.add_flags(flag.as_string());
+  }
+
   RETURN_NOT_OK(proxy->GetFlags(req, &resp, &rpc));
 
   flags->clear();
@@ -404,7 +438,8 @@ Status GetServerFlags(const std::string& address,
 
 Status PrintServerFlags(const string& address, uint16_t default_port) {
   vector<server::GetFlagsResponsePB_Flag> flags;
-  RETURN_NOT_OK(GetServerFlags(address, default_port, FLAGS_all_flags, FLAGS_flag_tags, &flags));
+  RETURN_NOT_OK(GetServerFlags(address, default_port, FLAGS_all_flags,
+      FLAGS_flags, FLAGS_flag_tags, &flags));
 
   std::sort(flags.begin(), flags.end(),
       [](const GetFlagsResponsePB::Flag& left,
@@ -459,6 +494,76 @@ bool MatchesAnyPattern(const vector<string>& patterns, const string& str) {
     if (MatchPattern(str, p)) return true;
   }
   return false;
+}
+
+Status CreateKuduClient(const RunnerContext& context,
+                        const char* master_addresses_arg,
+                        client::sp::shared_ptr<KuduClient>* client) {
+  vector<string> master_addresses;
+  RETURN_NOT_OK(ParseMasterAddresses(context, master_addresses_arg, &master_addresses));
+  return KuduClientBuilder()
+             .master_server_addrs(master_addresses)
+             .Build(client);
+}
+
+Status CreateKuduClient(const RunnerContext& context,
+                        client::sp::shared_ptr<KuduClient>* client) {
+  return CreateKuduClient(context, kMasterAddressesArg, client);
+}
+
+Status ParseMasterAddressesStr(const RunnerContext& context,
+                               const char* master_addresses_arg,
+                               string* master_addresses_str) {
+  CHECK(master_addresses_str);
+  *master_addresses_str = FindOrDie(context.required_args, master_addresses_arg);
+  string cluster_name;
+  if (!GetClusterName(*master_addresses_str, &cluster_name)) {
+    // Treat it as master addresses.
+    return Status::OK();
+  }
+
+  // Try to resolve cluster name.
+  char* kudu_config_path = getenv("KUDU_CONFIG");
+  if (!kudu_config_path) {
+    return Status::NotFound("${KUDU_CONFIG} is missing");
+  }
+  auto config_file = JoinPathSegments(kudu_config_path, "kudurc");
+  if (!Env::Default()->FileExists(config_file)) {
+    return Status::NotFound(Substitute("configuration file $0 was not found", config_file));
+  }
+  YamlReader reader(config_file);
+  RETURN_NOT_OK(reader.Init());
+  YAML::Node clusters_info;
+  RETURN_NOT_OK(YamlReader::ExtractMap(reader.node(), "clusters_info", &clusters_info));
+  YAML::Node cluster_info;
+  RETURN_NOT_OK(YamlReader::ExtractMap(&clusters_info, cluster_name, &cluster_info));
+  RETURN_NOT_OK(YamlReader::ExtractScalar(&cluster_info, "master_addresses",
+                                          master_addresses_str));
+  return Status::OK();
+}
+
+Status ParseMasterAddressesStr(
+    const RunnerContext& context,
+    string* master_addresses_str) {
+  CHECK(master_addresses_str);
+  return ParseMasterAddressesStr(context, kMasterAddressesArg, master_addresses_str);
+}
+
+Status ParseMasterAddresses(const RunnerContext& context,
+                            const char* master_addresses_arg,
+                            vector<string>* master_addresses) {
+  CHECK(master_addresses);
+  string master_addresses_str;
+  RETURN_NOT_OK(ParseMasterAddressesStr(context, master_addresses_arg, &master_addresses_str));
+  *master_addresses = strings::Split(master_addresses_str, ",");
+  return Status::OK();
+}
+
+Status ParseMasterAddresses(
+    const RunnerContext& context,
+    vector<string>* master_addresses) {
+  CHECK(master_addresses);
+  return ParseMasterAddresses(context, kMasterAddressesArg, master_addresses);
 }
 
 Status PrintServerStatus(const string& address, uint16_t default_port) {
@@ -636,12 +741,12 @@ void PrintTable(const vector<vector<string>>& columns, const string& separator, 
 
 } // anonymous namespace
 
-DataTable::DataTable(std::vector<string> col_names)
+DataTable::DataTable(vector<string> col_names)
     : column_names_(std::move(col_names)),
       columns_(column_names_.size()) {
 }
 
-void DataTable::AddRow(std::vector<string> row) {
+void DataTable::AddRow(vector<string> row) {
   CHECK_EQ(row.size(), columns_.size());
   int i = 0;
   for (auto& v : row) {
@@ -686,215 +791,68 @@ Status LeaderMasterProxy::Init(const vector<string>& master_addrs, const MonoDel
 }
 
 Status LeaderMasterProxy::Init(const RunnerContext& context) {
-  const string& master_addrs = FindOrDie(context.required_args, kMasterAddressesArg);
-  return Init(strings::Split(master_addrs, ","), MonoDelta::FromMilliseconds(FLAGS_timeout_ms));
+  vector<string> master_addresses;
+  RETURN_NOT_OK(ParseMasterAddresses(context, &master_addresses));
+  return Init(master_addresses, MonoDelta::FromMilliseconds(FLAGS_timeout_ms));
 }
 
 template<typename Req, typename Resp>
 Status LeaderMasterProxy::SyncRpc(const Req& req,
                                   Resp* resp,
-                                  const char* func_name,
-                                  const boost::function<Status(master::MasterServiceProxy*,
-                                                               const Req&, Resp*,
-                                                               rpc::RpcController*)>& func) {
+                                  string func_name,
+                                  const boost::function<void(master::MasterServiceProxy*,
+                                                             const Req&, Resp*,
+                                                             rpc::RpcController*,
+                                                             const ResponseCallback&)>& func) {
   MonoTime deadline = MonoTime::Now() + MonoDelta::FromMilliseconds(FLAGS_timeout_ms);
-  return client_->data_->SyncLeaderMasterRpc(deadline, client_.get(), req, resp,
-                                             func_name, func, {});
+  Synchronizer sync;
+  AsyncLeaderMasterRpc<Req, Resp> rpc(deadline, client_.get(), BackoffType::EXPONENTIAL,
+      req, resp, func, std::move(func_name), sync.AsStatusCallback(), {});
+  rpc.SendRpc();
+  return sync.Wait();
 }
 
 // Explicit specializations for callers outside this compilation unit.
 template
-Status LeaderMasterProxy::SyncRpc(const ListTabletServersRequestPB& req,
-                                  ListTabletServersResponsePB* resp,
-                                  const char* func_name,
-                                  const boost::function<Status(MasterServiceProxy*,
-                                                               const ListTabletServersRequestPB&,
-                                                               ListTabletServersResponsePB*,
-                                                               RpcController*)>& func);
+Status LeaderMasterProxy::SyncRpc(
+    const master::ChangeTServerStateRequestPB& req,
+    master::ChangeTServerStateResponsePB* resp,
+    string func_name,
+    const boost::function<void(MasterServiceProxy*,
+                               const master::ChangeTServerStateRequestPB&,
+                               master::ChangeTServerStateResponsePB*,
+                               RpcController*,
+                               const ResponseCallback&)>& func);
 template
-Status LeaderMasterProxy::SyncRpc(const ListMastersRequestPB& req,
-                                  ListMastersResponsePB* resp,
-                                  const char* func_name,
-                                  const boost::function<Status(MasterServiceProxy*,
-                                                               const ListMastersRequestPB&,
-                                                               ListMastersResponsePB*,
-                                                               RpcController*)>& func);
+Status LeaderMasterProxy::SyncRpc(
+    const master::ListTabletServersRequestPB& req,
+    master::ListTabletServersResponsePB* resp,
+    string func_name,
+    const boost::function<void(MasterServiceProxy*,
+                               const master::ListTabletServersRequestPB&,
+                               master::ListTabletServersResponsePB*,
+                               RpcController*,
+                               const ResponseCallback&)>& func);
 template
-Status LeaderMasterProxy::SyncRpc(const ReplaceTabletRequestPB& req,
-                                  ReplaceTabletResponsePB* resp,
-                                  const char* func_name,
-                                  const boost::function<Status(MasterServiceProxy*,
-                                                               const ReplaceTabletRequestPB&,
-                                                               ReplaceTabletResponsePB*,
-                                                               RpcController*)>& func);
-
-const int ControlShellProtocol::kMaxMessageBytes = 1024 * 1024;
-
-ControlShellProtocol::ControlShellProtocol(SerializationMode serialization_mode,
-                                           CloseMode close_mode,
-                                           int read_fd,
-                                           int write_fd)
-    : serialization_mode_(serialization_mode),
-      close_mode_(close_mode),
-      read_fd_(read_fd),
-      write_fd_(write_fd) {
-}
-
-ControlShellProtocol::~ControlShellProtocol() {
-  if (close_mode_ == CloseMode::CLOSE_ON_DESTROY) {
-    int ret;
-    RETRY_ON_EINTR(ret, close(read_fd_));
-    RETRY_ON_EINTR(ret, close(write_fd_));
-  }
-}
-
-template <class M>
-Status ControlShellProtocol::ReceiveMessage(M* message) {
-  switch (serialization_mode_) {
-    case SerializationMode::JSON:
-    {
-      // Read and accumulate one byte at a time, looking for the newline.
-      //
-      // TODO(adar): it would be more efficient to read a chunk of data, look
-      // for a newline, and if found, store the remainder for the next message.
-      faststring buf;
-      faststring one_byte;
-      one_byte.resize(1);
-      while (true) {
-        RETURN_NOT_OK_PREPEND(DoRead(&one_byte), "unable to receive message byte");
-        if (one_byte[0] == '\n') {
-          break;
-        }
-        buf.push_back(one_byte[0]);
-      }
-
-      // Parse the JSON-encoded message.
-      const auto& google_status =
-          google::protobuf::util::JsonStringToMessage(buf.ToString(), message);
-      if (!google_status.ok()) {
-        return Status::InvalidArgument(
-            Substitute("unable to parse JSON: $0", buf.ToString()),
-            google_status.error_message().ToString());
-      }
-      break;
-    }
-    case SerializationMode::PB:
-    {
-      // Read four bytes of size (big-endian).
-      faststring size_buf;
-      size_buf.resize(sizeof(uint32_t));
-      RETURN_NOT_OK_PREPEND(DoRead(&size_buf), "unable to receive message size");
-      uint32_t body_size = NetworkByteOrder::Load32(size_buf.data());
-
-      if (body_size > kMaxMessageBytes) {
-        return Status::IOError(
-            Substitute("message size ($0) exceeds maximum message size ($1)",
-                       body_size, kMaxMessageBytes));
-      }
-
-      // Read the variable size body.
-      faststring body_buf;
-      body_buf.resize(body_size);
-      RETURN_NOT_OK_PREPEND(DoRead(&body_buf), "unable to receive message body");
-
-      // Parse the body into a PB request.
-      RETURN_NOT_OK_PREPEND(pb_util::ParseFromArray(
-          message, body_buf.data(), body_buf.length()),
-                            Substitute("unable to parse PB: $0", body_buf.ToString()));
-      break;
-    }
-    default: LOG(FATAL) << "Unknown mode";
-  }
-
-  VLOG(1) << "Received message: " << pb_util::SecureDebugString(*message);
-  return Status::OK();
-}
-
-template <class M>
-Status ControlShellProtocol::SendMessage(const M& message) {
-  VLOG(1) << "Sending message: " << pb_util::SecureDebugString(message);
-
-  faststring buf;
-  switch (serialization_mode_) {
-    case SerializationMode::JSON:
-    {
-      string serialized;
-      const auto& google_status =
-          google::protobuf::util::MessageToJsonString(message, &serialized);
-      if (!google_status.ok()) {
-        return Status::InvalidArgument(Substitute(
-            "unable to serialize JSON: $0", pb_util::SecureDebugString(message)),
-                                       google_status.error_message().ToString());
-      }
-
-      buf.append(serialized);
-      buf.append("\n");
-      break;
-    }
-    case SerializationMode::PB:
-    {
-      size_t msg_size = message.ByteSizeLong();
-      buf.resize(sizeof(uint32_t) + msg_size);
-      NetworkByteOrder::Store32(buf.data(), msg_size);
-      if (!message.SerializeWithCachedSizesToArray(buf.data() + sizeof(uint32_t))) {
-        return Status::Corruption("failed to serialize PB to array");
-      }
-      break;
-    }
-    default:
-      break;
-  }
-  RETURN_NOT_OK_PREPEND(DoWrite(buf), "unable to send message");
-  return Status::OK();
-}
-
-Status ControlShellProtocol::DoRead(faststring* buf) {
-  uint8_t* pos = buf->data();
-  size_t rem = buf->length();
-  while (rem > 0) {
-    ssize_t r;
-    RETRY_ON_EINTR(r, read(read_fd_, pos, rem));
-    if (r == -1) {
-      return Status::IOError("Error reading from pipe", "", errno);
-    }
-    if (r == 0) {
-      return Status::EndOfFile("Other end of pipe was closed");
-    }
-    DCHECK_GE(rem, r);
-    rem -= r;
-    pos += r;
-  }
-  return Status::OK();
-}
-
-Status ControlShellProtocol::DoWrite(const faststring& buf) {
-  const uint8_t* pos = buf.data();
-  size_t rem = buf.length();
-  while (rem > 0) {
-    ssize_t r;
-    RETRY_ON_EINTR(r, write(write_fd_, pos, rem));
-    if (r == -1) {
-      if (errno == EPIPE) {
-        return Status::EndOfFile("Other end of pipe was closed");
-      }
-      return Status::IOError("Error writing to pipe", "", errno);
-    }
-    DCHECK_GE(rem, r);
-    rem -= r;
-    pos += r;
-  }
-  return Status::OK();
-}
-
-// Explicit specialization for callers outside this compilation unit.
+Status LeaderMasterProxy::SyncRpc(
+    const master::ListMastersRequestPB& req,
+    master::ListMastersResponsePB* resp,
+    string func_name,
+    const boost::function<void(MasterServiceProxy*,
+                               const master::ListMastersRequestPB&,
+                               master::ListMastersResponsePB*,
+                               RpcController*,
+                               const ResponseCallback&)>& func);
 template
-Status ControlShellProtocol::ReceiveMessage(ControlShellRequestPB* message);
-template
-Status ControlShellProtocol::ReceiveMessage(ControlShellResponsePB* message);
-template
-Status ControlShellProtocol::SendMessage(const ControlShellRequestPB& message);
-template
-Status ControlShellProtocol::SendMessage(const ControlShellResponsePB& message);
+Status LeaderMasterProxy::SyncRpc(
+    const master::ReplaceTabletRequestPB& req,
+    master::ReplaceTabletResponsePB* resp,
+    string func_name,
+    const boost::function<void(MasterServiceProxy*,
+                               const master::ReplaceTabletRequestPB&,
+                               master::ReplaceTabletResponsePB*,
+                               RpcController*,
+                               const ResponseCallback&)>& func);
 
 } // namespace tools
 } // namespace kudu

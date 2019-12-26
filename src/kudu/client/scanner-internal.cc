@@ -40,8 +40,10 @@
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/connection.h"
+#include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/security/token.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/async_util.h"
 #include "kudu/util/bitmap.h"
@@ -58,8 +60,10 @@ using std::vector;
 
 namespace kudu {
 
+using rpc::ComputeExponentialBackoff;
 using rpc::CredentialsPolicy;
 using rpc::RpcController;
+using security::SignedTokenPB;
 using strings::Substitute;
 using tserver::NewScanRequestPB;
 using tserver::TabletServerFeatures;
@@ -120,6 +124,7 @@ Status KuduScanner::Data::HandleError(const ScanRpcStatus& err,
   bool can_retry = true;
   bool backoff = false;
   bool reacquire_authn_token = false;
+  bool reacquire_authz_token = false;
   switch (err.result) {
     case ScanRpcStatus::SERVICE_UNAVAILABLE:
       backoff = true;
@@ -137,9 +142,14 @@ Status KuduScanner::Data::HandleError(const ScanRpcStatus& err,
       }
       break;
     case ScanRpcStatus::RPC_INVALID_AUTHENTICATION_TOKEN:
-      // Usually this happens if doing an RPC call with an expired auth token.
+      // Usually this happens if doing an RPC call with an expired authn token.
       // Retrying with a new authn token should help.
       reacquire_authn_token = true;
+      break;
+    case ScanRpcStatus::RPC_INVALID_AUTHORIZATION_TOKEN:
+      // Usually this happens if doing an RPC call with an expired authz token.
+      // Retrying with a new authz token should help.
+      reacquire_authz_token = true;
       break;
     case ScanRpcStatus::TABLET_NOT_RUNNING:
       blacklist_location = true;
@@ -181,9 +191,23 @@ Status KuduScanner::Data::HandleError(const ScanRpcStatus& err,
     }
   }
 
+  if (reacquire_authz_token) {
+    KuduClient* c = table_->client();
+    const Status& s = c->data_->RetrieveAuthzToken(table_.get(), deadline);
+    if (s.IsNotSupported()) {
+      return EnrichStatusMessage(s.CloneAndPrepend(
+          "Tried to reacquire authz token but operation not supported"));
+    }
+    if (!s.ok()) {
+      KLOG_EVERY_N_SECS(WARNING, 1)
+          << Substitute("Couldn't get authz token for table $0: ",
+                        table_->name()) << s.ToString();
+      backoff = true;
+    }
+  }
+
   if (backoff) {
-    MonoDelta sleep =
-        KuduClient::Data::ComputeExponentialBackoff(scan_attempts_);
+    MonoDelta sleep = ComputeExponentialBackoff(scan_attempts_);
     MonoTime now = MonoTime::Now() + sleep;
     if (deadline < now) {
       return EnrichStatusMessage(Status::TimedOut("unable to retry before timeout"));
@@ -246,6 +270,9 @@ ScanRpcStatus KuduScanner::Data::AnalyzeResponse(const Status& rpc_status,
         case rpc::ErrorStatusPB::FATAL_UNAUTHORIZED:
           return ScanRpcStatus{
               ScanRpcStatus::SCAN_NOT_AUTHORIZED, rpc_status};
+        case rpc::ErrorStatusPB::ERROR_INVALID_AUTHORIZATION_TOKEN:
+          return ScanRpcStatus{
+              ScanRpcStatus::RPC_INVALID_AUTHORIZATION_TOKEN, rpc_status};
         default:
           return ScanRpcStatus{ScanRpcStatus::RPC_ERROR, rpc_status};
       }
@@ -325,6 +352,18 @@ ScanRpcStatus KuduScanner::Data::SendScanRpc(const MonoTime& overall_deadline,
   if (configuration().row_format_flags() & KuduScanner::PAD_UNIXTIME_MICROS_TO_16_BYTES) {
     controller_.RequireServerFeature(TabletServerFeatures::PAD_UNIXTIME_MICROS_TO_16_BYTES);
   }
+  if (next_req_.has_new_scan_request()) {
+    // Only new scan requests require authz tokens. Scan continuations rely on
+    // Kudu's prevention of scanner hijacking by different users.
+    SignedTokenPB authz_token;
+    if (table_->client()->data_->FetchCachedAuthzToken(table_->id(), &authz_token)) {
+      *next_req_.mutable_new_scan_request()->mutable_authz_token() = std::move(authz_token);
+    } else {
+      // Note: this is expected if attempting to connect to a cluster that does
+      // not support fine-grained access control.
+      VLOG(1) << "no authz token for table " << table_->id();
+    }
+  }
   ScanRpcStatus scan_status = AnalyzeResponse(
       proxy_->Scan(next_req_,
                    &last_response_,
@@ -356,6 +395,9 @@ Status KuduScanner::Data::OpenTablet(const string& partition_key,
       break;
     case KuduScanner::READ_AT_SNAPSHOT:
       scan->set_read_mode(kudu::READ_AT_SNAPSHOT);
+      if (configuration_.has_start_timestamp()) {
+        scan->set_snap_start_timestamp(configuration_.start_timestamp());
+      }
       if (configuration_.has_snapshot_timestamp()) {
         scan->set_snap_timestamp(configuration_.snapshot_timestamp());
       }

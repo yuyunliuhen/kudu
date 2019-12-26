@@ -18,22 +18,38 @@
 #pragma once
 
 #include <string>
+#include <unordered_set>
 
 #include "kudu/gutil/port.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
+
+class SchemaPB;
+
+namespace security {
+class TablePrivilegePB;
+} // namespace security
+
 namespace master {
 
 // An interface for handling authorizations on Kudu operations.
 class AuthzProvider {
  public:
 
+  AuthzProvider();
+  virtual ~AuthzProvider() = default;
+
   // Starts the AuthzProvider instance.
   virtual Status Start() = 0;
 
   // Stops the AuthzProvider instance.
   virtual void Stop() = 0;
+
+  // Reset the underlying cache (if any), invalidating all cached entries.
+  // Returns Status::NotSupported() if the provider doesn't support resetting
+  // its cache.
+  virtual Status ResetCache() = 0;
 
   // Checks if the table creation is authorized for the given user.
   // If the table is being created with a different owner than the user,
@@ -68,7 +84,40 @@ class AuthzProvider {
   virtual Status AuthorizeGetTableMetadata(const std::string& table_name,
                                            const std::string& user) WARN_UNUSED_RESULT = 0;
 
-  virtual ~AuthzProvider() {}
+  // Filters the given table names, removing any the user is not authorized to
+  // see.
+  //
+  // Sets 'checked_table_names' if the AuthzProvider actually checked
+  // privileges for the table (rather than just passing through). This may be
+  // useful, e.g. to indicate that the caller needs to verify the table names
+  // have not changed during authorization.
+  virtual Status AuthorizeListTables(const std::string& user,
+                                     std::unordered_set<std::string>* table_names,
+                                     bool* checked_table_names) WARN_UNUSED_RESULT = 0;
+
+  // Checks if statistics of the table is authorized for the
+  // given user.
+  //
+  // If the operation is not authorized, returns Status::NotAuthorized().
+  // Otherwise, may return other Status error codes depend on actual errors.
+  virtual Status AuthorizeGetTableStatistics(const std::string& table_name,
+                                             const std::string& user) WARN_UNUSED_RESULT = 0;
+
+  // Populates the privilege fields of 'pb' with the table-specific privileges
+  // for the given user, using 'schema_pb' for metadata (e.g. column IDs). This
+  // does not populate the table ID field of 'pb' -- only the privilege fields;
+  // as such, it is expected that the table ID field is already set.
+  virtual Status FillTablePrivilegePB(const std::string& table_name,
+                                      const std::string& user,
+                                      const SchemaPB& schema_pb,
+                                      security::TablePrivilegePB* pb) WARN_UNUSED_RESULT = 0;
+
+  // Checks if the given user is trusted and thus can be exempted from
+  // authorization validation.
+  bool IsTrustedUser(const std::string& user) const;
+
+ private:
+  std::unordered_set<std::string> trusted_users_;
 };
 
 } // namespace master

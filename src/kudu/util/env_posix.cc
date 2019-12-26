@@ -29,6 +29,7 @@
 #include <ostream>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <gflags/gflags.h>
@@ -124,8 +125,8 @@ typedef struct xfs_flock64 {
 #define MAYBE_RETURN_EIO(filename_expr, error_expr) do { \
   const string& f_ = (filename_expr); \
   MAYBE_RETURN_FAILURE(FLAGS_env_inject_eio, \
-      ShouldInject(f_, FLAGS_env_inject_eio_globs) ? (error_expr) : Status::OK()) \
-} while (0);
+      ShouldInject(f_, FLAGS_env_inject_eio_globs) ? (error_expr) : Status::OK()); \
+} while (0)
 
 bool ShouldInject(const string& candidate, const string& glob_patterns) {
   // Never inject on /proc/ file accesses regardless of the configured flag,
@@ -340,18 +341,21 @@ Status DoSync(int fd, const string& filename) {
   return Status::OK();
 }
 
-Status DoOpen(const string& filename, Env::CreateMode mode, int* fd) {
+Status DoOpen(const string& filename, Env::OpenMode mode, int* fd) {
   MAYBE_RETURN_EIO(filename, IOError(Env::kInjectedFailureStatusMsg, EIO));
   ThreadRestrictions::AssertIOAllowed();
   int flags = O_RDWR;
   switch (mode) {
-    case Env::CREATE_IF_NON_EXISTING_TRUNCATE:
+    case Env::CREATE_OR_OPEN_WITH_TRUNCATE:
       flags |= O_CREAT | O_TRUNC;
       break;
-    case Env::CREATE_NON_EXISTING:
+    case Env::CREATE_OR_OPEN:
+      flags |= O_CREAT;
+      break;
+    case Env::MUST_CREATE:
       flags |= O_CREAT | O_EXCL;
       break;
-    case Env::OPEN_EXISTING:
+    case Env::MUST_EXIST:
       break;
     default:
       return Status::NotSupported(Substitute("Unknown create mode $0", mode));
@@ -1126,7 +1130,7 @@ class PosixEnv : public Env {
                                      string* created_filename,
                                      unique_ptr<WritableFile>* result) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::NewTempWritableFile", "template", name_template);
-    int fd;
+    int fd = 0;
     string tmp_filename;
     RETURN_NOT_OK(MkTmpFile(name_template, &fd, &tmp_filename));
     RETURN_NOT_OK(InstantiateNewWritableFile(tmp_filename, fd, opts, result));
@@ -1152,7 +1156,7 @@ class PosixEnv : public Env {
   virtual Status NewTempRWFile(const RWFileOptions& opts, const string& name_template,
                                string* created_filename, unique_ptr<RWFile>* res) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::NewTempRWFile", "template", name_template);
-    int fd;
+    int fd = 0;
     RETURN_NOT_OK(MkTmpFile(name_template, &fd, created_filename));
     res->reset(new PosixRWFile(*created_filename, fd, opts.sync_on_close));
     return Status::OK();
@@ -1191,7 +1195,7 @@ class PosixEnv : public Env {
       result = IOError(fname, errno);
     }
     return result;
-  };
+  }
 
   virtual Status CreateDir(const string& name) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::CreateDir", "path", name);
@@ -1202,7 +1206,7 @@ class PosixEnv : public Env {
       result = IOError(name, errno);
     }
     return result;
-  };
+  }
 
   virtual Status DeleteDir(const string& name) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::DeleteDir", "path", name);
@@ -1213,7 +1217,7 @@ class PosixEnv : public Env {
       result = IOError(name, errno);
     }
     return result;
-  };
+  }
 
   Status GetCurrentWorkingDir(string* cwd) const override {
     TRACE_EVENT0("io", "PosixEnv::GetCurrentWorkingDir");
@@ -1787,7 +1791,7 @@ class PosixEnv : public Env {
                                     const WritableFileOptions& opts,
                                     unique_ptr<WritableFile>* result) {
     uint64_t file_size = 0;
-    if (opts.mode == OPEN_EXISTING) {
+    if (opts.mode == MUST_EXIST) {
       RETURN_NOT_OK(GetFileSize(fname, &file_size));
     }
     result->reset(new PosixWritableFile(fname, fd, file_size, opts.sync_on_close));

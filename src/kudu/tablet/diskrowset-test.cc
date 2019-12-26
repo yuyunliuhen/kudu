@@ -23,7 +23,6 @@
 #include <memory>
 #include <ostream>
 #include <string>
-#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -134,7 +133,8 @@ TEST_F(TestRowSet, TestRowSetRoundTrip) {
 
   // 1. Check a key which comes before all keys in rowset
   {
-    RowBuilder rb(schema_.CreateKeyProjection());
+    Schema pk = schema_.CreateKeyProjection();
+    RowBuilder rb(&pk);
     rb.AddString(Slice("h"));
     RowSetKeyProbe probe(rb.row());
     bool present;
@@ -144,7 +144,8 @@ TEST_F(TestRowSet, TestRowSetRoundTrip) {
 
   // 2. Check a key which comes after all keys in rowset
   {
-    RowBuilder rb(schema_.CreateKeyProjection());
+    Schema pk = schema_.CreateKeyProjection();
+    RowBuilder rb(&pk);
     rb.AddString(Slice("z"));
     RowSetKeyProbe probe(rb.row());
     bool present;
@@ -155,7 +156,8 @@ TEST_F(TestRowSet, TestRowSetRoundTrip) {
   // 3. Check a key which is not present, but comes between present
   // keys
   {
-    RowBuilder rb(schema_.CreateKeyProjection());
+    Schema pk = schema_.CreateKeyProjection();
+    RowBuilder rb(&pk);
     rb.AddString(Slice("hello 00000000000049x"));
     RowSetKeyProbe probe(rb.row());
     bool present;
@@ -166,8 +168,9 @@ TEST_F(TestRowSet, TestRowSetRoundTrip) {
   // 4. Check a key which is present
   {
     char buf[256];
-    RowBuilder rb(schema_.CreateKeyProjection());
     FormatKey(49, buf, sizeof(buf));
+    Schema pk = schema_.CreateKeyProjection();
+    RowBuilder rb(&pk);
     rb.AddString(Slice(buf));
     RowSetKeyProbe probe(rb.row());
     bool present;
@@ -199,7 +202,8 @@ TEST_F(TestRowSet, TestRowSetUpdate) {
   enc.SetToDelete();
 
   Timestamp timestamp(0);
-  RowBuilder rb(schema_.CreateKeyProjection());
+  Schema proj_key = schema_.CreateKeyProjection();
+  RowBuilder rb(&proj_key);
   rb.AddString(Slice("hello 00000000000049x"));
   RowSetKeyProbe probe(rb.row());
 
@@ -225,7 +229,8 @@ TEST_F(TestRowSet, TestErrorDuringUpdate) {
 
   // Get a row that we expect to be in the rowset.
   Timestamp timestamp(0);
-  RowBuilder rb(schema_.CreateKeyProjection());
+  Schema proj_key = schema_.CreateKeyProjection();
+  RowBuilder rb(&proj_key);
   rb.AddString(Slice("hello 000000000000050"));
   RowSetKeyProbe probe(rb.row());
 
@@ -349,8 +354,8 @@ TEST_F(TestRowSet, TestDMSFlush) {
 
     ASSERT_OK(rs->FlushDeltas(nullptr));
 
-    // Check that the DiskRowSet's DMS has now been emptied.
-    ASSERT_EQ(0, rs->delta_tracker_->dms_->Count());
+    // Check that the DiskRowSet's DMS has not been initialized.
+    ASSERT_FALSE(rs->delta_tracker_->dms_);
 
     // Now read back the value column, and verify that the updates
     // are visible.
@@ -384,7 +389,7 @@ TEST_F(TestRowSet, TestFlushedUpdatesRespectMVCC) {
 
     ASSERT_OK(drsw.Open());
 
-    RowBuilder rb(schema_);
+    RowBuilder rb(&schema_);
     rb.AddString(key_slice);
     rb.AddUint32(1);
     ASSERT_OK_FAST(WriteRow(rb.data(), &drsw));
@@ -411,7 +416,8 @@ TEST_F(TestRowSet, TestFlushedUpdatesRespectMVCC) {
       tx.StartApplying();
       update.Reset();
       update.AddColumnUpdate(schema_.column(1), schema_.column_id(1), &i);
-      RowBuilder rb(schema_.CreateKeyProjection());
+      Schema proj_key = schema_.CreateKeyProjection();
+      RowBuilder rb(&proj_key);
       rb.AddString(key_slice);
       RowSetKeyProbe probe(rb.row());
       OperationResultPB result;
@@ -439,9 +445,9 @@ TEST_F(TestRowSet, TestFlushedUpdatesRespectMVCC) {
     RowIteratorOptions opts;
     opts.projection = &schema_;
     opts.snap_to_include = snaps[i];
-    gscoped_ptr<RowwiseIterator> iter;
+    unique_ptr<RowwiseIterator> iter;
     ASSERT_OK(rs->NewRowIterator(opts, &iter));
-    string data = InitAndDumpIterator(std::move(iter));
+    string data = InitAndDumpIterator(iter.get());
     EXPECT_EQ(StringPrintf(R"((string key="row", uint32 val=%d))", i + 1), data);
   }
 
@@ -454,9 +460,9 @@ TEST_F(TestRowSet, TestFlushedUpdatesRespectMVCC) {
     RowIteratorOptions opts;
     opts.projection = &schema_;
     opts.snap_to_include = snaps[i];
-    gscoped_ptr<RowwiseIterator> iter;
+    unique_ptr<RowwiseIterator> iter;
     ASSERT_OK(rs->NewRowIterator(opts, &iter));
-    string data = InitAndDumpIterator(std::move(iter));
+    string data = InitAndDumpIterator(iter.get());
     EXPECT_EQ(StringPrintf(R"((string key="row", uint32 val=%d))", i + 1), data);
   }
 }
@@ -505,15 +511,18 @@ TEST_F(TestRowSet, TestRollingDiskRowSetWriter) {
   RollingDiskRowSetWriter writer(tablet()->metadata(), schema_,
                                  BloomFilterSizing::BySizeAndFPRate(32*1024, 0.01f),
                                  64 * 1024); // roll every 64KB
-  DoWriteTestRowSet(10000, &writer);
+  DoWriteTestRowSet(FLAGS_roundtrip_num_rows, &writer);
 
   // Should have rolled 4 times.
   vector<shared_ptr<RowSetMetadata> > metas;
   writer.GetWrittenRowSetMetadata(&metas);
   EXPECT_EQ(4, metas.size());
+  int64_t count = 0;
   for (const shared_ptr<RowSetMetadata>& meta : metas) {
     ASSERT_TRUE(meta->HasDataForColumnIdForTests(schema_.column_id(0)));
+    count += meta->live_row_count();
   }
+  ASSERT_EQ(FLAGS_roundtrip_num_rows, count);
 }
 
 TEST_F(TestRowSet, TestMakeDeltaIteratorMergerUnlocked) {
@@ -730,6 +739,7 @@ INSTANTIATE_TEST_CASE_P(RowIteratorOptionsPermutations, DiffScanRowSetTest,
 // the test operates on a variety of different on-disk and in-memory layouts.
 TEST_P(DiffScanRowSetTest, TestFuzz) {
   fs::IOContext test_context;
+  scoped_refptr<log::LogAnchorRegistry> log_anchor_registry(new log::LogAnchorRegistry());
 
   // Create and open a DRS with four rows.
   shared_ptr<DiskRowSet> rs;
@@ -738,7 +748,7 @@ TEST_P(DiffScanRowSetTest, TestFuzz) {
                           BloomFilterSizing::BySizeAndFPRate(32 * 1024, 0.01f));
     ASSERT_OK(drsw.Open());
 
-    RowBuilder rb(schema_);
+    RowBuilder rb(&schema_);
     for (int i = 0; i < 4; i++) {
       rb.Reset();
       rb.AddUint32(i);
@@ -747,7 +757,7 @@ TEST_P(DiffScanRowSetTest, TestFuzz) {
       ASSERT_OK(WriteRow(rb.data(), &drsw));
     }
     ASSERT_OK(drsw.Finish());
-    ASSERT_OK(DiskRowSet::Open(rowset_meta_, new log::LogAnchorRegistry(),
+    ASSERT_OK(DiskRowSet::Open(rowset_meta_, log_anchor_registry.get(),
                                TabletMemTrackers(), &test_context, &rs));
   }
 
@@ -786,7 +796,7 @@ TEST_P(DiffScanRowSetTest, TestFuzz) {
     opts.projection = &projection;
     opts.snap_to_exclude = MvccSnapshot(ts1);
     opts.snap_to_include = MvccSnapshot(ts2);
-    gscoped_ptr<RowwiseIterator> iter;
+    unique_ptr<RowwiseIterator> iter;
     ASSERT_OK(rs->NewRowIterator(opts, &iter));
     ASSERT_OK(iter->Init(nullptr));
 
@@ -834,7 +844,8 @@ TEST_P(DiffScanRowSetTest, TestFuzz) {
     }
 
     // Build the row key.
-    RowBuilder rb(schema_.CreateKeyProjection());
+    Schema proj_key = schema_.CreateKeyProjection();
+    RowBuilder rb(&proj_key);
     rb.AddUint32(row_idx);
     RowSetKeyProbe probe(rb.row());
 

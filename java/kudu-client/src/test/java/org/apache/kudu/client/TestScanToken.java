@@ -17,27 +17,32 @@
 
 package org.apache.kudu.client;
 
+import static org.apache.kudu.test.ClientTestUtil.countRowsInScan;
+import static org.apache.kudu.test.ClientTestUtil.countScanTokenRows;
+import static org.apache.kudu.test.ClientTestUtil.createBasicSchemaInsert;
+import static org.apache.kudu.test.ClientTestUtil.createDefaultTable;
+import static org.apache.kudu.test.ClientTestUtil.createManyStringsSchema;
+import static org.apache.kudu.test.ClientTestUtil.getBasicSchema;
+import static org.apache.kudu.test.ClientTestUtil.loadDefaultTable;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
 import com.google.common.collect.ImmutableList;
-import org.apache.kudu.ColumnSchema;
-import org.apache.kudu.Schema;
-import org.apache.kudu.Type;
-import org.apache.kudu.test.KuduTestHarness;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.util.List;
-
-import static org.apache.kudu.test.ClientTestUtil.countScanTokenRows;
-import static org.apache.kudu.test.ClientTestUtil.createDefaultTable;
-import static org.apache.kudu.test.ClientTestUtil.createManyStringsSchema;
-import static org.apache.kudu.test.ClientTestUtil.loadDefaultTable;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import org.apache.kudu.ColumnSchema;
+import org.apache.kudu.Schema;
+import org.apache.kudu.Type;
+import org.apache.kudu.test.KuduTestHarness;
 
 public class TestScanToken {
   private static final Logger LOG = LoggerFactory.getLogger(TestKuduClient.class);
@@ -95,7 +100,7 @@ public class TestScanToken {
 
       KuduScanToken.KuduScanTokenBuilder tokenBuilder = client.newScanTokenBuilder(table);
       tokenBuilder.batchSizeBytes(0);
-      tokenBuilder.setProjectedColumnIndexes(ImmutableList.<Integer>of());
+      tokenBuilder.setProjectedColumnIndexes(ImmutableList.of());
       List<KuduScanToken> tokens = tokenBuilder.build();
       assertEquals(16, tokens.size());
 
@@ -165,7 +170,7 @@ public class TestScanToken {
     session.flush();
 
     KuduScanToken.KuduScanTokenBuilder tokenBuilder = client.newScanTokenBuilder(table);
-    tokenBuilder.setProjectedColumnIndexes(ImmutableList.<Integer>of());
+    tokenBuilder.setProjectedColumnIndexes(ImmutableList.of());
     List<KuduScanToken> tokens = tokenBuilder.build();
     assertEquals(6, tokens.size());
     assertEquals('f' - 'a' + 'z' - 'h',
@@ -190,7 +195,7 @@ public class TestScanToken {
         new ColumnSchema.ColumnSchemaBuilder("a", Type.INT64).nullable(false).key(false).build()
     ));
     CreateTableOptions createOptions = new CreateTableOptions();
-    createOptions.setRangePartitionColumns(ImmutableList.<String>of());
+    createOptions.setRangePartitionColumns(ImmutableList.of());
     createOptions.setNumReplicas(1);
     client.createTable(testTableName, schema, createOptions);
 
@@ -210,41 +215,154 @@ public class TestScanToken {
       assertTrue(e.getMessage().contains("Unknown column"));
     }
 
-    // Add back the column with the wrong type.
+    // Add a column with the same name, type, and nullability. It will have a different id-- it's a
+    // different column-- so the scan token will fail.
     client.alterTable(
         testTableName,
-        new AlterTableOptions().addColumn(
-            new ColumnSchema.ColumnSchemaBuilder("a", Type.STRING).nullable(true).build()));
+        new AlterTableOptions()
+            .addColumn(new ColumnSchema.ColumnSchemaBuilder("a", Type.INT64)
+                .nullable(false)
+                .defaultValue(0L).build()));
     try {
       token.intoScanner(client);
       fail();
-    } catch (IllegalStateException e) {
+    } catch (IllegalArgumentException e) {
       assertTrue(e.getMessage().contains(
-          "invalid type INT64 for column 'a' in scan token, expected: STRING"));
+          "Unknown column"));
     }
+  }
 
-    // Add the column with the wrong nullability.
-    client.alterTable(
-        testTableName,
-        new AlterTableOptions().dropColumn("a")
-                               .addColumn(new ColumnSchema.ColumnSchemaBuilder("a", Type.INT64)
-                                                          .nullable(true).build()));
+  /**
+   * Tests that it is possible to create a scan token, rename a column, and rehydrate a scanner from
+   * the scan token with the old column name.
+   */
+  @Test
+  public void testScanTokensConcurrentColumnRename() throws Exception {
+    Schema schema = getBasicSchema();
+    final String oldColName = schema.getColumnByIndex(1).getName();
+    CreateTableOptions createOptions = new CreateTableOptions();
+    createOptions.setRangePartitionColumns(ImmutableList.of());
+    createOptions.setNumReplicas(1);
+    client.createTable(testTableName, schema, createOptions);
+
+    KuduTable table = client.openTable(testTableName);
+
+    KuduScanToken.KuduScanTokenBuilder tokenBuilder = client.newScanTokenBuilder(table);
+    List<KuduScanToken> tokens = tokenBuilder.build();
+    assertEquals(1, tokens.size());
+    KuduScanToken token = tokens.get(0);
+
+    // Rename a column.
+    String newColName = "new-name";
+    client.alterTable(testTableName, new AlterTableOptions().renameColumn(oldColName, newColName));
+
+    KuduScanner scanner = token.intoScanner(client);
+
+    // TODO(wdberkeley): Handle renaming a column between when the token is rehydrated as a scanner
+    //  and when the scanner first hits a replica. Note that this is almost certainly a very
+    //  short period of vulnerability.
+
+    assertEquals(0, countRowsInScan(scanner));
+
+    // Test that the old name cannot be used and the new name can be.
+    Schema alteredSchema = scanner.getProjectionSchema();
     try {
-      token.intoScanner(client);
+      alteredSchema.getColumn(oldColName);
       fail();
-    } catch (IllegalStateException e) {
-      assertTrue(e.getMessage().contains(
-          "invalid nullability for column 'a' in scan token, expected: NOT NULL"));
+    } catch (IllegalArgumentException ex) {
+      // Good.
     }
+    alteredSchema.getColumn(newColName);
+  }
 
-    // Add the column with the correct type and nullability.
+  /**
+   * Tests that it is possible to rehydrate a scan token after a table rename.
+   */
+  @Test
+  public void testScanTokensWithTableRename() throws Exception {
+    Schema schema = getBasicSchema();
+    CreateTableOptions createOptions = new CreateTableOptions();
+    createOptions.setRangePartitionColumns(ImmutableList.of());
+    createOptions.setNumReplicas(1);
+    KuduTable table = client.createTable(testTableName, schema, createOptions);
+
+    KuduScanToken.KuduScanTokenBuilder tokenBuilder = client.newScanTokenBuilder(table);
+    List<KuduScanToken> tokens = tokenBuilder.build();
+    assertEquals(1, tokens.size());
+    KuduScanToken token = tokens.get(0);
+
+    // Rename the table.
     client.alterTable(
         testTableName,
-        new AlterTableOptions().dropColumn("a")
-                               .addColumn(new ColumnSchema.ColumnSchemaBuilder("a", Type.INT64)
-                                                          .nullable(false)
-                                                          .defaultValue(0L).build()));
-    token.intoScanner(client);
+        new AlterTableOptions().renameTable(testTableName + "-renamed"));
+
+    assertEquals(0, countRowsInScan(token.intoScanner(client)));
+  }
+
+  /**
+   * Tests scan token creation and execution on a table with interleaved range partition drops.
+   */
+  @Test
+  public void testScanTokensInterleavedRangePartitionDrops() throws Exception {
+    Schema schema = getBasicSchema();
+    CreateTableOptions createOptions = new CreateTableOptions();
+    createOptions.addHashPartitions(ImmutableList.of("key"), 2);
+
+    final int numRows = 30;
+    PartialRow lower0 = schema.newPartialRow();
+    PartialRow upper0 = schema.newPartialRow();
+    lower0.addInt("key", 0);
+    upper0.addInt("key", numRows / 3);
+    createOptions.addRangePartition(lower0, upper0);
+
+    PartialRow lower1 = schema.newPartialRow();
+    PartialRow upper1 = schema.newPartialRow();
+    lower1.addInt("key", numRows / 3);
+    upper1.addInt("key", 2 * numRows / 3);
+    createOptions.addRangePartition(lower1, upper1);
+
+    PartialRow lower2 = schema.newPartialRow();
+    PartialRow upper2 = schema.newPartialRow();
+    lower2.addInt("key", 2 * numRows / 3);
+    upper2.addInt("key", numRows);
+    createOptions.addRangePartition(lower2, upper2);
+
+    KuduTable table = client.createTable(testTableName, schema, createOptions);
+    KuduSession session = client.newSession();
+    for (int i = 0; i < numRows; i++) {
+      session.apply(createBasicSchemaInsert(table, i));
+    }
+
+    // Build the scan tokens.
+    List<KuduScanToken> tokens = client.newScanTokenBuilder(table).build();
+    assertEquals(6, tokens.size());
+
+    // Drop the range partition [10, 20).
+    AlterTableOptions dropMiddleOptions = new AlterTableOptions();
+    dropMiddleOptions.dropRangePartition(lower1, upper1);
+    client.alterTable(table.getName(), dropMiddleOptions);
+
+    // Rehydrate the tokens.
+    List<KuduScanner> scanners = new ArrayList<>();
+    for (KuduScanToken token : tokens) {
+      scanners.add(token.intoScanner(client));
+    }
+
+    // Drop the range partition [20, 30).
+    AlterTableOptions dropEndOptions = new AlterTableOptions();
+    dropEndOptions.dropRangePartition(lower2, upper2);
+    client.alterTable(table.getName(), dropEndOptions);
+
+    // Check the scanners work. The scanners for the tablets in the range [10, 20) definitely won't
+    // see any rows. The scanners for the tablets in the range [20, 30) might see rows.
+    int scannedRows = 0;
+    for (KuduScanner scanner : scanners) {
+      scannedRows += countRowsInScan(scanner);
+    }
+    assertTrue(String.format("%d >= %d / 3?", scannedRows, numRows),
+        scannedRows >= numRows / 3);
+    assertTrue(String.format("%d <= 2 * %d / 3?", scannedRows, numRows),
+        scannedRows <= 2 * numRows / 3);
   }
 
   /** Test that scanRequestTimeout makes it from the scan token to the underlying Scanner class. */
@@ -263,5 +381,106 @@ public class TestScanToken {
       KuduScanner scanner = KuduScanToken.deserializeIntoScanner(serialized, client);
       assertEquals(SCAN_REQUEST_TIMEOUT_MS, scanner.getScanRequestTimeout());
     }
+  }
+
+  // Helper for scan token tests that use diff scan.
+  private long setupTableForDiffScans(KuduClient client,
+                                      KuduTable table,
+                                      int numRows) throws Exception {
+    KuduSession session = client.newSession();
+    for (int i = 0 ; i < numRows / 2; i++) {
+      session.apply(createBasicSchemaInsert(table, i));
+    }
+
+    // Grab the timestamp, then add more data so there's a diff.
+    long timestamp = client.getLastPropagatedTimestamp();
+    for (int i = numRows / 2; i < numRows; i++) {
+      session.apply(createBasicSchemaInsert(table, i));
+    }
+    // Delete some data so the is_deleted column can be tested.
+    for (int i = 0; i < numRows / 4; i++) {
+      Delete delete = table.newDelete();
+      PartialRow row = delete.getRow();
+      row.addInt(0, i);
+      session.apply(delete);
+    }
+
+    return timestamp;
+  }
+
+  // Helper to check diff scan results.
+  private void checkDiffScanResults(KuduScanner scanner,
+                                    int numExpectedMutations,
+                                    int numExpectedDeletes) throws KuduException {
+    int numMutations = 0;
+    int numDeletes = 0;
+    while (scanner.hasMoreRows()) {
+      for (RowResult rowResult : scanner.nextRows()) {
+        numMutations++;
+        if (rowResult.isDeleted()) {
+          numDeletes++;
+        }
+      }
+    }
+    assertEquals(numExpectedMutations, numMutations);
+    assertEquals(numExpectedDeletes, numDeletes);
+  }
+
+  /** Test that scan tokens work with diff scans. */
+  @Test
+  public void testDiffScanTokens() throws Exception {
+    Schema schema = getBasicSchema();
+    CreateTableOptions createOptions = new CreateTableOptions();
+    createOptions.setRangePartitionColumns(ImmutableList.of());
+    createOptions.setNumReplicas(1);
+    KuduTable table = client.createTable(testTableName, schema, createOptions);
+
+    // Set up the table for a diff scan.
+    int numRows = 20;
+    long timestamp = setupTableForDiffScans(client, table, numRows);
+
+    // Since the diff scan interval is [start, end), increment the start timestamp to exclude
+    // the last row inserted in the first group of ops, and increment the end timestamp to include
+    // the last row deleted in the second group of ops.
+    List<KuduScanToken> tokens = client.newScanTokenBuilder(table)
+        .diffScan(timestamp + 1, client.getLastPropagatedTimestamp() + 1)
+        .build();
+    assertEquals(1, tokens.size());
+
+    checkDiffScanResults(tokens.get(0).intoScanner(client), 3 * numRows / 4, numRows / 4);
+  }
+
+  /** Test that scan tokens work with diff scans even when columns are renamed. */
+  @Test
+  public void testDiffScanTokensConcurrentColumnRename() throws Exception {
+    Schema schema = getBasicSchema();
+    CreateTableOptions createOptions = new CreateTableOptions();
+    createOptions.setRangePartitionColumns(ImmutableList.of());
+    createOptions.setNumReplicas(1);
+    KuduTable table = client.createTable(testTableName, schema, createOptions);
+
+    // Set up the table for a diff scan.
+    int numRows = 20;
+    long timestamp = setupTableForDiffScans(client, table, numRows);
+
+    // Since the diff scan interval is [start, end), increment the start timestamp to exclude
+    // the last row inserted in the first group of ops, and increment the end timestamp to include
+    // the last row deleted in the second group of ops.
+    List<KuduScanToken> tokens = client.newScanTokenBuilder(table)
+        .diffScan(timestamp + 1, client.getLastPropagatedTimestamp() + 1)
+        .build();
+    assertEquals(1, tokens.size());
+
+    // Rename a column between when the token is created and when it is rehydrated into a scanner
+    client.alterTable(table.getName(),
+                      new AlterTableOptions().renameColumn("column1_i", "column1_i_new"));
+
+    KuduScanner scanner = tokens.get(0).intoScanner(client);
+
+    // TODO(wdberkeley): Handle renaming a column between when the token is rehydrated as a scanner
+    //  and when the scanner first hits a replica. Note that this is almost certainly a very
+    //  short period of vulnerability.
+
+    checkDiffScanResults(scanner, 3 * numRows / 4, numRows / 4);
   }
 }

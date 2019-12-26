@@ -54,7 +54,7 @@ class Trace;
 namespace rpc {
 
 class Connection;
-class DumpRunningRpcsRequestPB;
+class DumpConnectionsRequestPB;
 class RemoteUser;
 class RpcCallInProgressPB;
 class RpcSidecar;
@@ -66,6 +66,14 @@ struct InboundCallTiming {
 
   MonoDelta TotalDuration() const {
     return time_completed - time_received;
+  }
+
+  MonoDelta ProcessingDuration() const {
+    return time_completed - time_handled;
+  }
+
+  MonoDelta QueueDuration() const {
+    return time_handled - time_received;
   }
 };
 
@@ -135,7 +143,7 @@ class InboundCall {
 
   std::string ToString() const;
 
-  void DumpPB(const DumpRunningRpcsRequestPB& req, RpcCallInProgressPB* resp);
+  void DumpPB(const DumpConnectionsRequestPB& req, RpcCallInProgressPB* resp);
 
   const RemoteUser& remote_user() const;
 
@@ -191,6 +199,9 @@ class InboundCall {
 
   // Return the time when this call was received.
   MonoTime GetTimeReceived() const;
+
+  // Return the time when this call was handled.
+  MonoTime GetTimeHandled() const;
 
   // Returns the set of application-specific feature flags required to service
   // the RPC.

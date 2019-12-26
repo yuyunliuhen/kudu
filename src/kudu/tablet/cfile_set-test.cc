@@ -43,7 +43,6 @@
 #include "kudu/common/rowid.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/integral_types.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stringprintf.h"
@@ -52,6 +51,7 @@
 #include "kudu/tablet/tablet-test-util.h"
 #include "kudu/util/auto_release_pool.h"
 #include "kudu/util/bloom_filter.h"
+#include "kudu/util/hash.pb.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/slice.h"
@@ -62,6 +62,7 @@ DECLARE_int32(cfile_default_block_size);
 
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
@@ -72,7 +73,7 @@ class TestCFileSet : public KuduRowSetTest {
   TestCFileSet() :
     KuduRowSetTest(Schema({ ColumnSchema("c0", INT32),
                             ColumnSchema("c1", INT32, false, nullptr, nullptr, GetRLEStorage()),
-                            ColumnSchema("c2", INT32) }, 1))
+                            ColumnSchema("c2", INT32, true) }, 1))
   {}
 
   virtual void SetUp() OVERRIDE {
@@ -93,7 +94,7 @@ class TestCFileSet : public KuduRowSetTest {
 
     ASSERT_OK(rsw.Open());
 
-    RowBuilder rb(schema_);
+    RowBuilder rb(&schema_);
     for (int i = 0; i < nrows; i++) {
       rb.Reset();
       rb.AddInt32(i * 2);
@@ -179,8 +180,8 @@ class TestCFileSet : public KuduRowSetTest {
                        int32_t lower,
                        int32_t upper) {
     // Create iterator.
-    shared_ptr<CFileSet::Iterator> cfile_iter(fileset->NewIterator(&schema_, nullptr));
-    gscoped_ptr<RowwiseIterator> iter(new MaterializingIterator(cfile_iter));
+    unique_ptr<CFileSet::Iterator> cfile_iter(fileset->NewIterator(&schema_, nullptr));
+    unique_ptr<RowwiseIterator> iter(NewMaterializingIterator(std::move(cfile_iter)));
 
     // Create a scan with a range predicate on the key column.
     ScanSpec spec;
@@ -192,7 +193,7 @@ class TestCFileSet : public KuduRowSetTest {
 
     // Check that the range was respected on all the results.
     Arena arena(1024);
-    RowBlock block(schema_, 100, &arena);
+    RowBlock block(&schema_, 100, &arena);
     while (iter->HasNext()) {
       ASSERT_OK_FAST(iter->NextBlock(&block));
       for (size_t i = 0; i < block.nrows(); i++) {
@@ -215,8 +216,8 @@ class TestCFileSet : public KuduRowSetTest {
                              vector<size_t> target) {
     LOG(INFO) << "predicates size: " << predicates.size();
     // Create iterator.
-    shared_ptr<CFileSet::Iterator> cfile_iter(fileset->NewIterator(&schema_, nullptr));
-    gscoped_ptr<RowwiseIterator> iter(new MaterializingIterator(cfile_iter));
+    unique_ptr<CFileSet::Iterator> cfile_iter(fileset->NewIterator(&schema_, nullptr));
+    unique_ptr<RowwiseIterator> iter(NewMaterializingIterator(std::move(cfile_iter)));
     LOG(INFO) << "Target size: " << target.size();
     // Create a scan with a range predicate on the key column.
     ScanSpec spec;
@@ -226,7 +227,7 @@ class TestCFileSet : public KuduRowSetTest {
     ASSERT_OK(iter->Init(&spec));
     // Check that the range was respected on all the results.
     Arena arena(1024);
-    RowBlock block(schema_, 100, &arena);
+    RowBlock block(&schema_, 100, &arena);
     while (iter->HasNext()) {
       ASSERT_OK_FAST(iter->NextBlock(&block));
       for (size_t i = 0; i < block.nrows(); i++) {
@@ -277,13 +278,14 @@ TEST_F(TestCFileSet, TestPartiallyMaterialize) {
   WriteTestRowSet(kNumRows);
 
   shared_ptr<CFileSet> fileset;
-  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), nullptr, &fileset));
+  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), MemTracker::GetRootTracker(),
+                           nullptr, &fileset));
 
-  gscoped_ptr<CFileSet::Iterator> iter(fileset->NewIterator(&schema_, nullptr));
+  unique_ptr<CFileSet::Iterator> iter(fileset->NewIterator(&schema_, nullptr));
   ASSERT_OK(iter->Init(nullptr));
 
   Arena arena(4096);
-  RowBlock block(schema_, 100, &arena);
+  RowBlock block(&schema_, 100, &arena);
   rowid_t row_idx = 0;
   while (iter->HasNext()) {
     arena.Reset();
@@ -357,12 +359,13 @@ TEST_F(TestCFileSet, TestIteratePartialSchema) {
   WriteTestRowSet(kNumRows);
 
   shared_ptr<CFileSet> fileset;
-  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), nullptr, &fileset));
+  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), MemTracker::GetRootTracker(),
+                           nullptr, &fileset));
 
   Schema new_schema;
   ASSERT_OK(schema_.CreateProjectionByNames({ "c0", "c2" }, &new_schema));
-  shared_ptr<CFileSet::Iterator> cfile_iter(fileset->NewIterator(&new_schema, nullptr));
-  gscoped_ptr<RowwiseIterator> iter(new MaterializingIterator(cfile_iter));
+  unique_ptr<CFileSet::Iterator> cfile_iter(fileset->NewIterator(&new_schema, nullptr));
+  unique_ptr<RowwiseIterator> iter(NewMaterializingIterator(std::move(cfile_iter)));
 
   ASSERT_OK(iter->Init(nullptr));
 
@@ -390,11 +393,13 @@ TEST_F(TestCFileSet, TestRangeScan) {
   WriteTestRowSet(kNumRows);
 
   shared_ptr<CFileSet> fileset;
-  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), nullptr, &fileset));
+  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), MemTracker::GetRootTracker(),
+                           nullptr, &fileset));
 
   // Create iterator.
-  shared_ptr<CFileSet::Iterator> cfile_iter(fileset->NewIterator(&schema_, nullptr));
-  gscoped_ptr<RowwiseIterator> iter(new MaterializingIterator(cfile_iter));
+  unique_ptr<CFileSet::Iterator> cfile_iter(fileset->NewIterator(&schema_, nullptr));
+  CFileSet::Iterator* cfile_iter_raw = cfile_iter.get();
+  unique_ptr<RowwiseIterator> iter(NewMaterializingIterator(std::move(cfile_iter)));
   Schema key_schema = schema_.CreateKeyProjection();
   Arena arena(1024);
   AutoReleasePool pool;
@@ -411,8 +416,8 @@ TEST_F(TestCFileSet, TestRangeScan) {
   // Check that the bounds got pushed as index bounds.
   // Since the key column is the rowidx * 2, we need to divide the integer bounds
   // back down.
-  EXPECT_EQ(lower / 2, cfile_iter->lower_bound_idx_);
-  EXPECT_EQ(upper / 2, cfile_iter->upper_bound_idx_);
+  EXPECT_EQ(lower / 2, cfile_iter_raw->lower_bound_idx_);
+  EXPECT_EQ(upper / 2, cfile_iter_raw->upper_bound_idx_);
 
   // Read all the results.
   vector<string> results;
@@ -443,7 +448,8 @@ TEST_F(TestCFileSet, TestRangePredicates2) {
   WriteTestRowSet(kNumRows);
 
   shared_ptr<CFileSet> fileset;
-  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), nullptr, &fileset));
+  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), MemTracker::GetRootTracker(),
+                           nullptr, &fileset));
 
   // Range scan where rows match on both ends
   DoTestRangeScan(fileset, 2000, 2010);
@@ -499,7 +505,8 @@ TEST_F(TestCFileSet, TestBloomFilterPredicates) {
                        &ret1_contain, &ret1_exclude, &ret2_contain, &ret2_exclude);
 
   shared_ptr<CFileSet> fileset;
-  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), nullptr, &fileset));
+  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), MemTracker::GetRootTracker(),
+                           nullptr, &fileset));
 
   vector<ColumnPredicate::BloomFilterInner> bfs;
   // BloomFilter of column 0 contain.

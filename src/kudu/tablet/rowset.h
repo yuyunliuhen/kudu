@@ -49,6 +49,7 @@ class RowwiseIterator;
 class Schema;
 class Slice;
 struct ColumnId;
+struct IterWithBounds;
 
 namespace consensus {
 class OpId;
@@ -134,7 +135,7 @@ class RowSet {
                            ProbeStats* stats,
                            OperationResultPB* result) = 0;
 
-  // Return a new RowIterator for this rowset, with the given options.
+  // Return a new iterator for this rowset, with the given options.
   //
   // Pointers in 'opts' must remain valid for the lifetime of the iterator.
   //
@@ -143,7 +144,12 @@ class RowSet {
   //
   // The returned iterator is not Initted.
   virtual Status NewRowIterator(const RowIteratorOptions& opts,
-                                gscoped_ptr<RowwiseIterator>* out) const = 0;
+                                std::unique_ptr<RowwiseIterator>* out) const = 0;
+
+  // Like NewRowIterator, but returns the rowset's bounds (if they exist) along
+  // with the iterator.
+  Status NewRowIteratorWithBounds(const RowIteratorOptions& opts,
+                                  IterWithBounds* out) const;
 
   // Create the input to be used for a compaction.
   //
@@ -156,6 +162,9 @@ class RowSet {
 
   // Count the number of rows in this rowset.
   virtual Status CountRows(const fs::IOContext* io_context, rowid_t *count) const = 0;
+
+  // Count the number of live rows in this rowset.
+  virtual Status CountLiveRows(uint64_t* count) const = 0;
 
   // Return the bounds for this RowSet. 'min_encoded_key' and 'max_encoded_key'
   // are set to the first and last encoded keys for this RowSet.
@@ -391,7 +400,7 @@ class DuplicatingRowSet : public RowSet {
                          bool *present, ProbeStats* stats) const OVERRIDE;
 
   virtual Status NewRowIterator(const RowIteratorOptions& opts,
-                                gscoped_ptr<RowwiseIterator>* out) const OVERRIDE;
+                                std::unique_ptr<RowwiseIterator>* out) const OVERRIDE;
 
   virtual Status NewCompactionInput(const Schema* projection,
                                     const MvccSnapshot &snap,
@@ -399,6 +408,8 @@ class DuplicatingRowSet : public RowSet {
                                     gscoped_ptr<CompactionInput>* out) const OVERRIDE;
 
   Status CountRows(const fs::IOContext* io_context, rowid_t *count) const OVERRIDE;
+
+  virtual Status CountLiveRows(uint64_t* count) const OVERRIDE;
 
   virtual Status GetBounds(std::string* min_encoded_key,
                            std::string* max_encoded_key) const OVERRIDE;

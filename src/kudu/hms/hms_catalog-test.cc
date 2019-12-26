@@ -195,6 +195,7 @@ class HmsCatalogTest : public KuduTest {
     b.AddColumn("int32_val", DataType::INT32);
     b.AddColumn("int64_val", DataType::INT64);
     b.AddColumn("timestamp_val", DataType::UNIXTIME_MICROS);
+    b.AddColumn("date_val", DataType::DATE);
     b.AddColumn("string_val", DataType::STRING);
     b.AddColumn("bool_val", DataType::BOOL);
     b.AddColumn("float_val", DataType::FLOAT);
@@ -203,6 +204,7 @@ class HmsCatalogTest : public KuduTest {
     b.AddColumn("decimal32_val", DataType::DECIMAL32);
     b.AddColumn("decimal64_val", DataType::DECIMAL64);
     b.AddColumn("decimal128_val", DataType::DECIMAL128);
+    b.AddColumn("varchar_val", DataType::VARCHAR);
     return b.Build();
   }
 
@@ -244,13 +246,13 @@ class HmsCatalogTest : public KuduTest {
     table.__set_parameters({
         make_pair(HmsClient::kStorageHandlerKey,
                   HmsClient::kLegacyKuduStorageHandler),
-        make_pair(HmsClient::kLegacyKuduTableNameKey,
+        make_pair(HmsClient::kKuduTableNameKey,
                   kudu_table_name),
         make_pair(HmsClient::kKuduMasterAddrsKey,
                   kMasterAddrs),
     });
 
-    // TODO(Hao): Remove this once HIVE-19253 is fixed.
+    // TODO(HIVE-19253): Used along with table type to indicate an external table.
     if (table_type == HmsClient::kExternalTable) {
       table.parameters[HmsClient::kExternalTableKey] = "TRUE";
     }
@@ -450,6 +452,42 @@ TEST_F(HmsCatalogTest, TestReconnect) {
   EXPECT_OK(hms_catalog_->AlterTable(kTableId, "default.a", "default.c", schema));
   NO_FATALS(CheckTable(kHmsDatabase, "c", kTableId, kOwner, schema));
   NO_FATALS(CheckTableDoesNotExist(kHmsDatabase, "a"));
+}
+
+TEST_F(HmsCatalogTest, TestMetastoreUuid) {
+  // Test that if the HMS has a DB UUID, we can retrieve it.
+  const auto get_and_verify_uuid = [&] (string* ret) {
+    Status s = hms_catalog_->GetUuid(ret);
+    if (s.ok()) {
+      ASSERT_EQ(36, ret->size());
+    } else {
+      ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    }
+  };
+  string uuid;
+  NO_FATALS(get_and_verify_uuid(&uuid));
+
+  // After stopping the HMS:
+  // 1. We should still be able to initialize the catalog.
+  // 2. Attempts to fetch the DB UUID will fail.
+  ASSERT_OK(hms_->Stop());
+  hms_catalog_.reset(new HmsCatalog(kMasterAddrs));
+  ASSERT_OK(hms_catalog_->Start());
+  ASSERT_TRUE(hms_catalog_->GetUuid(nullptr).IsNotSupported());
+
+  // But if we start the HMS back up, we should be able to eventually get the
+  // DB UUID, though we need to account for the possibility that this HMS may
+  // not support it.
+  ASSERT_OK(hms_->Start());
+  string uuid2;
+  ASSERT_EVENTUALLY([&] {
+    NO_FATALS(get_and_verify_uuid(&uuid2));
+    // Verify that if we got a UUID the first time, that it's the same as the
+    // one we go this time.
+    if (!uuid.empty()) {
+      ASSERT_EQ(uuid, uuid2);
+    }
+  });
 }
 
 } // namespace hms

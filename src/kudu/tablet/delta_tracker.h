@@ -91,7 +91,7 @@ class DeltaTracker {
 
   Status WrapIterator(const std::shared_ptr<CFileSet::Iterator> &base,
                       const RowIteratorOptions& opts,
-                      gscoped_ptr<ColumnwiseIterator>* out) const;
+                      std::unique_ptr<ColumnwiseIterator>* out) const;
 
   // Enum used for NewDeltaIterator() and CollectStores() below.
   // Determines whether all types of stores should be considered,
@@ -195,6 +195,7 @@ class DeltaTracker {
                           std::vector<std::shared_ptr<DeltaStore>>* stores,
                           DeltaType type);
 
+#ifndef NDEBUG
   // Validates that 'first' may precede 'second' in an ordered list of deltas,
   // given a delta type of 'type'. This should only be run in DEBUG mode.
   //
@@ -202,6 +203,7 @@ class DeltaTracker {
   // validation could not be performed.
   Status ValidateDeltaOrder(const std::shared_ptr<DeltaStore>& first,
                             const std::shared_ptr<DeltaStore>& second,
+                            const fs::IOContext* io_context,
                             DeltaType type);
 
   // Validates the relative ordering of the deltas in the specified list. This
@@ -209,22 +211,28 @@ class DeltaTracker {
   //
   // Crashes if there is an ordering violation, and returns an error if the
   // validation could not be performed.
-  Status ValidateDeltasOrdered(const SharedDeltaStoreVector& list, DeltaType type);
+  Status ValidateDeltasOrdered(const SharedDeltaStoreVector& list,
+                               const fs::IOContext* io_context,
+                               DeltaType type);
+#endif // NDEBUG
 
   // Replaces the subsequence of stores that matches 'stores_to_replace' with
   // delta file readers corresponding to 'new_delta_blocks', which may be empty.
   // If 'stores_to_replace' is empty then the stores represented by
   // 'new_delta_blocks' are prepended to the relevant delta stores list.
+  //
+  // In DEBUG mode, this may do IO to validate the delta ordering.
   void AtomicUpdateStores(const SharedDeltaStoreVector& stores_to_replace,
                           const SharedDeltaStoreVector& new_stores,
+                          const fs::IOContext* io_context,
                           DeltaType type);
 
   // Get the delta MemStore's size in bytes, including pre-allocation.
   size_t DeltaMemStoreSize() const;
 
-  // Returns true if the DMS has no entries. This doesn't rely on the size.
+  // Returns true if the DMS doesn't exist. This doesn't rely on the size.
   bool DeltaMemStoreEmpty() const {
-    return dms_empty_.Load();
+    return !dms_exists_.Load();
   }
 
   // Get the minimum log index for this tracker's DMS, -1 if it wasn't set.
@@ -257,6 +265,10 @@ class DeltaTracker {
 
   // Init() all of the specified delta stores. For tests only.
   Status InitAllDeltaStoresForTests(WhichStores stores);
+
+  // Count the number of deleted rows in the current DMS as well as
+  // in a flushing DMS (if one exists)
+  int64_t CountDeletedRows() const;
 
  private:
   FRIEND_TEST(TestRowSet, TestRowSetUpdate);
@@ -310,6 +322,8 @@ class DeltaTracker {
 
   std::string LogPrefix() const;
 
+  Status CreateAndInitDMSUnlocked(const fs::IOContext* io_context);
+
   std::shared_ptr<RowSetMetadata> rowset_metadata_;
 
   bool open_;
@@ -325,6 +339,8 @@ class DeltaTracker {
 
   TabletMemTrackers mem_trackers_;
 
+  int64_t next_dms_id_;
+
   // The current DeltaMemStore into which updates should be written.
   std::shared_ptr<DeltaMemStore> dms_;
   // The set of tracked REDO delta stores, in increasing timestamp order.
@@ -333,12 +349,14 @@ class DeltaTracker {
   SharedDeltaStoreVector undo_delta_stores_;
 
   // The maintenance scheduler calls DeltaMemStoreEmpty() a lot.
-  // We cache this here to avoid having to take component_lock_
-  // in order to satisfy this call.
-  AtomicBool dms_empty_;
+  // We use an atomic variable to indicate whether DMS exists or not and
+  // to avoid having to take component_lock_ in order to satisfy this call.
+  AtomicBool dms_exists_;
 
   // read-write lock protecting dms_ and {redo,undo}_delta_stores_.
-  // - Readers and mutators take this lock in shared mode.
+  // - Readers take this lock in shared mode.
+  // - Mutators take this lock in exclusive mode if they need to create
+  //   a new DMS, and shared mode otherwise.
   // - Flushers take this lock in exclusive mode before they modify the
   //   structure of the rowset.
   //
@@ -354,6 +372,11 @@ class DeltaTracker {
   //
   // TODO(perf): this needs to be more fine grained
   mutable Mutex compact_flush_lock_;
+
+  // Number of deleted rows for a DMS that is currently being flushed.
+  // When the flush completes, this is merged into the RowSetMetadata
+  // and reset.
+  int64_t deleted_row_count_;
 
   DISALLOW_COPY_AND_ASSIGN(DeltaTracker);
 };

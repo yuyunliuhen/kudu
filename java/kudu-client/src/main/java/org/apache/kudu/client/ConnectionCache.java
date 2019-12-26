@@ -29,7 +29,6 @@ import com.google.common.collect.ImmutableList;
 import com.stumbleupon.async.Deferred;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
-
 import org.jboss.netty.channel.socket.ClientSocketChannelFactory;
 import org.jboss.netty.util.HashedWheelTimer;
 
@@ -55,9 +54,6 @@ class ConnectionCache {
   /** Security context to use for connection negotiation. */
   private final SecurityContext securityContext;
 
-  /** Read timeout for connections (used by Netty's ReadTimeoutHandler) */
-  private final long socketReadTimeoutMs;
-
   /** Timer to monitor read timeouts for connections (used by Netty's ReadTimeoutHandler) */
   private final HashedWheelTimer timer;
 
@@ -75,11 +71,9 @@ class ConnectionCache {
 
   /** Create a new empty ConnectionCache given the specified parameters. */
   ConnectionCache(SecurityContext securityContext,
-                  long socketReadTimeoutMs,
                   HashedWheelTimer timer,
                   ClientSocketChannelFactory channelFactory) {
     this.securityContext = securityContext;
-    this.socketReadTimeoutMs = socketReadTimeoutMs;
     this.timer = timer;
     this.channelFactory = channelFactory;
   }
@@ -131,8 +125,11 @@ class ConnectionCache {
         }
       }
       if (result == null) {
-        result = new Connection(serverInfo, securityContext,
-            socketReadTimeoutMs, timer, channelFactory, credentialsPolicy);
+        result = new Connection(serverInfo,
+                                securityContext,
+                                timer,
+                                channelFactory,
+                                credentialsPolicy);
         connections.add(result);
         // There can be at most 2 connections to the same destination: one with primary and another
         // with secondary credentials.

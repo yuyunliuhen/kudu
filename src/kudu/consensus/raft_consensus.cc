@@ -31,7 +31,6 @@
 
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <google/protobuf/util/message_differencer.h>
 
 #include "kudu/common/timestamp.h"
@@ -132,13 +131,6 @@ DEFINE_bool(raft_prepare_replacement_before_eviction, true,
 TAG_FLAG(raft_prepare_replacement_before_eviction, advanced);
 TAG_FLAG(raft_prepare_replacement_before_eviction, experimental);
 
-DEFINE_bool(raft_attempt_to_replace_replica_without_majority, false,
-            "When enabled, the replica replacement logic attempts to perform "
-            "desired Raft configuration changes even if the majority "
-            "of voter replicas is reported failed or offline. "
-            "Warning! This is only intended for testing.");
-TAG_FLAG(raft_attempt_to_replace_replica_without_majority, unsafe);
-
 DECLARE_int32(memory_limit_warn_threshold_percentage);
 
 // Metrics
@@ -147,23 +139,27 @@ METRIC_DEFINE_counter(tablet, follower_memory_pressure_rejections,
                       "Follower Memory Pressure Rejections",
                       kudu::MetricUnit::kRequests,
                       "Number of RPC requests rejected due to "
-                      "memory pressure while FOLLOWER.");
+                      "memory pressure while FOLLOWER.",
+                      kudu::MetricLevel::kWarn);
 METRIC_DEFINE_gauge_int64(tablet, raft_term,
                           "Current Raft Consensus Term",
                           kudu::MetricUnit::kUnits,
                           "Current Term of the Raft Consensus algorithm. This number increments "
-                          "each time a leader election is started.");
+                          "each time a leader election is started.",
+                          kudu::MetricLevel::kDebug);
 METRIC_DEFINE_gauge_int64(tablet, failed_elections_since_stable_leader,
                           "Failed Elections Since Stable Leader",
                           kudu::MetricUnit::kUnits,
                           "Number of failed elections on this node since there was a stable "
                           "leader. This number increments on each failed election and resets on "
-                          "each successful one.");
+                          "each successful one.",
+                          kudu::MetricLevel::kWarn);
 METRIC_DEFINE_gauge_int64(tablet, time_since_last_leader_heartbeat,
                           "Time Since Last Leader Heartbeat",
                           kudu::MetricUnit::kMilliseconds,
                           "The time elapsed since the last heartbeat from the leader "
-                          "in milliseconds. This metric is identically zero on a leader replica.");
+                          "in milliseconds. This metric is identically zero on a leader replica.",
+                          kudu::MetricLevel::kDebug);
 
 
 using boost::optional;
@@ -227,7 +223,7 @@ Status RaftConsensus::Create(ConsensusOptions options,
 }
 
 Status RaftConsensus::Start(const ConsensusBootstrapInfo& info,
-                            gscoped_ptr<PeerProxyFactory> peer_proxy_factory,
+                            unique_ptr<PeerProxyFactory> peer_proxy_factory,
                             scoped_refptr<log::Log> log,
                             scoped_refptr<TimeManager> time_manager,
                             ConsensusRoundHandler* round_handler,
@@ -241,7 +237,9 @@ Status RaftConsensus::Start(const ConsensusBootstrapInfo& info,
   round_handler_ = DCHECK_NOTNULL(round_handler);
   mark_dirty_clbk_ = std::move(mark_dirty_clbk);
 
-  term_metric_ = metric_entity->FindOrCreateGauge(&METRIC_raft_term, CurrentTerm());
+  term_metric_ = metric_entity->FindOrCreateGauge(&METRIC_raft_term,
+                                                  CurrentTerm(),
+                                                  MergeType::kMax);
   follower_memory_pressure_rejections_ =
       metric_entity->FindOrCreateCounter(&METRIC_follower_memory_pressure_rejections);
 
@@ -250,7 +248,9 @@ Status RaftConsensus::Start(const ConsensusBootstrapInfo& info,
                                        failed_elections_since_stable_leader_);
 
   METRIC_time_since_last_leader_heartbeat.InstantiateFunctionGauge(
-    metric_entity, Bind(&RaftConsensus::GetMillisSinceLastLeaderHeartbeat, Unretained(this)))
+      metric_entity,
+      Bind(&RaftConsensus::GetMillisSinceLastLeaderHeartbeat, Unretained(this)),
+      MergeType::kMax)
     ->AutoDetach(&metric_detacher_);
 
   // A single Raft thread pool token is shared between RaftConsensus and
@@ -1012,9 +1012,9 @@ Status RaftConsensus::Update(const ConsensusRequestPB* request,
   Status s = UpdateReplica(request, response);
   if (PREDICT_FALSE(VLOG_IS_ON(1))) {
     if (request->ops().empty()) {
-      VLOG_WITH_PREFIX(1) << "Replica replied to status only request. Replica: "
-                          << ToString() << ". Response: "
-                          << SecureShortDebugString(*response);
+      VLOG_WITH_PREFIX(1)
+          << Substitute("Replica replied to status only request. Replica: $0. Response: $1",
+                        ToString(), SecureShortDebugString(*response));
     }
   }
   return s;
@@ -1178,8 +1178,12 @@ Status RaftConsensus::EnforceLogMatchingPropertyMatchesUnlocked(const LeaderRequ
                              ConsensusErrorPB::PRECEDING_ENTRY_DIDNT_MATCH,
                              Status::IllegalState(error_msg));
 
-  LOG_WITH_PREFIX_UNLOCKED(INFO) << "Refusing update from remote peer "
-                        << req.leader_uuid << ": " << error_msg;
+  // Adding a check to eliminate an unnecessary log message in the
+  // scenario where this is the first message from the Leader of a new tablet.
+  if (!OpIdEquals(MakeOpId(1,1), *req.preceding_opid)) {
+    LOG_WITH_PREFIX_UNLOCKED(INFO) << "Refusing update from remote peer "
+                                   << req.leader_uuid << ": " << error_msg;
+  }
 
   // If the terms mismatch we abort down to the index before the leader's preceding,
   // since we know that is the last opid that has a chance of not being overwritten.
@@ -1432,7 +1436,7 @@ Status RaftConsensus::UpdateReplica(const ConsensusRequestPB* request,
     queue_->UpdateLastIndexAppendedToLeader(request->last_idx_appended_to_leader());
 
     // Also prohibit voting for anyone for the minimum election timeout.
-    withhold_votes_until_ = MonoTime::Now() + MinimumElectionTimeout();
+    WithholdVotesUnlocked();
 
     // 1 - Early commit pending (and committed) transactions
 
@@ -1592,9 +1596,15 @@ Status RaftConsensus::UpdateReplica(const ConsensusRequestPB* request,
       s = log_synchronizer.WaitFor(
           MonoDelta::FromMilliseconds(FLAGS_raft_heartbeat_interval_ms));
       // If just waiting for our log append to finish lets snooze the timer.
-      // We don't want to fire leader election because we're waiting on our own log.
+      // We don't want to fire leader election nor accept vote requests because
+      // we're still processing the Raft message from the leader,
+      // waiting on our own log.
       if (s.IsTimedOut()) {
         SnoozeFailureDetector();
+        {
+          LockGuard l(lock_);
+          WithholdVotesUnlocked();
+        }
       }
     } while (s.IsTimedOut());
     RETURN_NOT_OK(s);
@@ -1719,9 +1729,15 @@ Status RaftConsensus::RequestVote(const VoteRequestPB* request,
   // will change to eject the abandoned node, but until that point, we don't want the
   // abandoned follower to disturb the other nodes.
   //
+  // 3) Other dynamic scenarios with a stale former leader
+  // This is a generalization of the case 1. It's possible that a stale former
+  // leader detects it's not a leader anymore at some point, but a majority
+  // of replicas has elected a new leader already.
+  //
   // See also https://ramcloud.stanford.edu/~ongaro/thesis.pdf
   // section 4.2.3.
-  if (!request->ignore_live_leader() && MonoTime::Now() < withhold_votes_until_) {
+  if (PREDICT_TRUE(!request->ignore_live_leader()) &&
+      MonoTime::Now() < withhold_votes_until_) {
     return RequestVoteRespondLeaderIsAlive(request, response);
   }
 
@@ -2831,10 +2847,10 @@ void RaftConsensus::SnoozeFailureDetector(boost::optional<string> reason_for_log
                                           boost::optional<MonoDelta> delta) {
   if (PREDICT_TRUE(failure_detector_ && FLAGS_enable_leader_failure_detection)) {
     if (reason_for_log) {
-      LOG(INFO) << LogPrefixThreadSafe()
-                << Substitute("Snoozing failure detection for $0 ($1)",
-                              delta ? delta->ToString() : "election timeout",
-                              *reason_for_log);
+      VLOG(1) << LogPrefixThreadSafe()
+              << Substitute("Snoozing failure detection for $0 ($1)",
+                            delta ? delta->ToString() : "election timeout",
+                            *reason_for_log);
     }
 
     if (!delta) {
@@ -2842,6 +2858,12 @@ void RaftConsensus::SnoozeFailureDetector(boost::optional<string> reason_for_log
     }
     failure_detector_->Snooze(std::move(delta));
   }
+}
+
+void RaftConsensus::WithholdVotesUnlocked() {
+  DCHECK(lock_.is_locked());
+  withhold_votes_until_ = std::max(withhold_votes_until_,
+                                   MonoTime::Now() + MinimumElectionTimeout());
 }
 
 MonoDelta RaftConsensus::MinimumElectionTimeout() const {

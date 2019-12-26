@@ -25,10 +25,10 @@
 #include <boost/bind.hpp> // IWYU pragma: keep
 #include <boost/optional/optional.hpp>
 #include <boost/optional/optional_io.hpp>
-#include <glog/logging.h>
-#include <gtest/gtest.h>
 #include <gflags/gflags.h>
 #include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
 
 #include "kudu/common/column_predicate.h"
 #include "kudu/common/common.pb.h"
@@ -51,6 +51,7 @@
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 #include "kudu/util/thread.h"
 
@@ -64,6 +65,7 @@ DECLARE_int32(deltafile_default_block_size);
 
 using boost::optional;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
@@ -156,7 +158,7 @@ class TestRandomAccess : public KuduTabletTest {
     s.start();
     while (s.elapsed().wall_seconds() < FLAGS_runtime_seconds) {
       for (int i = 0; i < 100; i++) {
-        ASSERT_NO_FATAL_FAILURE(DoRandomBatch());
+        NO_FATALS(DoRandomBatch());
         op_count++;
       }
     }
@@ -270,7 +272,7 @@ class TestRandomAccess : public KuduTabletTest {
   optional<ExpectedKeyValueRow> GetRow(int key) {
     ScanSpec spec;
     const Schema& schema = this->client_schema_;
-    gscoped_ptr<RowwiseIterator> iter;
+    unique_ptr<RowwiseIterator> iter;
     CHECK_OK(this->tablet()->NewRowIterator(schema, &iter));
     auto pred_one = ColumnPredicate::Equality(schema.column(0), &key);
     spec.AddPredicate(pred_one);
@@ -280,7 +282,7 @@ class TestRandomAccess : public KuduTabletTest {
     int n_results = 0;
 
     Arena arena(1024);
-    RowBlock block(schema, 100, &arena);
+    RowBlock block(&schema, 100, &arena);
     while (iter->HasNext()) {
       arena.Reset();
       CHECK_OK(iter->NextBlock(&block));

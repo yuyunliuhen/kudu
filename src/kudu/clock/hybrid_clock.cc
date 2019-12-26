@@ -26,11 +26,14 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "kudu/clock/builtin_ntp.h"
 #include "kudu/clock/mock_ntp.h"
 #include "kudu/clock/system_ntp.h"
+#include "kudu/clock/system_unsync_time.h"
 #include "kudu/gutil/bind.h"
 #include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/flag_tags.h"
@@ -38,10 +41,6 @@
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
-
-#ifdef __APPLE__
-#include "kudu/clock/system_unsync_time.h"
-#endif
 
 using kudu::Status;
 using std::string;
@@ -54,32 +53,48 @@ TAG_FLAG(max_clock_sync_error_usec, advanced);
 TAG_FLAG(max_clock_sync_error_usec, runtime);
 
 DEFINE_bool(use_hybrid_clock, true,
-            "Whether HybridClock should be used as the default clock"
-            " implementation. This should be disabled for testing purposes only.");
+            "Whether HybridClock should be used as the default clock "
+            "implementation. This should be disabled for testing purposes only.");
 TAG_FLAG(use_hybrid_clock, hidden);
 
+// Use the 'system' time source by default in standard (non-test) environment.
+// This requires local machine clock to be NTP-synchronized.
 DEFINE_string(time_source, "system",
-              "The clock source that HybridClock should use. Must be one of "
-              "'system' or 'mock' (for tests only)");
-TAG_FLAG(time_source, experimental);
-DEFINE_validator(time_source, [](const char* /* flag_name */, const string& value) {
-    if (boost::iequals(value, "system") ||
-        boost::iequals(value, "mock")) {
-      return true;
-    }
-    LOG(ERROR) << "unknown value for 'time_source': '" << value << "'"
-               << " (expected one of 'system' or 'mock')";
-    return false;
-  });
+              "The time source that HybridClock should use. Must be one of "
+              "'builtin', 'system', 'system_unsync', or 'mock' "
+              "('system_unsync' and 'mock' are for tests only)");
+TAG_FLAG(time_source, evolving);
+DEFINE_validator(time_source, [](const char* flag_name, const string& value) {
+  if (boost::iequals(value, "builtin") ||
+      boost::iequals(value, "system") ||
+      boost::iequals(value, "system_unsync") ||
+      boost::iequals(value, "mock")) {
+    return true;
+  }
+  LOG(ERROR) << Substitute("unknown value for --$0 flag: '$1' "
+                           "(expected one of 'system', 'builtin', or 'mock')",
+                           flag_name, value);
+  return false;
+});
+
+DEFINE_int32(ntp_initial_sync_wait_secs, 60,
+             "Amount of time in seconds to wait for clock synchronisation at "
+             "startup. A value of zero means Kudu will fail to start "
+             "if the clock is unsynchronized. This flag can prevent Kudu from "
+             "crashing if it starts before NTP can synchronize the clock.");
+TAG_FLAG(ntp_initial_sync_wait_secs, advanced);
+TAG_FLAG(ntp_initial_sync_wait_secs, evolving);
 
 METRIC_DEFINE_gauge_uint64(server, hybrid_clock_timestamp,
                            "Hybrid Clock Timestamp",
                            kudu::MetricUnit::kMicroseconds,
-                           "Hybrid clock timestamp.");
+                           "Hybrid clock timestamp.",
+                           kudu::MetricLevel::kInfo);
 METRIC_DEFINE_gauge_uint64(server, hybrid_clock_error,
                            "Hybrid Clock Error",
                            kudu::MetricUnit::kMicroseconds,
-                           "Server clock maximum error.");
+                           "Server clock maximum error.",
+                           kudu::MetricLevel::kInfo);
 
 namespace kudu {
 namespace clock {
@@ -116,20 +131,62 @@ HybridClock::HybridClock()
 
 Status HybridClock::Init() {
   if (boost::iequals(FLAGS_time_source, "mock")) {
-    time_service_.reset(new clock::MockNtp());
+    time_service_.reset(new clock::MockNtp);
   } else if (boost::iequals(FLAGS_time_source, "system")) {
 #ifndef __APPLE__
-    time_service_.reset(new clock::SystemNtp());
+    time_service_.reset(new clock::SystemNtp);
 #else
-    time_service_.reset(new clock::SystemUnsyncTime());
+    time_service_.reset(new clock::SystemUnsyncTime);
 #endif
+  } else if (boost::iequals(FLAGS_time_source, "system_unsync")) {
+    time_service_.reset(new clock::SystemUnsyncTime);
+  } else if (boost::iequals(FLAGS_time_source, "builtin")) {
+    time_service_.reset(new clock::BuiltInNtp);
   } else {
     return Status::InvalidArgument("invalid NTP source", FLAGS_time_source);
   }
   RETURN_NOT_OK(time_service_->Init());
 
-  state_ = kInitialized;
+  // Make sure the underlying clock service is available (e.g., for NTP-based
+  // clock make sure it's synchronized with its NTP source). If requested, wait
+  // up to the specified timeout for the clock to become ready to use.
+  const auto wait_s = FLAGS_ntp_initial_sync_wait_secs;
+  const auto deadline = MonoTime::Now() + MonoDelta::FromSeconds(wait_s);
+  bool need_log = true;
+  Status s;
+  uint64_t now_usec;
+  uint64_t error_usec;
+  int poll_backoff_ms = 1;
+  do {
+    s = time_service_->WalltimeWithError(&now_usec, &error_usec);
+    if (!s.IsServiceUnavailable()) {
+      break;
+    }
+    if (need_log) {
+      // Log about what's going on, just once.
+      if (wait_s > 0) {
+        LOG(INFO) << Substitute("waiting up to --ntp_initial_sync_wait_secs=$0 "
+                                "seconds for the clock to synchronize", wait_s);
+      } else {
+        LOG(INFO) << Substitute("not waiting for clock synchronization: "
+                                "--ntp_initial_sync_wait_secs=$0 is nonpositive",
+                                wait_s);
+      }
+      need_log = false;
+    }
+    SleepFor(MonoDelta::FromMilliseconds(poll_backoff_ms));
+    poll_backoff_ms = std::min(2 * poll_backoff_ms, 1000);
+  } while (MonoTime::Now() < deadline);
 
+  if (!s.ok()) {
+    time_service_->DumpDiagnostics(/* log= */nullptr);
+    return s.CloneAndPrepend("timed out waiting for clock synchronisation");
+  }
+
+  LOG(INFO) << Substitute("HybridClock initialized: "
+                          "now $0 us; error $1 us; skew $2 ppm",
+                          now_usec, error_usec, time_service_->skew_ppm());
+  state_ = kInitialized;
   return Status::OK();
 }
 
@@ -180,11 +237,10 @@ void HybridClock::NowWithError(Timestamp* timestamp, uint64_t* max_error_usec) {
     next_timestamp_ = candidate_phys_timestamp;
     *timestamp = Timestamp(next_timestamp_++);
     *max_error_usec = error_usec;
-    if (PREDICT_FALSE(VLOG_IS_ON(2))) {
-      VLOG(2) << "Current clock is higher than the last one. Resetting logical values."
-          << " Physical Value: " << now_usec << " usec Logical Value: 0  Error: "
-          << error_usec;
-    }
+    VLOG(2) << Substitute("Current clock is higher than the last one. "
+                          "Resetting logical values. Physical Value: $0 usec "
+                          "Logical Value: 0  Error: $1",
+                          now_usec, error_usec);
     return;
   }
 
@@ -208,10 +264,10 @@ void HybridClock::NowWithError(Timestamp* timestamp, uint64_t* max_error_usec) {
 
   *max_error_usec = (next_timestamp_ >> kBitsToShift) - (now_usec - error_usec);
   *timestamp = Timestamp(next_timestamp_++);
-  if (PREDICT_FALSE(VLOG_IS_ON(2))) {
-    VLOG(2) << "Current clock is lower than the last one. Returning last read and incrementing"
-        " logical values. Clock: " + Stringify(*timestamp) << " Error: " << *max_error_usec;
-  }
+  VLOG(2) << Substitute("Current clock is lower than the last one. Returning "
+                        "last read and incrementing logical values. "
+                        "Clock: $0 Error: $1",
+                        Stringify(*timestamp), *max_error_usec);
 }
 
 Status HybridClock::Update(const Timestamp& to_update) {
@@ -228,16 +284,20 @@ Status HybridClock::Update(const Timestamp& to_update) {
 
   uint64_t to_update_physical = GetPhysicalValueMicros(to_update);
   uint64_t now_physical = GetPhysicalValueMicros(now);
+  DCHECK_GE(to_update_physical, now_physical);
 
-  // we won't update our clock if to_update is more than 'max_clock_sync_error_usec'
-  // into the future as it might have been corrupted or originated from an out-of-sync
-  // server.
-  if ((to_update_physical - now_physical) > FLAGS_max_clock_sync_error_usec) {
-    return Status::InvalidArgument("Tried to update clock beyond the max. error.");
+  // Don't update our clock if 'to_update' is more than
+  // '--max_clock_sync_error_usec' into the future as it might have been
+  // corrupted or originated from an out-of-sync server.
+  if (to_update_physical - now_physical > FLAGS_max_clock_sync_error_usec) {
+    return Status::InvalidArgument(Substitute(
+        "tried to update clock beyond the error threshold of $0us: "
+        "now $1, to_update $2 (now_physical $3, to_update_physical $4)",
+        FLAGS_max_clock_sync_error_usec,
+        now.ToUint64(), to_update.ToUint64(), now_physical, to_update_physical));
   }
 
-  // Our next timestamp must be higher than the one that we are updating
-  // from.
+  // Our next timestamp must be higher than the one that we are updating from.
   next_timestamp_ = to_update.value() + 1;
   return Status::OK();
 }

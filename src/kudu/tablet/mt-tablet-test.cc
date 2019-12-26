@@ -35,13 +35,14 @@
 #include "kudu/common/rowblock.h"
 #include "kudu/common/rowid.h"
 #include "kudu/common/schema.h"
-#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/local_tablet_writer.h"
 #include "kudu/tablet/rowset.h"
 #include "kudu/tablet/tablet-harness.h"
 #include "kudu/tablet/tablet-test-base.h"
+#include "kudu/tablet/tablet-test-util.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/faststring.h"
@@ -77,6 +78,7 @@ DEFINE_double(flusher_backoff, 2.0f, "Ratio to backoff the flusher thread");
 DEFINE_int32(flusher_initial_frequency_ms, 30, "Number of ms to wait between flushes");
 
 using std::shared_ptr;
+using std::unique_ptr;
 
 namespace kudu {
 namespace tablet {
@@ -95,7 +97,7 @@ class MultiThreadedTabletTest : public TabletTestBase<SETUP> {
     superclass::SetUp();
 
     // Warm up code cache with all the projections we'll be using.
-    gscoped_ptr<RowwiseIterator> iter;
+    unique_ptr<RowwiseIterator> iter;
     CHECK_OK(tablet()->NewRowIterator(client_schema_, &iter));
     uint64_t count;
     CHECK_OK(tablet()->CountRows(&count));
@@ -142,7 +144,7 @@ class MultiThreadedTabletTest : public TabletTestBase<SETUP> {
     LocalTabletWriter writer(this->tablet().get(), &this->client_schema_);
 
     Arena tmp_arena(1024);
-    RowBlock block(schema_, 1, &tmp_arena);
+    RowBlock block(&schema_, 1, &tmp_arena);
     faststring update_buf;
 
     uint64_t updates_since_last_report = 0;
@@ -152,9 +154,9 @@ class MultiThreadedTabletTest : public TabletTestBase<SETUP> {
     KuduPartialRow row(&client_schema_);
 
     while (running_insert_count_.count() > 0) {
-      gscoped_ptr<RowwiseIterator> iter;
+      unique_ptr<RowwiseIterator> iter;
       CHECK_OK(tablet()->NewRowIterator(client_schema_, &iter));
-      CHECK_OK(iter->Init(NULL));
+      CHECK_OK(iter->Init(nullptr));
 
       while (iter->HasNext() && running_insert_count_.count() > 0) {
         tmp_arena.Reset();
@@ -212,7 +214,7 @@ class MultiThreadedTabletTest : public TabletTestBase<SETUP> {
   // trying to reference already-freed memrowset memory.
   void SlowReaderThread(int /*tid*/) {
     Arena arena(32*1024);
-    RowBlock block(schema_, 1, &arena);
+    RowBlock block(&schema_, 1, &arena);
 
     uint64_t max_rows = this->ClampRowCount(FLAGS_inserts_per_thread * FLAGS_num_insert_threads)
             / FLAGS_num_insert_threads;
@@ -220,9 +222,9 @@ class MultiThreadedTabletTest : public TabletTestBase<SETUP> {
     int max_iters = FLAGS_num_insert_threads * max_rows / 10;
 
     while (running_insert_count_.count() > 0) {
-      gscoped_ptr<RowwiseIterator> iter;
+      unique_ptr<RowwiseIterator> iter;
       CHECK_OK(tablet()->NewRowIterator(client_schema_, &iter));
-      CHECK_OK(iter->Init(NULL));
+      CHECK_OK(iter->Init(nullptr));
 
       for (int i = 0; i < max_iters && iter->HasNext(); i++) {
         CHECK_OK(iter->NextBlock(&block));
@@ -247,16 +249,16 @@ class MultiThreadedTabletTest : public TabletTestBase<SETUP> {
     Arena arena(1024); // unused, just scanning ints
 
     static const int kBufInts = 1024*1024 / 8;
-    RowBlock block(valcol_projection_, kBufInts, &arena);
+    RowBlock block(&valcol_projection_, kBufInts, &arena);
     ColumnBlock column = block.column_block(0);
 
     uint64_t count_since_report = 0;
 
     int64_t sum = 0;
 
-    gscoped_ptr<RowwiseIterator> iter;
+    unique_ptr<RowwiseIterator> iter;
     CHECK_OK(tablet()->NewRowIterator(valcol_projection_, &iter));
-    CHECK_OK(iter->Init(NULL));
+    CHECK_OK(iter->Init(nullptr));
 
     while (iter->HasNext()) {
       arena.Reset();
@@ -407,13 +409,18 @@ class MultiThreadedTabletTest : public TabletTestBase<SETUP> {
       "num_rowsets");
     shared_ptr<TimeSeries> memrowset_size_ts = ts_collector_.GetTimeSeries(
       "memrowset_kb");
+    shared_ptr<TimeSeries> num_live_rows_ts = ts_collector_.GetTimeSeries(
+      "num_live_rows");
 
     while (running_insert_count_.count() > 0) {
       num_rowsets_ts->SetValue(tablet()->num_rowsets());
       memrowset_size_ts->SetValue(tablet()->MemRowSetSize() / 1024.0);
+      uint64_t num_live_rows;
+      ignore_result(tablet()->CountLiveRows(&num_live_rows));
+      num_live_rows_ts->SetValue(num_live_rows);
 
       // Wait, unless the inserters are all done.
-      running_insert_count_.WaitFor(MonoDelta::FromMilliseconds(250));
+      running_insert_count_.WaitFor(MonoDelta::FromMilliseconds(10));
     }
   }
 
@@ -490,6 +497,7 @@ TYPED_TEST(MultiThreadedTabletTest, DeleteAndReinsert) {
   FLAGS_flusher_initial_frequency_ms = 1;
   FLAGS_tablet_delta_store_major_compact_min_ratio = 0.01f;
   FLAGS_tablet_delta_store_minor_compact_max = 10;
+  this->StartThreads(1, &TestFixture::CollectStatisticsThread);
   this->StartThreads(FLAGS_num_flush_threads, &TestFixture::FlushThread);
   this->StartThreads(FLAGS_num_compact_threads, &TestFixture::CompactThread);
   this->StartThreads(FLAGS_num_undo_delta_gc_threads, &TestFixture::DeleteAncientUndoDeltasThread);

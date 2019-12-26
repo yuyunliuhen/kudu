@@ -17,10 +17,10 @@
 
 #include "kudu/tserver/tablet_server.h"
 
-#include <cstddef>
 #include <ostream>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <glog/logging.h>
 
@@ -31,6 +31,7 @@
 #include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/service_if.h"
+#include "kudu/server/rpc_server.h"
 #include "kudu/tserver/heartbeater.h"
 #include "kudu/tserver/scanners.h"
 #include "kudu/tserver/tablet_copy_service.h"
@@ -38,10 +39,12 @@
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/tserver/tserver_path_handlers.h"
 #include "kudu/util/maintenance_manager.h"
+#include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/status.h"
 
 using std::string;
+using std::vector;
 using kudu::fs::ErrorHandlerType;
 using kudu::rpc::ServiceIf;
 
@@ -50,7 +53,7 @@ namespace tserver {
 
 TabletServer::TabletServer(const TabletServerOptions& opts)
   : KuduServer("TabletServer", opts, "kudu.tabletserver"),
-    initted_(false),
+    state_(kStopped),
     fail_heartbeats_for_tests_(false),
     opts_(opts),
     tablet_manager_(new TSTabletManager(this)),
@@ -62,41 +65,43 @@ TabletServer::~TabletServer() {
   Shutdown();
 }
 
-string TabletServer::ToString() const {
-  // TODO: include port numbers, etc.
-  return "TabletServer";
-}
-
-Status TabletServer::ValidateMasterAddressResolution() const {
-  for (const HostPort& master_addr : opts_.master_addresses) {
-    RETURN_NOT_OK_PREPEND(master_addr.ResolveAddresses(NULL),
-                          strings::Substitute(
-                              "Couldn't resolve master service address '$0'",
-                              master_addr.ToString()));
-  }
-  return Status::OK();
-}
-
 Status TabletServer::Init() {
-  CHECK(!initted_);
+  CHECK_EQ(kStopped, state_);
 
   cfile::BlockCache::GetSingleton()->StartInstrumentation(metric_entity());
 
+  UnorderedHostPortSet master_addrs;
+  for (auto addr : opts_.master_addresses) {
+    master_addrs.emplace(std::move(addr));
+  }
+  // If we deduplicated some masters addresses, log something about it.
+  if (master_addrs.size() < opts_.master_addresses.size()) {
+    vector<HostPort> addr_list;
+    for (const auto& addr : master_addrs) {
+      addr_list.emplace_back(addr);
+    }
+    LOG(INFO) << "deduplicated master addresses: "
+              << HostPort::ToCommaSeparatedString(addr_list);
+  }
   // Validate that the passed master address actually resolves.
   // We don't validate that we can connect at this point -- it should
   // be allowed to start the TS and the master in whichever order --
   // our heartbeat thread will loop until successfully connecting.
-  RETURN_NOT_OK(ValidateMasterAddressResolution());
+  for (const auto& addr : master_addrs) {
+    RETURN_NOT_OK_PREPEND(dns_resolver()->ResolveAddresses(addr, nullptr),
+        strings::Substitute("couldn't resolve master service address '$0'",
+                            addr.ToString()));
+  }
 
   RETURN_NOT_OK(KuduServer::Init());
   if (web_server_) {
     RETURN_NOT_OK(path_handlers_->Register(web_server_.get()));
   }
 
-  maintenance_manager_.reset(new MaintenanceManager(
-      MaintenanceManager::kDefaultOptions, fs_manager_->uuid()));
+  maintenance_manager_ = std::make_shared<MaintenanceManager>(
+      MaintenanceManager::kDefaultOptions, fs_manager_->uuid());
 
-  heartbeater_.reset(new Heartbeater(opts_, this));
+  heartbeater_.reset(new Heartbeater(std::move(master_addrs), this));
 
   RETURN_NOT_OK_PREPEND(tablet_manager_->Init(),
                         "Could not init Tablet Manager");
@@ -104,7 +109,7 @@ Status TabletServer::Init() {
   RETURN_NOT_OK_PREPEND(scanner_manager_->StartRemovalThread(),
                         "Could not start expired Scanner removal thread");
 
-  initted_ = true;
+  state_ = kInitialized;
   return Status::OK();
 }
 
@@ -113,7 +118,7 @@ Status TabletServer::WaitInited() {
 }
 
 Status TabletServer::Start() {
-  CHECK(initted_);
+  CHECK_EQ(kInitialized, state_);
 
   fs_manager_->SetErrorNotificationCb(ErrorHandlerType::DISK_ERROR,
       Bind(&TSTabletManager::FailTabletsInDataDir, Unretained(tablet_manager_.get())));
@@ -137,13 +142,14 @@ Status TabletServer::Start() {
 
   google::FlushLogFiles(google::INFO); // Flush the startup messages.
 
+  state_ = kRunning;
   return Status::OK();
 }
 
 void TabletServer::Shutdown() {
-  if (initted_) {
-    string name = ToString();
-    LOG(INFO) << name << " shutting down...";
+  if (kInitialized == state_ || kRunning == state_) {
+    const string name = rpc_server_->ToString();
+    LOG(INFO) << "TabletServer@" << name << " shutting down...";
 
     // 1. Stop accepting new RPCs.
     UnregisterAllServices();
@@ -157,8 +163,9 @@ void TabletServer::Shutdown() {
 
     // 3. Shut down generic subsystems.
     KuduServer::Shutdown();
-    LOG(INFO) << name << " shutdown complete.";
+    LOG(INFO) << "TabletServer@" << name << " shutdown complete.";
   }
+  state_ = kStopped;
 }
 
 } // namespace tserver

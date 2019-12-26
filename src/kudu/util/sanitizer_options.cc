@@ -16,7 +16,7 @@
 // under the License.
 //
 
-#include "kudu/gutil/macros.h"
+#include "kudu/gutil/macros.h" // IWYU pragma: keep
 
 // Functions returning default options are declared weak in the runtime
 // libraries. To make the linker pick the strong replacements for those
@@ -110,6 +110,9 @@ SANITIZER_HOOK_ATTRIBUTE const char *__tsan_default_suppressions() {
   "race:google::InitVLOG3__\n"
   "race:glog_internal_namespace_::Mutex\n"
   "race:vlocal__\n"
+  // See https://issues.apache.org/jira/browse/KUDU-2212 for details on
+  // the destruction of a locked mutex in glog.
+  "mutex:glog_internal_namespace_::Mutex::~Mutex\n"
 
   // gflags variables are accessed without synchronization, but FlagSaver and other
   // APIs acquire locks when accessing them. This should be safe on x86 for
@@ -185,7 +188,17 @@ SANITIZER_HOOK_ATTRIBUTE const char *__lsan_default_suppressions() {
 
   // False positive from krb5 < 1.12
   // Fixed by upstream commit 379d39c17b8930718e98185a5b32a0f7f3e3b4b6
-  "leak:krb5_authdata_import_attributes\n";
+  "leak:krb5_authdata_import_attributes\n"
+
+  // KUDU-2653: Memory leak in libgssapi_krb5 [1]. Exists in certain patched
+  // versions of krb5-1.12 (such as krb5 in Debian 8).
+  //
+  // Unfortunately there's no narrower match without resorting to
+  // fast_unwind_on_malloc=0; the best alternative is to match on glob, but that
+  // seems like overkill too.
+  //
+  // 1. http://krbdev.mit.edu/rt/Ticket/Display.html?id=7981
+  "leak:libgssapi_krb5.so.2\n";
 }
 #endif  // LEAK_SANITIZER
 

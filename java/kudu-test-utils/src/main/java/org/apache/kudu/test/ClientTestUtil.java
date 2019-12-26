@@ -17,11 +17,27 @@
 
 package org.apache.kudu.test;
 
+import static org.junit.Assert.assertEquals;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.nio.ByteBuffer;
+import java.sql.Timestamp;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.Lists;
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.ColumnTypeAttributes;
 import org.apache.kudu.Schema;
@@ -41,17 +57,9 @@ import org.apache.kudu.client.KuduTable;
 import org.apache.kudu.client.PartialRow;
 import org.apache.kudu.client.RowResult;
 import org.apache.kudu.client.RowResultIterator;
+import org.apache.kudu.client.Upsert;
+import org.apache.kudu.util.CharUtil;
 import org.apache.kudu.util.DecimalUtil;
-import org.apache.yetus.audience.InterfaceAudience;
-import org.apache.yetus.audience.InterfaceStability;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Utilities useful for cluster testing.
@@ -87,7 +95,9 @@ public abstract class ClientTestUtil {
     Callback<Object, RowResultIterator> cb = new Callback<Object, RowResultIterator>() {
       @Override
       public Object call(RowResultIterator arg) throws Exception {
-        if (arg == null) return null;
+        if (arg == null) {
+          return null;
+        }
         counter.addAndGet(arg.getNumRows());
         return null;
       }
@@ -123,13 +133,14 @@ public abstract class ClientTestUtil {
    * @param predicates optional predicates to apply to the scan
    * @return the number of rows in the table matching the predicates
    */
-  public static long countRowsInTable(KuduTable table, KuduPredicate... predicates) throws KuduException {
+  public static long countRowsInTable(KuduTable table, KuduPredicate... predicates)
+      throws KuduException {
     KuduScanner.KuduScannerBuilder scanBuilder =
         table.getAsyncClient().syncClient().newScannerBuilder(table);
     for (KuduPredicate predicate : predicates) {
       scanBuilder.addPredicate(predicate);
     }
-    scanBuilder.setProjectedColumnIndexes(ImmutableList.<Integer>of());
+    scanBuilder.setProjectedColumnIndexes(ImmutableList.of());
     return countRowsInScan(scanBuilder.build());
   }
 
@@ -149,7 +160,8 @@ public abstract class ClientTestUtil {
           try (KuduClient contextClient = new KuduClient.KuduClientBuilder(masterAddresses)
                    .defaultAdminOperationTimeoutMs(operationTimeoutMs)
                    .build()) {
-            KuduScanner scanner = KuduScanToken.deserializeIntoScanner(serializedToken, contextClient);
+            KuduScanner scanner =
+                KuduScanToken.deserializeIntoScanner(serializedToken, contextClient);
             try {
               int localCount = 0;
               while (scanner.hasMoreRows()) {
@@ -164,7 +176,7 @@ public abstract class ClientTestUtil {
           }
         }
       });
-      thread.run();
+      thread.start();
       threads.add(thread);
     }
 
@@ -183,11 +195,8 @@ public abstract class ClientTestUtil {
       scanBuilder.addPredicate(predicate);
     }
     KuduScanner scanner = scanBuilder.build();
-    while (scanner.hasMoreRows()) {
-      RowResultIterator rows = scanner.nextRows();
-      for (RowResult r : rows) {
-        rowStrings.add(r.rowToString());
-      }
+    for (RowResult r : scanner) {
+      rowStrings.add(r.rowToString());
     }
     Collections.sort(rowStrings);
     return rowStrings;
@@ -209,9 +218,35 @@ public abstract class ClientTestUtil {
             new ColumnSchema.ColumnSchemaBuilder("null", Type.STRING).nullable(true).build(),
             new ColumnSchema.ColumnSchemaBuilder("timestamp", Type.UNIXTIME_MICROS).build(),
             new ColumnSchema.ColumnSchemaBuilder("decimal", Type.DECIMAL)
-                .typeAttributes(DecimalUtil.typeAttributes(5, 3)).build());
+              .typeAttributes(DecimalUtil.typeAttributes(5, 3)).build(),
+            new ColumnSchema.ColumnSchemaBuilder("varchar", Type.VARCHAR)
+              .typeAttributes(CharUtil.typeAttributes(10)).build());
 
     return new Schema(columns);
+  }
+
+  public static PartialRow getPartialRowWithAllTypes() {
+    Schema schema = getSchemaWithAllTypes();
+    // Ensure we aren't missing any types
+    assertEquals(14, schema.getColumnCount());
+
+    PartialRow row = schema.newPartialRow();
+    row.addByte("int8", (byte) 42);
+    row.addShort("int16", (short) 43);
+    row.addInt("int32", 44);
+    row.addLong("int64", 45);
+    row.addTimestamp("timestamp", new Timestamp(1234567890));
+    row.addBoolean("bool", true);
+    row.addFloat("float", 52.35F);
+    row.addDouble("double", 53.35);
+    row.addString("string", "fun with ütf\0");
+    row.addVarchar("varchar", "árvíztűrő tükörfúrógép");
+    row.addBinary("binary-array", new byte[] { 0, 1, 2, 3, 4 });
+    ByteBuffer binaryBuffer = ByteBuffer.wrap(new byte[] { 5, 6, 7, 8, 9 });
+    row.addBinary("binary-bytebuffer", binaryBuffer);
+    row.setNull("null");
+    row.addDecimal("decimal", BigDecimal.valueOf(12345, 3));
+    return row;
   }
 
   public static CreateTableOptions getAllTypesCreateTableOptions() {
@@ -250,17 +285,17 @@ public abstract class ClientTestUtil {
     CreateTableOptions option = new CreateTableOptions();
     option.setRangePartitionColumns(ImmutableList.of("key"));
 
-    PartialRow aLowerBound = schema.newPartialRow();
-    aLowerBound.addInt("key", 0);
-    PartialRow aUpperBound = schema.newPartialRow();
-    aUpperBound.addInt("key", 100);
-    option.addRangePartition(aLowerBound, aUpperBound);
+    PartialRow lowerBoundA = schema.newPartialRow();
+    lowerBoundA.addInt("key", 0);
+    PartialRow upperBoundA = schema.newPartialRow();
+    upperBoundA.addInt("key", 100);
+    option.addRangePartition(lowerBoundA, upperBoundA);
 
-    PartialRow bLowerBound = schema.newPartialRow();
-    bLowerBound.addInt("key", 200);
-    PartialRow bUpperBound = schema.newPartialRow();
-    bUpperBound.addInt("key", 300);
-    option.addRangePartition(bLowerBound, bUpperBound);
+    PartialRow lowerBoundB = schema.newPartialRow();
+    lowerBoundB.addInt("key", 200);
+    PartialRow upperBoundB = schema.newPartialRow();
+    upperBoundB.addInt("key", 300);
+    option.addRangePartition(lowerBoundB, upperBoundB);
 
     PartialRow split = schema.newPartialRow();
     split.addInt("key", 50);
@@ -271,7 +306,8 @@ public abstract class ClientTestUtil {
   /**
    * A generic helper function to create a table with default test options.
    */
-  public static KuduTable createDefaultTable(KuduClient client, String tableName) throws KuduException {
+  public static KuduTable createDefaultTable(KuduClient client, String tableName)
+      throws KuduException {
     return client.createTable(tableName, getBasicSchema(), getBasicCreateTableOptions());
   }
 
@@ -288,6 +324,34 @@ public abstract class ClientTestUtil {
     }
     session.flush();
     session.close();
+  }
+
+  public static Upsert createBasicSchemaUpsert(KuduTable table, int key) {
+    Upsert upsert = table.newUpsert();
+    PartialRow row = upsert.getRow();
+    row.addInt(0, key);
+    row.addInt(1, 3);
+    row.addInt(2, 4);
+    row.addString(3, "another string");
+    row.addBoolean(4, false);
+    return upsert;
+  }
+
+  public static Upsert createBasicSchemaUpsertWithDataSize(KuduTable table, int key, int dataSize) {
+    Upsert upsert = table.newUpsert();
+    PartialRow row = upsert.getRow();
+    row.addInt(0, key);
+    row.addInt(1, 3);
+    row.addInt(2, 4);
+
+    StringBuilder builder = new StringBuilder();
+    for (int i = 0; i < dataSize; i++) {
+      builder.append("*");
+    }
+    String val = builder.toString();
+    row.addString(3, val);
+    row.addBoolean(4, false);
+    return upsert;
   }
 
   public static Insert createBasicSchemaInsert(KuduTable table, int key) {
@@ -333,8 +397,48 @@ public abstract class ClientTestUtil {
     return table;
   }
 
+  public static KuduTable createTableWithOneThousandRows(AsyncKuduClient client,
+                                                         String tableName,
+                                                         final int rowDataSize,
+                                                         final long timeoutMs)
+      throws Exception {
+    final int[] KEYS = new int[] { 250, 500, 750 };
+    final Schema basicSchema = getBasicSchema();
+    CreateTableOptions builder = getBasicCreateTableOptions();
+    for (int i : KEYS) {
+      PartialRow splitRow = basicSchema.newPartialRow();
+      splitRow.addInt(0, i);
+      builder.addSplitRow(splitRow);
+    }
+    KuduTable table = client.syncClient().createTable(tableName, basicSchema, builder);
+    AsyncKuduSession session = client.newSession();
+
+    // create a table with on 4 tablets of 250 rows each
+    for (int key = 0; key < 1000; key++) {
+      Upsert upsert = createBasicSchemaUpsertWithDataSize(table, key, rowDataSize);
+      session.apply(upsert).join(timeoutMs);
+    }
+    session.close().join(timeoutMs);
+    return table;
+  }
+
+  public static Schema createManyVarcharsSchema() {
+    ArrayList<ColumnSchema> columns = new ArrayList<>();
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.VARCHAR)
+                  .typeAttributes(CharUtil.typeAttributes(10)).key(true).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.VARCHAR)
+                  .typeAttributes(CharUtil.typeAttributes(10)).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("c2", Type.VARCHAR)
+                  .typeAttributes(CharUtil.typeAttributes(10)).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("c3", Type.VARCHAR)
+                  .typeAttributes(CharUtil.typeAttributes(10)).nullable(true).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("c4", Type.VARCHAR)
+                  .typeAttributes(CharUtil.typeAttributes(10)).nullable(true).build());
+    return new Schema(columns);
+  }
+
   public static Schema createManyStringsSchema() {
-    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>(4);
+    ArrayList<ColumnSchema> columns = new ArrayList<>(4);
     columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.STRING).key(true).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.STRING).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("c2", Type.STRING).build());
@@ -344,7 +448,7 @@ public abstract class ClientTestUtil {
   }
 
   public static Schema createSchemaWithBinaryColumns() {
-    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>();
+    ArrayList<ColumnSchema> columns = new ArrayList<>();
     columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.BINARY).key(true).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.STRING).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("c2", Type.DOUBLE).build());
@@ -353,14 +457,16 @@ public abstract class ClientTestUtil {
   }
 
   public static Schema createSchemaWithTimestampColumns() {
-    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>();
-    columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.UNIXTIME_MICROS).key(true).build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.UNIXTIME_MICROS).nullable(true).build());
+    ArrayList<ColumnSchema> columns = new ArrayList<>();
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.UNIXTIME_MICROS)
+        .key(true).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.UNIXTIME_MICROS)
+        .nullable(true).build());
     return new Schema(columns);
   }
 
   public static Schema createSchemaWithDecimalColumns() {
-    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>();
+    ArrayList<ColumnSchema> columns = new ArrayList<>();
     columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.DECIMAL).key(true)
         .typeAttributes(
             new ColumnTypeAttributes.ColumnTypeAttributesBuilder()

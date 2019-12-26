@@ -44,7 +44,6 @@ import org.apache.kudu.rpc.RpcHeader.RpcFeatureFlag;
 import org.apache.kudu.tserver.Tserver;
 import org.apache.kudu.util.Pair;
 
-
 /**
  * This is a 'stateless' helper to send RPCs to a Kudu server ('stateless' in the sense that it
  * does not keep any state itself besides the references to the {@link AsyncKuduClient} and
@@ -59,6 +58,9 @@ import org.apache.kudu.util.Pair;
 class RpcProxy {
 
   private static final Logger LOG = LoggerFactory.getLogger(RpcProxy.class);
+
+  private static int staticNumFail = 0;
+  private static Exception staticException = null;
 
   /** The reference to the top-level Kudu client object. */
   @Nonnull
@@ -77,6 +79,18 @@ class RpcProxy {
   RpcProxy(AsyncKuduClient client, Connection connection) {
     this.client = Preconditions.checkNotNull(client);
     this.connection = Preconditions.checkNotNull(connection);
+  }
+
+  /**
+   * Fails the next numFail RPCs by throwing the passed exception.
+   * @param numFail the number of RPCs to fail
+   * @param exception the exception to throw when failing an rpc
+   */
+  @InterfaceAudience.LimitedPrivate("Test")
+  static void failNextRpcs(int numFail, Exception exception) {
+    Preconditions.checkNotNull(exception);
+    staticNumFail = numFail;
+    staticException = exception;
   }
 
   /**
@@ -101,6 +115,12 @@ class RpcProxy {
                           final Connection connection,
                           final KuduRpc<R> rpc) {
     try {
+      // Throw an exception to enable testing failures. See `failNextRpcs`.
+      if (staticNumFail > 0) {
+        staticNumFail--;
+        LOG.warn("Forcing a failure on sendRpc: " + rpc);
+        throw staticException;
+      }
       if (!rpc.getRequiredFeatures().isEmpty()) {
         // An extra optimization: when the peer's features are already known, check that the server
         // supports feature flags, if those are required.
@@ -120,9 +140,6 @@ class RpcProxy {
               .serverInfo(connection.getServerInfo())
               .build());
 
-      if (!rpc.deadlineTracker.hasDeadline()) {
-        LOG.warn("{} sending RPC with no timeout {}", connection.getLogPrefix(), rpc);
-      }
       connection.enqueueMessage(rpcToMessage(client, rpc),
           new Callback<Void, Connection.CallResponseInfo>() {
             @Override
@@ -163,12 +180,17 @@ class RpcProxy {
             RpcHeader.RemoteMethodPB.newBuilder()
                 .setServiceName(rpc.serviceName())
                 .setMethodName(rpc.method()));
-    final Message reqPB = rpc.createRequestPB();
-
-    if (rpc.deadlineTracker.hasDeadline()) {
-      headerBuilder.setTimeoutMillis((int) rpc.deadlineTracker.getMillisBeforeDeadline());
+    // Before we create the request, get an authz token if needed. This is done
+    // regardless of whether the KuduRpc object already has a token; we may be
+    // a retrying due to an invalid token and the client may have a new token.
+    if (rpc.needsAuthzToken()) {
+      rpc.bindAuthzToken(client.getAuthzToken(rpc.getTable().getTableId()));
     }
-
+    final Message reqPB = rpc.createRequestPB();
+    // TODO(wdberkeley): We should enforce that every RPC has a timeout.
+    if (rpc.timeoutTracker.hasTimeout()) {
+      headerBuilder.setTimeoutMillis((int) rpc.timeoutTracker.getMillisBeforeTimeout());
+    }
     if (rpc.isRequestTracked()) {
       RpcHeader.RequestIdPB.Builder requestIdBuilder = RpcHeader.RequestIdPB.newBuilder();
       final RequestTracker requestTracker = client.getRequestTracker();
@@ -208,7 +230,11 @@ class RpcProxy {
             connection.getServerInfo());
     if (ex != null) {
       if (ex instanceof InvalidAuthnTokenException) {
-        client.handleInvalidToken(rpc);
+        client.handleInvalidAuthnToken(rpc);
+        return;
+      }
+      if (ex instanceof InvalidAuthzTokenException) {
+        client.handleInvalidAuthzToken(rpc, ex);
         return;
       }
       if (ex instanceof RecoverableException) {
@@ -381,11 +407,21 @@ class RpcProxy {
         .build());
 
     RemoteTablet tablet = rpc.getTablet();
-    // Note As of the time of writing (03/11/16), a null tablet doesn't make sense, if we see a null
-    // tablet it's because we didn't set it properly before calling sendRpc().
+    // Note: As of the time of writing (03/11/16), a null tablet doesn't make sense, if we see a
+    // null tablet it's because we didn't set it properly before calling sendRpc().
     if (tablet == null) {  // Can't retry, dunno where this RPC should go.
       rpc.errback(exception);
+      return;
+    }
+    if (exception instanceof InvalidAuthnTokenException) {
+      client.handleInvalidAuthnToken(rpc);
+    } else if (exception instanceof InvalidAuthzTokenException) {
+      client.handleInvalidAuthzToken(rpc, exception);
+    } else if (exception.getStatus().isServiceUnavailable()) {
+      client.handleRetryableError(rpc, exception);
     } else {
+      // If we don't really know anything about the exception, invalidate the location for the
+      // tablet, opening the possibility of retrying on a different server.
       client.handleTabletNotFound(rpc, exception, connection.getServerInfo());
     }
   }

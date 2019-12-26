@@ -14,13 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_MASTER_MASTER_SERVICE_H
-#define KUDU_MASTER_MASTER_SERVICE_H
+
+#pragma once
 
 #include <cstdint>
 
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/port.h"
 #include "kudu/master/master.service.h"
 
 namespace google {
@@ -39,6 +38,8 @@ namespace master {
 
 class AlterTableRequestPB;
 class AlterTableResponsePB;
+class ChangeTServerStateRequestPB;
+class ChangeTServerStateResponsePB;
 class ConnectToMasterRequestPB;
 class ConnectToMasterResponsePB;
 class CreateTableRequestPB;
@@ -51,6 +52,8 @@ class GetTableLocationsRequestPB;
 class GetTableLocationsResponsePB;
 class GetTableSchemaRequestPB;
 class GetTableSchemaResponsePB;
+class GetTableStatisticsRequestPB;
+class GetTableStatisticsResponsePB;
 class GetTabletLocationsRequestPB;
 class GetTabletLocationsResponsePB;
 class IsAlterTableDoneRequestPB;
@@ -68,6 +71,8 @@ class PingRequestPB;
 class PingResponsePB;
 class ReplaceTabletRequestPB;
 class ReplaceTabletResponsePB;
+class ResetAuthzCacheRequestPB;
+class ResetAuthzCacheResponsePB;
 class TSHeartbeatRequestPB;
 class TSHeartbeatResponsePB;
 
@@ -95,61 +100,81 @@ class MasterServiceImpl : public MasterServiceIf {
                           google::protobuf::Message* resp,
                           rpc::RpcContext* context) override;
 
-  virtual void Ping(const PingRequestPB* req,
-                    PingResponsePB* resp,
-                    rpc::RpcContext* rpc) OVERRIDE;
+  void ChangeTServerState(const ChangeTServerStateRequestPB* req,
+                          ChangeTServerStateResponsePB* resp,
+                          rpc::RpcContext* rpc) override;
 
-  virtual void TSHeartbeat(const TSHeartbeatRequestPB* req,
-                           TSHeartbeatResponsePB* resp,
-                           rpc::RpcContext* rpc) OVERRIDE;
+  void Ping(const PingRequestPB* req,
+            PingResponsePB* resp,
+            rpc::RpcContext* rpc) override;
 
-  virtual void GetTabletLocations(const GetTabletLocationsRequestPB* req,
-                                  GetTabletLocationsResponsePB* resp,
-                                  rpc::RpcContext* rpc) OVERRIDE;
+  void TSHeartbeat(const TSHeartbeatRequestPB* req,
+                   TSHeartbeatResponsePB* resp,
+                   rpc::RpcContext* rpc) override;
 
-  virtual void CreateTable(const CreateTableRequestPB* req,
-                           CreateTableResponsePB* resp,
-                           rpc::RpcContext* rpc) OVERRIDE;
-  virtual void IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
-                                 IsCreateTableDoneResponsePB* resp,
-                                 rpc::RpcContext* rpc) OVERRIDE;
-  virtual void DeleteTable(const DeleteTableRequestPB* req,
-                           DeleteTableResponsePB* resp,
-                           rpc::RpcContext* rpc) OVERRIDE;
-  virtual void AlterTable(const AlterTableRequestPB* req,
-                           AlterTableResponsePB* resp,
-                           rpc::RpcContext* rpc) OVERRIDE;
-  virtual void IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
-                                IsAlterTableDoneResponsePB* resp,
-                                rpc::RpcContext* rpc) OVERRIDE;
-  virtual void ListTables(const ListTablesRequestPB* req,
-                          ListTablesResponsePB* resp,
-                          rpc::RpcContext* rpc) OVERRIDE;
-  virtual void GetTableLocations(const GetTableLocationsRequestPB* req,
-                                 GetTableLocationsResponsePB* resp,
-                                 rpc::RpcContext* rpc) OVERRIDE;
-  virtual void GetTableSchema(const GetTableSchemaRequestPB* req,
-                              GetTableSchemaResponsePB* resp,
-                              rpc::RpcContext* rpc) OVERRIDE;
-  virtual void ListTabletServers(const ListTabletServersRequestPB* req,
-                                 ListTabletServersResponsePB* resp,
-                                 rpc::RpcContext* rpc) OVERRIDE;
+  void GetTabletLocations(const GetTabletLocationsRequestPB* req,
+                          GetTabletLocationsResponsePB* resp,
+                          rpc::RpcContext* rpc) override;
 
-  virtual void ListMasters(const ListMastersRequestPB* req,
-                           ListMastersResponsePB* resp,
-                           rpc::RpcContext* rpc) OVERRIDE;
+  void CreateTable(const CreateTableRequestPB* req,
+                   CreateTableResponsePB* resp,
+                   rpc::RpcContext* rpc) override;
 
-  virtual void GetMasterRegistration(const GetMasterRegistrationRequestPB* req,
-                                     GetMasterRegistrationResponsePB* resp,
-                                     rpc::RpcContext* rpc) OVERRIDE;
+  void IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
+                         IsCreateTableDoneResponsePB* resp,
+                         rpc::RpcContext* rpc) override;
 
-  virtual void ConnectToMaster(const ConnectToMasterRequestPB* req,
-                               ConnectToMasterResponsePB* resp,
-                               rpc::RpcContext* rpc) OVERRIDE;
+  void DeleteTable(const DeleteTableRequestPB* req,
+                   DeleteTableResponsePB* resp,
+                   rpc::RpcContext* rpc) override;
 
-  virtual void ReplaceTablet(const ReplaceTabletRequestPB* req,
-                             ReplaceTabletResponsePB* resp,
-                             rpc::RpcContext* rpc) OVERRIDE;
+  void AlterTable(const AlterTableRequestPB* req,
+                  AlterTableResponsePB* resp,
+                  rpc::RpcContext* rpc) override;
+
+  void IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
+                        IsAlterTableDoneResponsePB* resp,
+                        rpc::RpcContext* rpc) override;
+
+  void ListTables(const ListTablesRequestPB* req,
+                  ListTablesResponsePB* resp,
+                  rpc::RpcContext* rpc) override;
+
+  void GetTableStatistics(const GetTableStatisticsRequestPB* req,
+                          GetTableStatisticsResponsePB* resp,
+                          rpc::RpcContext* rpc) override;
+
+  void GetTableLocations(const GetTableLocationsRequestPB* req,
+                         GetTableLocationsResponsePB* resp,
+                         rpc::RpcContext* rpc) override;
+
+  void GetTableSchema(const GetTableSchemaRequestPB* req,
+                      GetTableSchemaResponsePB* resp,
+                      rpc::RpcContext* rpc) override;
+
+  void ListTabletServers(const ListTabletServersRequestPB* req,
+                         ListTabletServersResponsePB* resp,
+                         rpc::RpcContext* rpc) override;
+
+  void ListMasters(const ListMastersRequestPB* req,
+                   ListMastersResponsePB* resp,
+                   rpc::RpcContext* rpc) override;
+
+  void GetMasterRegistration(const GetMasterRegistrationRequestPB* req,
+                             GetMasterRegistrationResponsePB* resp,
+                             rpc::RpcContext* rpc) override;
+
+  void ConnectToMaster(const ConnectToMasterRequestPB* req,
+                       ConnectToMasterResponsePB* resp,
+                       rpc::RpcContext* rpc) override;
+
+  void ReplaceTablet(const ReplaceTabletRequestPB* req,
+                     ReplaceTabletResponsePB* resp,
+                     rpc::RpcContext* rpc) override;
+
+  void ResetAuthzCache(const ResetAuthzCacheRequestPB* req,
+                       ResetAuthzCacheResponsePB* resp,
+                       rpc::RpcContext* rpc) override;
 
   bool SupportsFeature(uint32_t feature) const override;
 
@@ -161,5 +186,3 @@ class MasterServiceImpl : public MasterServiceIf {
 
 } // namespace master
 } // namespace kudu
-
-#endif

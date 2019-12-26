@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
 import static org.junit.Assert.assertEquals;
@@ -23,11 +24,11 @@ import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertTrue;
 
 import com.stumbleupon.async.Deferred;
-import org.apache.kudu.test.cluster.MiniKuduCluster;
-import org.apache.kudu.test.junit.RetryRule;
 import org.junit.Rule;
 import org.junit.Test;
 
+import org.apache.kudu.test.cluster.MiniKuduCluster;
+import org.apache.kudu.test.junit.RetryRule;
 import org.apache.kudu.util.NetUtil;
 
 public class TestConnectionCache {
@@ -37,20 +38,21 @@ public class TestConnectionCache {
 
   @Test(timeout = 50000)
   public void test() throws Exception {
-    MiniKuduCluster cluster = null;
-    try {
-      cluster = new MiniKuduCluster.MiniKuduClusterBuilder().numMasterServers(3).build();
-
-      final AsyncKuduClient client =
-          new AsyncKuduClient.AsyncKuduClientBuilder(cluster.getMasterAddressesAsString()).build();
+    try (MiniKuduCluster cluster = new MiniKuduCluster.MiniKuduClusterBuilder()
+                                                      .numMasterServers(3)
+                                                      .build();
+         AsyncKuduClient client = new AsyncKuduClient.AsyncKuduClientBuilder(
+             cluster.getMasterAddressesAsString()).build()) {
       // Below we ping the masters directly using RpcProxy, so if they aren't ready to process
       // RPCs we'll get an error. Here by listing the tables we make sure this won't happen since
       // it won't return until a master leader is found.
       client.getTablesList().join();
 
       HostAndPort masterHostPort = cluster.getMasterServers().get(0);
-      ServerInfo firstMaster = new ServerInfo("fake-uuid", masterHostPort,
-          NetUtil.getInetAddress(masterHostPort.getHost()));
+      ServerInfo firstMaster = new ServerInfo("fake-uuid",
+                                              masterHostPort,
+                                              NetUtil.getInetAddress(masterHostPort.getHost()),
+                                              /*location=*/"");
 
       // 3 masters in the cluster. Connections should have been cached since we forced
       // a cluster connection above.
@@ -92,10 +94,6 @@ public class TestConnectionCache {
         waitForConnectionToTerminate(c);
       }
       assertTrue(allConnectionsTerminated(client));
-    } finally {
-      if (cluster != null) {
-        cluster.shutdown();
-      }
     }
   }
 
@@ -109,9 +107,9 @@ public class TestConnectionCache {
   }
 
   private void waitForConnectionToTerminate(Connection c) throws InterruptedException {
-    DeadlineTracker deadlineTracker = new DeadlineTracker();
-    deadlineTracker.setDeadline(5000);
-    while (!c.isTerminated() && !deadlineTracker.timedOut()) {
+    TimeoutTracker timeoutTracker = new TimeoutTracker();
+    timeoutTracker.setTimeout(5000);
+    while (!c.isTerminated() && !timeoutTracker.timedOut()) {
       Thread.sleep(250);
     }
   }
@@ -120,6 +118,6 @@ public class TestConnectionCache {
     PingRequest ping = PingRequest.makeMasterPingRequest();
     Deferred<PingResponse> d = ping.getDeferred();
     proxy.sendRpc(ping);
-    d.join();
+    d.join(10000);
   }
 }

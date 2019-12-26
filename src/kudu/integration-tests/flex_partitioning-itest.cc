@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -43,11 +44,11 @@
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
+#include "kudu/integration-tests/data_gen_util.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/rpc/rpc_controller.h"
-#include "kudu/tools/data_gen_util.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/random.h"
 #include "kudu/util/random_util.h"
@@ -56,8 +57,8 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+using boost::none;
 using kudu::client::KuduClient;
-using kudu::client::KuduClientBuilder;
 using kudu::client::KuduColumnSchema;
 using kudu::client::KuduInsert;
 using kudu::client::KuduPredicate;
@@ -227,7 +228,10 @@ class FlexPartitioningITest : public KuduTest,
     }
 
     table_creator->set_range_partition_columns(range_partition.columns);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     table_creator->split_rows(split_rows);
+#pragma GCC diagnostic pop
 
     for (const auto& bound : range_partition.bounds) {
       KuduPartialRow* lower = schema.NewRow();
@@ -336,7 +340,7 @@ Status FlexPartitioningITest::InsertRows(const RangePartitionOptions& range_part
   for (const auto& bound : bounds) {
     for (int32_t i = bound.first[0]; i < bound.second[0]; i++) {
       gscoped_ptr<KuduInsert> insert(table_->NewInsert());
-      tools::GenerateDataForRow(table_->schema(), i, &random_, insert->mutable_row());
+      GenerateDataForRow(table_->schema(), i, &random_, insert->mutable_row());
       inserted_rows_.emplace_back(new KuduPartialRow(*insert->mutable_row()));
       RETURN_NOT_OK(session->Apply(insert.release()));
       count++;
@@ -429,6 +433,7 @@ void FlexPartitioningITest::CheckPartitionKeyRangeScan() {
                               table_->name(),
                               MonoDelta::FromSeconds(32),
                               master::VOTER_REPLICA,
+                              /*table_id=*/none,
                               &table_locations));
 
   vector<string> rows;
@@ -463,6 +468,7 @@ void FlexPartitioningITest::CheckPartitionKeyRangeScanWithPKRange(int lower, int
                               table_->name(),
                               MonoDelta::FromSeconds(32),
                               master::VOTER_REPLICA,
+                              /*table_id=*/none,
                               &table_locations));
   vector<string> rows;
 
@@ -499,9 +505,9 @@ void FlexPartitioningITest::InsertAndVerifyScans(const RangePartitionOptions& ra
   // First, ensure that we get back the same number we put in.
   {
     vector<string> rows;
-    ScanTableToStrings(table_.get(), &rows);
-    std::sort(rows.begin(), rows.end());
+    ASSERT_OK(ScanTableToStrings(table_.get(), &rows));
     ASSERT_EQ(row_count, rows.size());
+    std::sort(rows.begin(), rows.end());
   }
 
   // Perform some scans with predicates.

@@ -45,7 +45,6 @@
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/dynamic_annotations.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
@@ -89,7 +88,7 @@ using strings::Substitute;
 ////////////////////////////////////////////////////////////
 
 static Status OpenReader(FsManager* fs,
-                         shared_ptr<MemTracker> parent_mem_tracker,
+                         shared_ptr<MemTracker> cfile_reader_tracker,
                          const BlockId& block_id,
                          const IOContext* io_context,
                          unique_ptr<CFileReader>* new_reader) {
@@ -97,7 +96,7 @@ static Status OpenReader(FsManager* fs,
   RETURN_NOT_OK(fs->OpenBlock(block_id, &block));
 
   ReaderOptions opts;
-  opts.parent_mem_tracker = std::move(parent_mem_tracker);
+  opts.parent_mem_tracker = std::move(cfile_reader_tracker);
   opts.io_context = io_context;
   return CFileReader::OpenNoInit(std::move(block),
                                  std::move(opts),
@@ -109,20 +108,24 @@ static Status OpenReader(FsManager* fs,
 ////////////////////////////////////////////////////////////
 
 CFileSet::CFileSet(shared_ptr<RowSetMetadata> rowset_metadata,
-                   shared_ptr<MemTracker> parent_mem_tracker)
+                   shared_ptr<MemTracker> bloomfile_tracker,
+                   shared_ptr<MemTracker> cfile_reader_tracker)
     : rowset_metadata_(std::move(rowset_metadata)),
-      parent_mem_tracker_(std::move(parent_mem_tracker)) {
+      bloomfile_tracker_(std::move(bloomfile_tracker)),
+      cfile_reader_tracker_(std::move(cfile_reader_tracker)) {
 }
 
 CFileSet::~CFileSet() {
 }
 
 Status CFileSet::Open(shared_ptr<RowSetMetadata> rowset_metadata,
-                      shared_ptr<MemTracker> parent_mem_tracker,
+                      shared_ptr<MemTracker> bloomfile_tracker,
+                      shared_ptr<MemTracker> cfile_reader_tracker,
                       const IOContext* io_context,
                       shared_ptr<CFileSet>* cfile_set) {
   shared_ptr<CFileSet> cfs(new CFileSet(std::move(rowset_metadata),
-                                        std::move(parent_mem_tracker)));
+                                        std::move(bloomfile_tracker),
+                                        std::move(cfile_reader_tracker)));
   RETURN_NOT_OK(cfs->DoOpen(io_context));
 
   cfile_set->swap(cfs);
@@ -141,7 +144,7 @@ Status CFileSet::DoOpen(const IOContext* io_context) {
 
     unique_ptr<CFileReader> reader;
     RETURN_NOT_OK(OpenReader(rowset_metadata_->fs_manager(),
-                             parent_mem_tracker_,
+                             cfile_reader_tracker_,
                              rowset_metadata_->column_data_block_for_col_id(col_id),
                              io_context,
                              &reader));
@@ -153,7 +156,7 @@ Status CFileSet::DoOpen(const IOContext* io_context) {
 
   if (rowset_metadata_->has_adhoc_index_block()) {
     RETURN_NOT_OK(OpenReader(rowset_metadata_->fs_manager(),
-                             parent_mem_tracker_,
+                             cfile_reader_tracker_,
                              rowset_metadata_->adhoc_index_block(),
                              io_context,
                              &ad_hoc_idx_reader_));
@@ -184,8 +187,8 @@ Status CFileSet::OpenBloomReader(const IOContext* io_context) {
   RETURN_NOT_OK(fs->OpenBlock(rowset_metadata_->bloom_block(), &block));
 
   ReaderOptions opts;
-  opts.parent_mem_tracker = parent_mem_tracker_;
   opts.io_context = io_context;
+  opts.parent_mem_tracker = bloomfile_tracker_;
   Status s = BloomFileReader::OpenNoInit(std::move(block),
                                          std::move(opts),
                                          &bloom_reader_);
@@ -221,15 +224,19 @@ CFileReader* CFileSet::key_index_reader() const {
   return FindOrDie(readers_by_col_id_, key_col_id).get();
 }
 
-Status CFileSet::NewColumnIterator(ColumnId col_id, CFileReader::CacheControl cache_blocks,
-                                   const fs::IOContext* io_context, CFileIterator **iter) const {
+Status CFileSet::NewColumnIterator(ColumnId col_id,
+                                   CFileReader::CacheControl cache_blocks,
+                                   const fs::IOContext* io_context,
+                                   unique_ptr<CFileIterator>* iter) const {
   return FindOrDie(readers_by_col_id_, col_id)->NewIterator(iter, cache_blocks,
                                                             io_context);
 }
 
-CFileSet::Iterator* CFileSet::NewIterator(const Schema* projection,
-                                          const IOContext* io_context) const {
-  return new CFileSet::Iterator(shared_from_this(), projection, io_context);
+unique_ptr<CFileSet::Iterator> CFileSet::NewIterator(
+    const Schema* projection,
+    const IOContext* io_context) const {
+  return unique_ptr<CFileSet::Iterator>(
+      new CFileSet::Iterator(shared_from_this(), projection, io_context));
 }
 
 Status CFileSet::CountRows(const IOContext* io_context, rowid_t *count) const {
@@ -297,10 +304,8 @@ Status CFileSet::FindRow(const RowSetKeyProbe &probe,
   }
 
   stats->keys_consulted++;
-  CFileIterator *key_iter = nullptr;
+  unique_ptr<CFileIterator> key_iter;
   RETURN_NOT_OK(NewKeyIterator(io_context, &key_iter));
-
-  unique_ptr<CFileIterator> key_iter_scoped(key_iter); // free on return
 
   bool exact;
   Status s = key_iter->SeekAtOrAfter(probe.encoded_key(), &exact);
@@ -320,12 +325,17 @@ Status CFileSet::CheckRowPresent(const RowSetKeyProbe& probe, const IOContext* i
   RETURN_NOT_OK(FindRow(probe, io_context, &opt_rowid, stats));
   *present = opt_rowid != boost::none;
   if (*present) {
+  // Suppress false positive about 'opt_rowid' used when uninitialized.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
     *rowid = *opt_rowid;
+#pragma GCC diagnostic pop
   }
   return Status::OK();
 }
 
-Status CFileSet::NewKeyIterator(const IOContext* io_context, CFileIterator** key_iter) const {
+Status CFileSet::NewKeyIterator(const IOContext* io_context,
+                                unique_ptr<CFileIterator>* key_iter) const {
   RETURN_NOT_OK(key_index_reader()->Init(io_context));
   return key_index_reader()->NewIterator(key_iter, CFileReader::CACHE_BLOCK, io_context);
 }
@@ -364,14 +374,15 @@ Status CFileSet::Iterator::CreateColumnIterators(const ScanSpec* spec) {
                                                             col_schema.read_default_value()));
       continue;
     }
-    CFileIterator *iter;
+    unique_ptr<CFileIterator> iter;
     RETURN_NOT_OK_PREPEND(base_data_->NewColumnIterator(col_id, cache_blocks, io_context_, &iter),
                           Substitute("could not create iterator for column $0",
                                      projection_->column(proj_col_idx).ToString()));
-    ret_iters.emplace_back(iter);
+    ret_iters.emplace_back(std::move(iter));
   }
 
   col_iters_.swap(ret_iters);
+  prepared_iters_.reserve(col_iters_.size());
   return Status::OK();
 }
 
@@ -380,10 +391,8 @@ Status CFileSet::Iterator::Init(ScanSpec *spec) {
 
   RETURN_NOT_OK(base_data_->CountRows(io_context_, &row_count_));
 
-  // Setup Key Iterator
-  CFileIterator *tmp;
-  RETURN_NOT_OK(base_data_->NewKeyIterator(io_context_, &tmp));
-  key_iter_.reset(tmp);
+  // Setup key iterator.
+  RETURN_NOT_OK(base_data_->NewKeyIterator(io_context_, &key_iter_));
 
   // Setup column iterators.
   RETURN_NOT_OK(CreateColumnIterators(spec));
@@ -463,29 +472,24 @@ Status CFileSet::Iterator::PushdownRangeScanPredicate(ScanSpec *spec) {
 
 void CFileSet::Iterator::Unprepare() {
   prepared_count_ = 0;
-  cols_prepared_.assign(col_iters_.size(), false);
+  prepared_iters_.clear();
 }
 
-Status CFileSet::Iterator::PrepareBatch(size_t *n) {
+Status CFileSet::Iterator::PrepareBatch(size_t *nrows) {
   DCHECK_EQ(prepared_count_, 0) << "Already prepared";
 
   size_t remaining = upper_bound_idx_ - cur_idx_;
-  if (*n > remaining) {
-    *n = remaining;
+  if (*nrows > remaining) {
+    *nrows = remaining;
   }
 
-  prepared_count_ = *n;
+  prepared_count_ = *nrows;
 
   // Lazily prepare the first column when it is materialized.
   return Status::OK();
 }
 
 Status CFileSet::Iterator::PrepareColumn(ColumnMaterializationContext *ctx) {
-  if (cols_prepared_[ctx->col_idx()]) {
-    // Already prepared in this batch.
-    return Status::OK();
-  }
-
   ColumnIterator* col_iter = col_iters_[ctx->col_idx()].get();
   size_t n = prepared_count_;
 
@@ -512,7 +516,7 @@ Status CFileSet::Iterator::PrepareColumn(ColumnMaterializationContext *ctx) {
                          cur_idx_, prepared_count_, n));
   }
 
-  cols_prepared_[ctx->col_idx()] = true;
+  prepared_iters_.emplace_back(col_iter);
 
   return Status::OK();
 }
@@ -535,16 +539,10 @@ Status CFileSet::Iterator::MaterializeColumn(ColumnMaterializationContext *ctx) 
 }
 
 Status CFileSet::Iterator::FinishBatch() {
-  CHECK_GT(prepared_count_, 0);
+  DCHECK_GT(prepared_count_, 0);
 
-  for (size_t i = 0; i < col_iters_.size(); i++) {
-    if (cols_prepared_[i]) {
-      Status s = col_iters_[i]->FinishBatch();
-      if (!s.ok()) {
-        LOG(WARNING) << "Unable to FinishBatch() on column " << i;
-        return s;
-      }
-    }
+  for (ColumnIterator* col_iter : prepared_iters_) {
+    RETURN_NOT_OK(col_iter->FinishBatch());
   }
 
   cur_idx_ += prepared_count_;

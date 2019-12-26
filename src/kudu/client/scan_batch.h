@@ -42,6 +42,7 @@ class Schema;
 
 namespace tools {
 class ReplicaDumper;
+class TableScanner;
 } // namespace tools
 
 namespace client {
@@ -161,6 +162,13 @@ class KUDU_EXPORT KuduScanBatch::RowPtr {
   /// a properly-initialized value.
   RowPtr() : schema_(NULL), row_data_(NULL) {}
 
+  /// Overloaded operator -> to support pointer trait
+  /// for access via const_iterator.
+
+  /// @return Pointer to the row
+  const RowPtr* operator->() const {
+    return this;
+  }
   /// @param [in] col_name
   ///   Name of the column.
   /// @return @c true iff the specified column of the row has @c NULL value.
@@ -170,6 +178,14 @@ class KUDU_EXPORT KuduScanBatch::RowPtr {
   ///   Index of the column.
   /// @return @c true iff the specified column of the row has @c NULL value.
   bool IsNull(int col_idx) const;
+
+  /// Get the value of the IS_DELETED virtual column.
+  ///
+  /// @param [out] val
+  ///   Placeholder for the result value.
+  /// @return Operation result status. Return a bad Status if there is no
+  ///   IS_DELETED virtual column in the schema.
+  Status IsDeleted(bool* val) const WARN_UNUSED_RESULT KUDU_NO_EXPORT;
 
   /// @name Getters for integral type columns by column name.
   ///
@@ -191,7 +207,8 @@ class KUDU_EXPORT KuduScanBatch::RowPtr {
   Status GetInt32(const Slice& col_name, int32_t* val) const WARN_UNUSED_RESULT;
   Status GetInt64(const Slice& col_name, int64_t* val) const WARN_UNUSED_RESULT;
   Status GetUnixTimeMicros(const Slice& col_name, int64_t* micros_since_utc_epoch)
-    const WARN_UNUSED_RESULT;
+      const WARN_UNUSED_RESULT;
+  Status GetDate(const Slice& col_name, int32_t* days_since_unix_epoch) const WARN_UNUSED_RESULT;
 
   Status GetFloat(const Slice& col_name, float* val) const WARN_UNUSED_RESULT;
   Status GetDouble(const Slice& col_name, double* val) const WARN_UNUSED_RESULT;
@@ -226,6 +243,7 @@ class KUDU_EXPORT KuduScanBatch::RowPtr {
   Status GetInt32(int col_idx, int32_t* val) const WARN_UNUSED_RESULT;
   Status GetInt64(int col_idx, int64_t* val) const WARN_UNUSED_RESULT;
   Status GetUnixTimeMicros(int col_idx, int64_t* micros_since_utc_epoch) const WARN_UNUSED_RESULT;
+  Status GetDate(int col_idx, int32_t* days_since_unix_epoch) const WARN_UNUSED_RESULT;
 
   Status GetFloat(int col_idx, float* val) const WARN_UNUSED_RESULT;
   Status GetDouble(int col_idx, double* val) const WARN_UNUSED_RESULT;
@@ -235,9 +253,9 @@ class KUDU_EXPORT KuduScanBatch::RowPtr {
 #endif
   ///@}
 
-  /// @name Getters for string/binary column by column name.
+  /// @name Getters for string/binary/varchar column by column name.
   ///
-  /// Get the string/binary value for a column by its name.
+  /// Get the string/binary/varchar value for a column by its name.
   ///
   /// @param [in] col_name
   ///   Name of the column.
@@ -254,11 +272,12 @@ class KUDU_EXPORT KuduScanBatch::RowPtr {
   ///@{
   Status GetString(const Slice& col_name, Slice* val) const WARN_UNUSED_RESULT;
   Status GetBinary(const Slice& col_name, Slice* val) const WARN_UNUSED_RESULT;
+  Status GetVarchar(const Slice& col_name, Slice* val) const WARN_UNUSED_RESULT;
   ///@}
 
-  /// @name Getters for string/binary column by column index.
+  /// @name Getters for string/binary/varchar column by column index.
   ///
-  /// Get the string/binary value for a column by its index.
+  /// Get the string/binary/varchar value for a column by its index.
   ///
   /// These methods are faster than their name-based counterparts
   /// since using indices avoids a hashmap lookup, so index-based getters
@@ -279,6 +298,7 @@ class KUDU_EXPORT KuduScanBatch::RowPtr {
   ///@{
   Status GetString(int col_idx, Slice* val) const WARN_UNUSED_RESULT;
   Status GetBinary(int col_idx, Slice* val) const WARN_UNUSED_RESULT;
+  Status GetVarchar(int col_idx, Slice* val) const WARN_UNUSED_RESULT;
   ///@}
 
   /// Get the column's row data.
@@ -294,6 +314,7 @@ class KUDU_EXPORT KuduScanBatch::RowPtr {
 
  private:
   friend class KuduScanBatch;
+  friend class tools::TableScanner;
   template<typename KeyTypeWrapper> friend struct SliceKeysTestSetup;
   template<typename KeyTypeWrapper> friend struct IntKeysTestSetup;
 
@@ -321,6 +342,16 @@ class KUDU_EXPORT KuduScanBatch::const_iterator
 
   /// @return The row in the batch the iterator is pointing at.
   KuduScanBatch::RowPtr operator*() const {
+    return batch_->Row(idx_);
+  }
+
+  /// @note Since iterator does not keep current KuduScanBatch::RowPtr,
+  /// we cannot return pointer to it.
+  /// Instead we return KuduScanBatch::RowPtr,
+  /// which implements pointer operator ->
+
+  /// @return The row in the batch the iterator is pointing at.
+  KuduScanBatch::RowPtr operator->() const {
     return batch_->Row(idx_);
   }
 

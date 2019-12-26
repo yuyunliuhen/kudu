@@ -18,6 +18,7 @@
 package org.apache.kudu.client;
 
 import java.util.List;
+import java.util.Map;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
@@ -112,8 +113,8 @@ public class CreateTableOptions {
   }
 
   /**
-   * Add a range partition partition to the table with an inclusive lower bound
-   * and an exclusive upper bound.
+   * Add a range partition to the table with an inclusive lower bound and an
+   * exclusive upper bound.
    *
    * If either row is empty, then that end of the range will be unbounded. If a
    * range column is missing a value, the logical minimum value for that column
@@ -187,6 +188,38 @@ public class CreateTableOptions {
    */
   public CreateTableOptions setNumReplicas(int numReplicas) {
     pb.setNumReplicas(numReplicas);
+    return this;
+  }
+
+  /**
+   * Sets the dimension label for all tablets created at table creation time.
+   *
+   * By default, the master will try to place newly created tablet replicas on tablet
+   * servers with a small number of tablet replicas. If the dimension label is provided,
+   * newly created replicas will be evenly distributed in the cluster based on the dimension
+   * label. In other words, the master will try to place newly created tablet replicas on
+   * tablet servers with a small number of tablet replicas belonging to this dimension label.
+   *
+   * @param dimensionLabel the dimension label for the tablet to be created.
+   * @return this instance
+   */
+  public CreateTableOptions setDimensionLabel(String dimensionLabel) {
+    Preconditions.checkArgument(dimensionLabel != null,
+        "dimension label must not be null");
+    pb.setDimensionLabel(dimensionLabel);
+    return this;
+  }
+
+  /**
+   * Sets the table's extra configuration properties.
+   *
+   * If the value of the kv pair is empty, the property will be ignored.
+   *
+   * @param extraConfig the table's extra configuration properties
+   * @return this instance
+   */
+  public CreateTableOptions setExtraConfigs(Map<String, String> extraConfig) {
+    pb.putAllExtraConfigs(extraConfig);
     return this;
   }
 

@@ -15,19 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/common/row_operations.h"
+
 #include <cstdint>
 #include <cstdlib>
-#include <ostream>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <vector>
 
-#include <gtest/gtest.h>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
+#include <gtest/gtest.h>
 
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
-#include "kudu/common/row_operations.h"
+#include "kudu/common/row.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
 #include "kudu/common/wire_protocol.pb.h"
@@ -35,6 +38,7 @@
 #include "kudu/gutil/dynamic_annotations.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/bitmap.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
@@ -45,7 +49,8 @@ using std::shared_ptr;
 using std::string;
 using std::vector;
 using strings::Substitute;
-using strings::SubstituteAndAppend;
+
+DECLARE_int32(max_cell_size_bytes);
 
 namespace kudu {
 
@@ -100,8 +105,13 @@ void RowOperationsTest::CheckDecodeDoesntCrash(const Schema& client_schema,
                                                const RowOperationsPB& pb) {
   arena_.Reset();
   RowOperationsPBDecoder decoder(&pb, &client_schema, &server_schema, &arena_);
+  // Decoding the operations, regardless of the mode, should not result in a
+  // crash.
   vector<DecodedRowOperation> ops;
-  Status s = decoder.DecodeOperations(&ops);
+  Status s = decoder.DecodeOperations<DecoderMode::WRITE_OPS>(&ops);
+  if (!s.ok()) {
+    s = decoder.DecodeOperations<DecoderMode::SPLIT_ROWS>(&ops);
+  }
   if (s.ok() && !ops.empty()) {
     // If we got an OK result, then we should be able to stringify without
     // crashing. This ensures that any indirect data (eg strings) gets
@@ -357,7 +367,7 @@ string TestProjection(RowOperationsPB::Type type,
   Arena arena(1024);
   vector<DecodedRowOperation> ops;
   RowOperationsPBDecoder dec(&pb, client_row.schema(), &server_schema, &arena);
-  Status s = dec.DecodeOperations(&ops);
+  Status s = dec.DecodeOperations<DecoderMode::WRITE_OPS>(&ops);
 
   if (!s.ok()) {
     return "error: " + s.ToString();
@@ -375,12 +385,32 @@ TEST_F(RowOperationsTest, ProjectionTestWholeSchemaSpecified) {
                          ColumnSchema("int_val", INT32),
                          ColumnSchema("string_val", STRING, true) },
                        1);
+  // Test a row missing 'key', which is key column.
+  {
+    KuduPartialRow client_row(&client_schema);
+    EXPECT_EQ("row error: Invalid argument: No value provided for required column: "
+              "key INT32 NOT NULL",
+              TestProjection(RowOperationsPB::INSERT, client_row, schema_));
+  }
+
+  // Force to set null on key column.
+  {
+    int col_idx;
+    ASSERT_OK(client_schema.FindColumn("key", &col_idx));
+    KuduPartialRow client_row(&client_schema);
+    ContiguousRow row(&client_schema, client_row.row_data_);
+    row.set_null(col_idx, true);
+    BitmapSet(client_row.isset_bitmap_, col_idx);
+    EXPECT_EQ("row error: Invalid argument: NULL values not allowed for non-nullable column: "
+              "key INT32 NOT NULL",
+              TestProjection(RowOperationsPB::INSERT, client_row, schema_));
+  }
 
   // Test a row missing 'int_val', which is required.
   {
     KuduPartialRow client_row(&client_schema);
     CHECK_OK(client_row.SetInt32("key", 12345));
-    EXPECT_EQ("error: Invalid argument: No value provided for required column: "
+    EXPECT_EQ("row error: Invalid argument: No value provided for required column: "
               "int_val INT32 NOT NULL",
               TestProjection(RowOperationsPB::INSERT, client_row, schema_));
   }
@@ -463,6 +493,19 @@ TEST_F(RowOperationsTest, ProjectionTestWithDefaults) {
               " int32 non_null_with_default=54321)",
               TestProjection(RowOperationsPB::INSERT, client_row, server_schema));
   }
+
+  // Specify the key and override both defaults, overriding the non-nullable
+  // one to NULL.
+  {
+    KuduPartialRow client_row(&client_schema);
+    CHECK_OK(client_row.SetInt32("key", 12345));
+    CHECK_OK(client_row.SetInt32("nullable_with_default", 12345));
+    Status s = client_row.SetNull("non_null_with_default");
+    CHECK(s.IsInvalidArgument());
+    EXPECT_EQ("INSERT (int32 key=12345, int32 nullable_with_default=12345,"
+              " int32 non_null_with_default=456)",
+              TestProjection(RowOperationsPB::INSERT, client_row, server_schema));
+  }
 }
 
 // Test cases where the client only has a subset of the fields
@@ -486,7 +529,7 @@ TEST_F(RowOperationsTest, ProjectionTestWithClientHavingValidSubset) {
   {
     KuduPartialRow client_row(&client_schema);
     CHECK_OK(client_row.SetInt32("key", 12345));
-    EXPECT_EQ("error: Invalid argument: No value provided for required column:"
+    EXPECT_EQ("row error: Invalid argument: No value provided for required column:"
               " int_val INT32 NOT NULL",
               TestProjection(RowOperationsPB::INSERT, client_row, server_schema));
   }
@@ -533,14 +576,13 @@ TEST_F(RowOperationsTest, TestProjectUpdates) {
 
   // Check without specifying any columns
   KuduPartialRow client_row(&client_schema);
-  EXPECT_EQ("error: Invalid argument: No value provided for key column: key INT32 NOT NULL",
+  EXPECT_EQ("row error: Invalid argument: No value provided for key column: key INT32 NOT NULL",
             TestProjection(RowOperationsPB::UPDATE, client_row, server_schema));
 
   // Specify the key and no columns to update
   ASSERT_OK(client_row.SetInt32("key", 12345));
-  EXPECT_EQ("error: Invalid argument: No fields updated, key is: (int32 key=12345)",
+  EXPECT_EQ("row error: Invalid argument: No fields updated, key is: (int32 key=12345)",
             TestProjection(RowOperationsPB::UPDATE, client_row, server_schema));
-
 
   // Specify the key and update one column.
   ASSERT_OK(client_row.SetInt32("int_val", 12345));
@@ -556,6 +598,33 @@ TEST_F(RowOperationsTest, TestProjectUpdates) {
   ASSERT_OK(client_row.SetNull("string_val"));
   EXPECT_EQ("MUTATE (int32 key=12345) SET int_val=12345, string_val=NULL",
             TestProjection(RowOperationsPB::UPDATE, client_row, server_schema));
+
+  // Force to set null on key column.
+  {
+    KuduPartialRow client_row(&client_schema);
+    int col_idx;
+    ASSERT_OK(client_schema.FindColumn("key", &col_idx));
+    ContiguousRow row(&client_schema, client_row.row_data_);
+    row.set_null(col_idx, true);
+    BitmapSet(client_row.isset_bitmap_, col_idx);
+    EXPECT_EQ("row error: Invalid argument: NULL values not allowed for key column: "
+              "key INT32 NOT NULL",
+              TestProjection(RowOperationsPB::UPDATE, client_row, server_schema));
+  }
+
+  // Force to set null on non-nullable column.
+  {
+    KuduPartialRow client_row(&client_schema);
+    ASSERT_OK(client_row.SetInt32("key", 12345));
+    int col_idx;
+    ASSERT_OK(client_schema.FindColumn("int_val", &col_idx));
+    ContiguousRow row(&client_schema, client_row.row_data_);
+    row.set_null(col_idx, true);
+    BitmapSet(client_row.isset_bitmap_, col_idx);
+    EXPECT_EQ("row error: Invalid argument: NULL value not allowed for non-nullable column: "
+              "int_val INT32 NOT NULL",
+              TestProjection(RowOperationsPB::UPDATE, client_row, server_schema));
+  }
 }
 
 // Client schema has the columns in a different order. Makes
@@ -617,18 +686,19 @@ TEST_F(RowOperationsTest, TestClientMismatchedType) {
 TEST_F(RowOperationsTest, TestProjectDeletes) {
   Schema client_schema({ ColumnSchema("key", INT32),
                          ColumnSchema("key_2", INT32),
+                         ColumnSchema("int_val", INT32),
                          ColumnSchema("string_val", STRING, true) },
                        2);
   Schema server_schema = SchemaBuilder(client_schema).Build();
 
   KuduPartialRow client_row(&client_schema);
   // No columns set
-  EXPECT_EQ("error: Invalid argument: No value provided for key column: key INT32 NOT NULL",
+  EXPECT_EQ("row error: Invalid argument: No value provided for key column: key INT32 NOT NULL",
             TestProjection(RowOperationsPB::DELETE, client_row, server_schema));
 
   // Only half the key set
   ASSERT_OK(client_row.SetInt32("key", 12345));
-  EXPECT_EQ("error: Invalid argument: No value provided for key column: key_2 INT32 NOT NULL",
+  EXPECT_EQ("row error: Invalid argument: No value provided for key column: key_2 INT32 NOT NULL",
             TestProjection(RowOperationsPB::DELETE, client_row, server_schema));
 
   // Whole key set (correct)
@@ -636,11 +706,45 @@ TEST_F(RowOperationsTest, TestProjectDeletes) {
   EXPECT_EQ("MUTATE (int32 key=12345, int32 key_2=54321) DELETE",
             TestProjection(RowOperationsPB::DELETE, client_row, server_schema));
 
-  // Extra column set (incorrect)
-  ASSERT_OK(client_row.SetStringNoCopy("string_val", "hello"));
-  EXPECT_EQ("error: Invalid argument: DELETE should not have a value for column: "
+  // Extra column set
+  ASSERT_OK(client_row.SetNull("string_val"));
+  EXPECT_EQ("row error: Invalid argument: DELETE should not have a value for column: "
             "string_val STRING NULLABLE",
             TestProjection(RowOperationsPB::DELETE, client_row, server_schema));
+
+  // Extra column set (incorrect)
+  ASSERT_OK(client_row.SetStringNoCopy("string_val", "hello"));
+  EXPECT_EQ("row error: Invalid argument: DELETE should not have a value for column: "
+            "string_val STRING NULLABLE",
+            TestProjection(RowOperationsPB::DELETE, client_row, server_schema));
+
+  // Force to set null on key column.
+  {
+    KuduPartialRow client_row(&client_schema);
+    int col_idx;
+    ASSERT_OK(client_schema.FindColumn("key", &col_idx));
+    ContiguousRow row(&client_schema, client_row.row_data_);
+    row.set_null(col_idx, true);
+    BitmapSet(client_row.isset_bitmap_, col_idx);
+    EXPECT_EQ("row error: Invalid argument: NULL values not allowed for key column: "
+              "key INT32 NOT NULL",
+              TestProjection(RowOperationsPB::DELETE, client_row, server_schema));
+  }
+
+  // Force to set null on non-key column.
+  {
+    KuduPartialRow client_row(&client_schema);
+    ASSERT_OK(client_row.SetInt32("key", 12345));
+    ASSERT_OK(client_row.SetInt32("key_2", 12345));
+    int col_idx;
+    ASSERT_OK(client_schema.FindColumn("int_val", &col_idx));
+    ContiguousRow row(&client_schema, client_row.row_data_);
+    row.set_null(col_idx, true);
+    BitmapSet(client_row.isset_bitmap_, col_idx);
+    EXPECT_EQ("row error: Invalid argument: DELETE should not have a value for column: "
+              "int_val INT32 NOT NULL",
+              TestProjection(RowOperationsPB::DELETE, client_row, server_schema));
+  }
 }
 
 TEST_F(RowOperationsTest, SplitKeyRoundTrip) {
@@ -675,7 +779,7 @@ TEST_F(RowOperationsTest, SplitKeyRoundTrip) {
   Schema schema = client_schema.CopyWithColumnIds();
   RowOperationsPBDecoder decoder(&pb, &client_schema, &schema, nullptr);
   vector<DecodedRowOperation> ops;
-  ASSERT_OK(decoder.DecodeOperations(&ops));
+  ASSERT_OK(decoder.DecodeOperations<DecoderMode::SPLIT_ROWS>(&ops));
   ASSERT_EQ(1, ops.size());
 
   const shared_ptr<KuduPartialRow>& row2 = ops[0].split_row;
@@ -705,6 +809,166 @@ TEST_F(RowOperationsTest, SplitKeyRoundTrip) {
   CHECK_EQ(Slice("binary-value"), binary_val);
 
   CHECK(!row2->IsColumnSet("missing"));
+}
+
+namespace {
+void CheckExceedCellLimit(const Schema& client_schema,
+                          const vector<string>& col_values,
+                          RowOperationsPB::Type op_type,
+                          const Status& expect_status,
+                          const string& expect_msg) {
+  ASSERT_EQ(client_schema.num_columns(), col_values.size());
+
+  // Fill the row.
+  KuduPartialRow row(&client_schema);
+  for (size_t i = 0; i < client_schema.num_columns(); ++i) {
+    if (op_type == RowOperationsPB::DELETE && i >= client_schema.num_key_columns()) {
+      // DELETE should not have a value for non-key column.
+      break;
+    }
+    const ColumnSchema& column_schema = client_schema.column(i);
+    switch (column_schema.type_info()->type()) {
+      case STRING:
+        ASSERT_OK(row.SetStringNoCopy(static_cast<int>(i), col_values[i]));
+        break;
+      case BINARY:
+        ASSERT_OK(row.SetBinaryNoCopy(static_cast<int>(i), col_values[i]));
+        break;
+      default:
+        ASSERT_TRUE(false) << "Unsupported type: " << column_schema.ToString();
+    }
+  }
+
+  RowOperationsPB pb;
+  RowOperationsPBEncoder(&pb).Add(op_type, row);
+
+  Arena arena(1024*1024);
+  Schema schema = client_schema.CopyWithColumnIds();
+  RowOperationsPBDecoder decoder(&pb, &client_schema, &schema, &arena);
+  vector<DecodedRowOperation> ops;
+  Status s;
+  switch (op_type) {
+    case RowOperationsPB::INSERT:
+    case RowOperationsPB::UPDATE:
+    case RowOperationsPB::DELETE:
+    case RowOperationsPB::UPSERT:
+      s = decoder.DecodeOperations<WRITE_OPS>(&ops);
+      break;
+    case RowOperationsPB::SPLIT_ROW:
+    case RowOperationsPB::RANGE_LOWER_BOUND:
+    case RowOperationsPB::RANGE_UPPER_BOUND:
+    case RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND:
+    case RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND:
+      s = decoder.DecodeOperations<SPLIT_ROWS>(&ops);
+      break;
+    default:
+      ASSERT_TRUE(false) << "Unsupported op_type " << op_type;
+  }
+  ASSERT_OK(s);
+  for (const auto& op : ops) {
+    ASSERT_EQ(op.result.CodeAsString(), expect_status.CodeAsString());
+    ASSERT_STR_CONTAINS(op.result.ToString(), expect_msg);
+  }
+}
+
+void CheckInsertUpsertExceedCellLimit(const Schema& client_schema,
+                                      const vector<string>& col_values,
+                                      const Status& expect_status,
+                                      const string& expect_msg) {
+  for (auto op_type : { RowOperationsPB::INSERT,
+                        RowOperationsPB::UPSERT }) {
+    NO_FATALS(CheckExceedCellLimit(client_schema, col_values, op_type, expect_status, expect_msg));
+  }
+}
+
+void CheckUpdateDeleteExceedCellLimit(const Schema& client_schema,
+                                      const vector<string>& col_values,
+                                      const Status& expect_status,
+                                      const string& expect_msg) {
+  for (auto op_type : { RowOperationsPB::UPDATE,
+                        RowOperationsPB::DELETE }) {
+    NO_FATALS(CheckExceedCellLimit(client_schema, col_values, op_type, expect_status, expect_msg));
+  }
+}
+
+void CheckWriteExceedCellLimit(const Schema& client_schema,
+                               const vector<string>& col_values,
+                               const Status& expect_status,
+                               const string& expect_msg) {
+  NO_FATALS(CheckInsertUpsertExceedCellLimit(client_schema, col_values, expect_status, expect_msg));
+  NO_FATALS(CheckUpdateDeleteExceedCellLimit(client_schema, col_values, expect_status, expect_msg));
+}
+
+void CheckSplitExceedCellLimit(const Schema& client_schema,
+                               const vector<string>& col_values,
+                               const Status& expect_status,
+                               const string& expect_msg) {
+  for (auto op_type : { RowOperationsPB::SPLIT_ROW,
+                        RowOperationsPB::RANGE_LOWER_BOUND,
+                        RowOperationsPB::RANGE_UPPER_BOUND,
+                        RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND,
+                        RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND }) {
+    NO_FATALS(CheckExceedCellLimit(client_schema, col_values, op_type, expect_status, expect_msg));
+  }
+}
+} // anonymous namespace
+
+TEST_F(RowOperationsTest, ExceedCellLimit) {
+  Schema client_schema = Schema({ ColumnSchema("key_string", STRING),
+                                  ColumnSchema("key_binary", BINARY),
+                                  ColumnSchema("col_string", STRING),
+                                  ColumnSchema("col_binary", BINARY) },
+                                2);
+
+  const string long_string(static_cast<size_t>(FLAGS_max_cell_size_bytes), 'a');
+  const string too_long_string(static_cast<size_t>(FLAGS_max_cell_size_bytes + 1), 'a');
+  const vector<string> base_col_values(4, long_string);
+
+  // All column cell sizes are not exceed.
+  NO_FATALS(CheckWriteExceedCellLimit(client_schema, base_col_values, Status::OK(), ""));
+
+  // Some column cell size exceed for INSERT and UPSERT operation.
+  for (size_t i = 0; i < client_schema.num_columns(); ++i) {
+    auto col_values(base_col_values);
+    col_values[i] = too_long_string;
+    NO_FATALS(CheckInsertUpsertExceedCellLimit(client_schema,
+                                               col_values,
+                                               Status::InvalidArgument(""),
+                                               Substitute("value too large for column '$0'"
+                                                          " ($1 bytes, maximum is $2 bytes)",
+                                                          client_schema.column(i).name(),
+                                                          FLAGS_max_cell_size_bytes + 1,
+                                                          FLAGS_max_cell_size_bytes)));
+  }
+
+  // Key column cell size exceed for UPDATE and DELETE operation, it's OK.
+  for (size_t i = 0; i < client_schema.num_key_columns(); ++i) {
+    auto col_values(base_col_values);
+    col_values[i] = too_long_string;
+    NO_FATALS(CheckUpdateDeleteExceedCellLimit(client_schema, col_values, Status::OK(), ""));
+  }
+
+  // Non-key column cell size exceed for UPDATE operation.
+  for (size_t i = client_schema.num_key_columns(); i < client_schema.num_columns(); ++i) {
+    auto col_values(base_col_values);
+    col_values[i] = too_long_string;
+    NO_FATALS(CheckExceedCellLimit(client_schema,
+                                   col_values,
+                                   RowOperationsPB::UPDATE,
+                                   Status::InvalidArgument(""),
+                                   Substitute("value too large for column '$0'"
+                                              " ($1 bytes, maximum is $2 bytes)",
+                                              client_schema.column(i).name(),
+                                              FLAGS_max_cell_size_bytes + 1,
+                                              FLAGS_max_cell_size_bytes)));
+  }
+
+  // Some column cell size exceed for SPLIT_ROW type operation, it's OK.
+  for (size_t i = 0; i < client_schema.num_columns(); ++i) {
+    auto col_values(base_col_values);
+    col_values[i] = too_long_string;
+    NO_FATALS(CheckSplitExceedCellLimit(client_schema, col_values, Status::OK(), ""));
+  }
 }
 
 } // namespace kudu

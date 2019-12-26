@@ -14,14 +14,15 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
-import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
 import static org.apache.kudu.test.ClientTestUtil.createBasicSchemaInsert;
 import static org.apache.kudu.test.ClientTestUtil.getBasicCreateTableOptions;
 import static org.apache.kudu.test.ClientTestUtil.getBasicSchema;
 import static org.apache.kudu.test.ClientTestUtil.getBasicTableOptionsWithNonCoveredRange;
 import static org.apache.kudu.test.ClientTestUtil.scanTableToStrings;
+import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -30,21 +31,23 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
-import org.apache.kudu.test.KuduTestHarness;
-import org.apache.kudu.test.ClientTestUtil;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.kudu.test.ClientTestUtil;
+import org.apache.kudu.test.KuduTestHarness;
 
 public class TestKuduTable {
   private static final Logger LOG = LoggerFactory.getLogger(TestKuduTable.class);
@@ -78,7 +81,8 @@ public class TestKuduTable {
             .encoding(ColumnSchema.Encoding.PLAIN_ENCODING)
             .compressionAlgorithm(ColumnSchema.CompressionAlgorithm.NO_COMPRESSION)
             .build());
-    KuduTable table = client.createTable(tableName, new Schema(columns), getBasicCreateTableOptions());
+    KuduTable table =
+        client.createTable(tableName, new Schema(columns), getBasicCreateTableOptions());
     KuduSession session = client.newSession();
     // Insert a row before a default is defined and check the value is NULL.
     insertDefaultRow(table, session, 0);
@@ -172,7 +176,7 @@ public class TestKuduTable {
       // Delete it.
       client.alterTable(tableName, new AlterTableOptions().dropColumn("newtestaddint"));
 
-      String newTableName = tableName +"new";
+      String newTableName = tableName + "new";
 
       // Rename our table.
       client.alterTable(tableName, new AlterTableOptions().renameTable(newTableName));
@@ -212,12 +216,13 @@ public class TestKuduTable {
   }
 
   /**
-   * Test creating tables of different sizes and see that we get the correct number of tablets back
-   * @throws Exception
+   * Test creating tables of different sizes and see that we get the correct number of tablets back.
    */
   @Test
+  @SuppressWarnings("deprecation")
   public void testGetLocations() throws Exception {
-    int initialTableCount = asyncClient.getTablesList().join(DEFAULT_SLEEP).getTablesList().size();
+    final int initialTableCount =
+        asyncClient.getTablesList().join(DEFAULT_SLEEP).getTablesList().size();
 
     final String NON_EXISTENT_TABLE = "NON_EXISTENT_TABLE";
 
@@ -231,7 +236,7 @@ public class TestKuduTable {
     // Test with defaults
     String tableWithDefault = tableName + "-WithDefault";
     CreateTableOptions builder = getBasicCreateTableOptions();
-    List<ColumnSchema> columns = new ArrayList<ColumnSchema>(BASIC_SCHEMA.getColumnCount());
+    List<ColumnSchema> columns = new ArrayList<>(BASIC_SCHEMA.getColumnCount());
     int defaultInt = 30;
     String defaultString = "data";
     for (ColumnSchema columnSchema : BASIC_SCHEMA.getColumns()) {
@@ -275,37 +280,52 @@ public class TestKuduTable {
 
     KuduTable table = createTableWithSplitsAndTest(splitTablePrefix, 30);
 
-    List<LocatedTablet>tablets = table.getTabletsLocations(null, getKeyInBytes(9), DEFAULT_SLEEP);
+    List<LocatedTablet> tablets =
+        table.getTabletsLocations(null, getKeyInBytes(9), DEFAULT_SLEEP);
     assertEquals(9, tablets.size());
-    assertEquals(9, table.asyncGetTabletsLocations(null, getKeyInBytes(9), DEFAULT_SLEEP).join().size());
+    assertEquals(9,
+        table.asyncGetTabletsLocations(null, getKeyInBytes(9), DEFAULT_SLEEP).join().size());
 
     tablets = table.getTabletsLocations(getKeyInBytes(0), getKeyInBytes(9), DEFAULT_SLEEP);
     assertEquals(9, tablets.size());
-    assertEquals(9, table.asyncGetTabletsLocations(getKeyInBytes(0), getKeyInBytes(9), DEFAULT_SLEEP).join().size());
+    assertEquals(9,
+        table.asyncGetTabletsLocations(getKeyInBytes(0),
+            getKeyInBytes(9), DEFAULT_SLEEP).join().size());
 
     tablets = table.getTabletsLocations(getKeyInBytes(5), getKeyInBytes(9), DEFAULT_SLEEP);
     assertEquals(4, tablets.size());
-    assertEquals(4, table.asyncGetTabletsLocations(getKeyInBytes(5), getKeyInBytes(9), DEFAULT_SLEEP).join().size());
+    assertEquals(4,
+        table.asyncGetTabletsLocations(getKeyInBytes(5),
+            getKeyInBytes(9), DEFAULT_SLEEP).join().size());
 
     tablets = table.getTabletsLocations(getKeyInBytes(5), getKeyInBytes(14), DEFAULT_SLEEP);
     assertEquals(9, tablets.size());
-    assertEquals(9, table.asyncGetTabletsLocations(getKeyInBytes(5), getKeyInBytes(14), DEFAULT_SLEEP).join().size());
+    assertEquals(9,
+        table.asyncGetTabletsLocations(getKeyInBytes(5),
+            getKeyInBytes(14), DEFAULT_SLEEP).join().size());
 
     tablets = table.getTabletsLocations(getKeyInBytes(5), getKeyInBytes(31), DEFAULT_SLEEP);
     assertEquals(26, tablets.size());
-    assertEquals(26, table.asyncGetTabletsLocations(getKeyInBytes(5), getKeyInBytes(31), DEFAULT_SLEEP).join().size());
+    assertEquals(26,
+        table.asyncGetTabletsLocations(getKeyInBytes(5),
+            getKeyInBytes(31), DEFAULT_SLEEP).join().size());
 
     tablets = table.getTabletsLocations(getKeyInBytes(5), null, DEFAULT_SLEEP);
     assertEquals(26, tablets.size());
-    assertEquals(26, table.asyncGetTabletsLocations(getKeyInBytes(5), null, DEFAULT_SLEEP).join().size());
+    assertEquals(26,
+        table.asyncGetTabletsLocations(getKeyInBytes(5), null, DEFAULT_SLEEP).join().size());
 
     tablets = table.getTabletsLocations(null, getKeyInBytes(10000), DEFAULT_SLEEP);
     assertEquals(31, tablets.size());
-    assertEquals(31, table.asyncGetTabletsLocations(null, getKeyInBytes(10000), DEFAULT_SLEEP).join().size());
+    assertEquals(31,
+        table.asyncGetTabletsLocations(null,
+            getKeyInBytes(10000), DEFAULT_SLEEP).join().size());
 
     tablets = table.getTabletsLocations(getKeyInBytes(20), getKeyInBytes(10000), DEFAULT_SLEEP);
     assertEquals(11, tablets.size());
-    assertEquals(11, table.asyncGetTabletsLocations(getKeyInBytes(20), getKeyInBytes(10000), DEFAULT_SLEEP).join().size());
+    assertEquals(11,
+        table.asyncGetTabletsLocations(getKeyInBytes(20),
+            getKeyInBytes(10000), DEFAULT_SLEEP).join().size());
 
     // Test listing tables.
     assertEquals(0, asyncClient.getTablesList(NON_EXISTENT_TABLE)
@@ -314,14 +334,15 @@ public class TestKuduTable {
         .join(DEFAULT_SLEEP).getTablesList().size());
     assertEquals(initialTableCount + 5,
         asyncClient.getTablesList().join(DEFAULT_SLEEP).getTablesList().size());
-    assertFalse(asyncClient.getTablesList(tableWithDefault).
-        join(DEFAULT_SLEEP).getTablesList().isEmpty());
+    assertFalse(asyncClient.getTablesList(tableWithDefault)
+        .join(DEFAULT_SLEEP).getTablesList().isEmpty());
 
     assertFalse(asyncClient.tableExists(NON_EXISTENT_TABLE).join(DEFAULT_SLEEP));
     assertTrue(asyncClient.tableExists(tableWithDefault).join(DEFAULT_SLEEP));
   }
 
   @Test(timeout = 100000)
+  @SuppressWarnings("deprecation")
   public void testLocateTableNonCoveringRange() throws Exception {
     client.createTable(tableName, basicSchema, getBasicTableOptionsWithNonCoveredRange());
     KuduTable table = client.openTable(tableName);
@@ -368,17 +389,18 @@ public class TestKuduTable {
   }
 
   @Test(timeout = 100000)
+  @SuppressWarnings("deprecation")
   public void testAlterTableNonCoveringRange() throws Exception {
     client.createTable(tableName, basicSchema, getBasicTableOptionsWithNonCoveredRange());
-    KuduTable table = client.openTable(tableName);
-    KuduSession session = client.newSession();
+    final KuduTable table = client.openTable(tableName);
+    final KuduSession session = client.newSession();
 
     AlterTableOptions ato = new AlterTableOptions();
-    PartialRow bLowerBound = BASIC_SCHEMA.newPartialRow();
-    bLowerBound.addInt("key", 300);
-    PartialRow bUpperBound = BASIC_SCHEMA.newPartialRow();
-    bUpperBound.addInt("key", 400);
-    ato.addRangePartition(bLowerBound, bUpperBound);
+    PartialRow lowerBound = BASIC_SCHEMA.newPartialRow();
+    lowerBound.addInt("key", 300);
+    PartialRow upperBound = BASIC_SCHEMA.newPartialRow();
+    upperBound.addInt("key", 400);
+    ato.addRangePartition(lowerBound, upperBound);
     client.alterTable(tableName, ato);
 
     Insert insert = createBasicSchemaInsert(table, 301);
@@ -396,11 +418,11 @@ public class TestKuduTable {
     session.apply(insert);
 
     ato = new AlterTableOptions();
-    bLowerBound = BASIC_SCHEMA.newPartialRow();
-    bLowerBound.addInt("key", 200);
-    bUpperBound = BASIC_SCHEMA.newPartialRow();
-    bUpperBound.addInt("key", 300);
-    ato.dropRangePartition(bLowerBound, bUpperBound);
+    lowerBound = BASIC_SCHEMA.newPartialRow();
+    lowerBound.addInt("key", 200);
+    upperBound = BASIC_SCHEMA.newPartialRow();
+    upperBound.addInt("key", 300);
+    ato.dropRangePartition(lowerBound, upperBound);
     client.alterTable(tableName, ato);
 
     insert = createBasicSchemaInsert(table, 202);
@@ -565,6 +587,7 @@ public class TestKuduTable {
         client.openTable(tableName).getFormattedRangePartitions(10000));
   }
 
+  @SuppressWarnings("deprecation")
   private KuduTable createTableWithSplitsAndTest(String tableNamePrefix, int splitsCount)
       throws Exception {
     String newTableName = tableNamePrefix + "-" + splitsCount;
@@ -670,7 +693,9 @@ public class TestKuduTable {
       try {
         table.getSchema().getColumn(newName);
         fail(String.format("New column name %s should not yet be visible", newName));
-      } catch (IllegalArgumentException e) {}
+      } catch (IllegalArgumentException e) {
+        // ignored
+      }
 
       // After waiting for the alter to finish and reloading the schema,
       // 'newName' should be visible and 'oldName' should be gone.
@@ -679,7 +704,9 @@ public class TestKuduTable {
       try {
         table.getSchema().getColumn(oldName);
         fail(String.format("Old column name %s should not be visible", oldName));
-      } catch (IllegalArgumentException e) {}
+      } catch (IllegalArgumentException e) {
+        // ignored
+      }
       table.getSchema().getColumn(newName);
       LOG.info("Test passed on attempt {}", i + 1);
       return;
@@ -700,5 +727,120 @@ public class TestKuduTable {
         assertEquals(i, table.getNumReplicas());
       }
     }
+  }
+
+  @Test(timeout = 100000)
+  public void testAlterColumnComment() throws Exception {
+    // Schema with comments.
+    List<ColumnSchema> columns = ImmutableList.of(
+        new ColumnSchema.ColumnSchemaBuilder("key", Type.INT32)
+            .key(true).comment("keytest").build(),
+        new ColumnSchema.ColumnSchemaBuilder("value", Type.STRING)
+            .comment("valuetest").build());
+    // Create a table.
+    KuduTable table = client.createTable(tableName,
+        new Schema(columns), getBasicCreateTableOptions());
+
+    // Verify the comments after creating.
+    assertEquals("wrong key comment", "keytest",
+        table.getSchema().getColumn("key").getComment());
+    assertEquals("wrong value comment", "valuetest",
+        table.getSchema().getColumn("value").getComment());
+
+    // Change the comments.
+    client.alterTable(tableName,
+        new AlterTableOptions().changeComment("key", "keycomment"));
+    client.alterTable(tableName,
+        new AlterTableOptions().changeComment("value", "valuecomment"));
+
+    // Verify the comments after the first change.
+    KuduTable table1 = client.openTable(tableName);
+    assertEquals("wrong key comment post alter",
+        "keycomment", table1.getSchema().getColumn("key").getComment());
+    assertEquals("wrong value comment post alter",
+        "valuecomment", table1.getSchema().getColumn("value").getComment());
+
+    // Delete the comments.
+    client.alterTable(tableName,
+        new AlterTableOptions().changeComment("key", ""));
+    client.alterTable(tableName,
+        new AlterTableOptions().changeComment("value", ""));
+
+    // Verify the comments after the second change.
+    KuduTable table2 = client.openTable(tableName);
+    assertEquals("wrong key comment post alter", "",
+        table2.getSchema().getColumn("key").getComment());
+    assertEquals("wrong value comment post alter", "",
+        table2.getSchema().getColumn("value").getComment());
+  }
+
+  @Test(timeout = 100000)
+  @SuppressWarnings("deprecation")
+  public void testDimensionLabel() throws Exception {
+    // Create a table with dimension label.
+    final KuduTable table = client.createTable(tableName, basicSchema,
+        getBasicTableOptionsWithNonCoveredRange().setDimensionLabel("labelA"));
+
+    // Add a range partition to the table with dimension label.
+    AlterTableOptions ato = new AlterTableOptions();
+    PartialRow lowerBound = BASIC_SCHEMA.newPartialRow();
+    lowerBound.addInt("key", 300);
+    PartialRow upperBound = BASIC_SCHEMA.newPartialRow();
+    upperBound.addInt("key", 400);
+    ato.addRangePartition(lowerBound, upperBound, "labelB",
+                          RangePartitionBound.INCLUSIVE_BOUND,
+                          RangePartitionBound.EXCLUSIVE_BOUND);
+    client.alterTable(tableName, ato);
+
+    Map<String, Integer> dimensionMap = new HashMap<>();
+    for (LocatedTablet tablet : table.getTabletsLocations(DEFAULT_SLEEP)) {
+      for (LocatedTablet.Replica replica : tablet.getReplicas()) {
+        Integer number = dimensionMap.get(replica.getDimensionLabel());
+        if (number == null) {
+          number = 0;
+        }
+        dimensionMap.put(replica.getDimensionLabel(), number + 1);
+      }
+    }
+    assertEquals(9, dimensionMap.get("labelA").intValue());
+    assertEquals(3, dimensionMap.get("labelB").intValue());
+  }
+
+  @Test(timeout = 100000)
+  @KuduTestHarness.TabletServerConfig(flags = {
+      "--update_tablet_stats_interval_ms=200",
+      "--heartbeat_interval_ms=100",
+  })
+  public void testGetTableStatistics() throws Exception {
+    // Create a table.
+    CreateTableOptions builder = getBasicCreateTableOptions();
+    KuduTable table = client.createTable(tableName, BASIC_SCHEMA, builder);
+
+    // Insert some rows and test the statistics.
+    KuduTableStatistics prevStatistics = new KuduTableStatistics(-1, -1);
+    KuduTableStatistics currentStatistics;
+    KuduSession session = client.newSession();
+    int num = 100;
+    for (int i = 0; i < num; ++i) {
+      // Get current table statistics.
+      currentStatistics = table.getTableStatistics();
+      assertTrue(currentStatistics.getOnDiskSize() >= prevStatistics.getOnDiskSize());
+      assertTrue(currentStatistics.getLiveRowCount() >= prevStatistics.getLiveRowCount());
+      assertTrue(currentStatistics.getLiveRowCount() <= i + 1);
+      prevStatistics = currentStatistics;
+      // Insert row.
+      Insert insert = createBasicSchemaInsert(table, i);
+      session.apply(insert);
+      List<String> rows = scanTableToStrings(table);
+      assertEquals("wrong number of rows", i + 1, rows.size());
+    }
+
+    // Final accuracy test.
+    // Wait for master to aggregate table statistics.
+    Thread.sleep(200 * 6);
+    currentStatistics = table.getTableStatistics();
+    assertTrue(currentStatistics.getOnDiskSize() >= prevStatistics.getOnDiskSize());
+    assertTrue(currentStatistics.getLiveRowCount() >= prevStatistics.getLiveRowCount());
+    assertEquals(num, currentStatistics.getLiveRowCount());
   }
 }

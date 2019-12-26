@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -33,6 +34,9 @@
 
 #include "kudu/client/client.h"
 #include "kudu/client/master_rpc.h"
+#if !defined(NO_CHRONY)
+#include "kudu/clock/test/mini_chronyd.h"
+#endif
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/basictypes.h"
@@ -48,6 +52,7 @@
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/user_credentials.h"
 #include "kudu/security/test/mini_kdc.h"
+#include "kudu/sentry/mini_sentry.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
 #include "kudu/tablet/metadata.pb.h"
@@ -69,6 +74,9 @@
 #include "kudu/util/test_util.h"
 
 using kudu::client::internal::ConnectToClusterRpc;
+#if !defined(NO_CHRONY)
+using kudu::clock::MiniChronyd;
+#endif
 using kudu::master::ListTablesRequestPB;
 using kudu::master::ListTablesResponsePB;
 using kudu::master::MasterServiceProxy;
@@ -79,6 +87,7 @@ using kudu::server::ServerStatusPB;
 using kudu::tserver::ListTabletsRequestPB;
 using kudu::tserver::ListTabletsResponsePB;
 using kudu::tserver::TabletServerServiceProxy;
+using std::copy;
 using std::pair;
 using std::string;
 using std::unique_ptr;
@@ -104,13 +113,18 @@ static double kMasterCatalogManagerTimeoutSeconds = 60.0;
 ExternalMiniClusterOptions::ExternalMiniClusterOptions()
     : num_masters(1),
       num_tablet_servers(1),
-      bind_mode(MiniCluster::kDefaultBindMode),
+      bind_mode(kDefaultBindMode),
       num_data_dirs(1),
       enable_kerberos(false),
       hms_mode(HmsMode::NONE),
+      enable_sentry(false),
       logtostderr(true),
-      start_process_timeout(MonoDelta::FromSeconds(30)),
-      rpc_negotiation_timeout(MonoDelta::FromSeconds(3)) {
+      start_process_timeout(MonoDelta::FromSeconds(70)),
+      rpc_negotiation_timeout(MonoDelta::FromSeconds(3))
+#if !defined(NO_CHRONY)
+      , num_ntp_servers(1)
+#endif // #if !defined(NO_CHRONY) ...
+{
 }
 
 ExternalMiniCluster::ExternalMiniCluster()
@@ -153,6 +167,62 @@ Status ExternalMiniCluster::HandleOptions() {
   return Status::OK();
 }
 
+Status ExternalMiniCluster::AddTimeSourceFlags(std::vector<std::string>* flags) {
+  DCHECK(flags);
+#if defined(NO_CHRONY)
+  flags->emplace_back("--time_source=system_unsync");
+#else
+  if (opts_.num_ntp_servers > 0) {
+    vector<string> ntp_endpoints;
+    CHECK_EQ(opts_.num_ntp_servers, ntp_servers_.size());
+    for (const auto& server : ntp_servers_) {
+      ntp_endpoints.emplace_back(server->address().ToString());
+    }
+    // Point the built-in NTP client to the test NTP server running as a part
+    // of the cluster.
+    flags->emplace_back(Substitute("--builtin_ntp_servers=$0",
+                                   JoinStrings(ntp_endpoints, ",")));
+    // The chronyd server supports very short polling interval: let's use this
+    // feature for faster clock synchronisation at startup and to keep the
+    // estimated clock error of the built-in NTP client smaller.
+    flags->emplace_back(Substitute("--builtin_ntp_poll_interval_ms=100"));
+    // Wait up to 10 seconds to let the built-in NTP client to synchronize its
+    // time with the test NTP server.
+    flags->emplace_back(Substitute("--ntp_initial_sync_wait_secs=10"));
+    // Switch the clock to use the built-in NTP client which clock is
+    // synchronized with the test NTP server.
+    flags->emplace_back("--time_source=builtin");
+  } else {
+    flags->emplace_back("--time_source=system_unsync");
+  }
+#endif // #if defined(NO_CHRONY) ... else ...
+  return Status::OK();
+}
+
+Status ExternalMiniCluster::StartSentry() {
+  sentry_->SetDataRoot(opts_.cluster_root);
+
+  if (hms_) {
+    sentry_->EnableHms(hms_->uris());
+  }
+
+  if (opts_.enable_kerberos) {
+    string spn = Substitute("sentry/$0", sentry_->address().host());
+    string ktpath;
+    RETURN_NOT_OK_PREPEND(kdc_->CreateServiceKeytab(spn, &ktpath),
+                          "could not create keytab");
+    sentry_->EnableKerberos(kdc_->GetEnvVars()["KRB5_CONFIG"],
+                            Substitute("$0@KRBTEST.COM", spn),
+                            ktpath);
+  }
+
+  return sentry_->Start();
+}
+
+Status ExternalMiniCluster::StopSentry() {
+  return sentry_->Stop();
+}
+
 Status ExternalMiniCluster::Start() {
   CHECK(masters_.empty()) << "Masters are not empty (size: " << masters_.size()
       << "). Maybe you meant Restart()?";
@@ -193,13 +263,77 @@ Status ExternalMiniCluster::Start() {
                           "could not set krb5 client env");
   }
 
-  if (opts_.hms_mode == HmsMode::ENABLE_HIVE_METASTORE ||
+#if !defined(NO_CHRONY)
+  // Start NTP servers, if requested.
+  if (opts_.num_ntp_servers > 0) {
+    // Collect and keep alive the set of sockets bound with SO_REUSEPORT option
+    // until all chronyd proccesses are started. This allows to avoid port
+    // conflicts: chronyd doesn't support binding to wildcard addresses and
+    // it's necessary to make sure chronyd is able to bind to the port specified
+    // in its configuration. So, the mini-cluster reserves a set of ports up
+    // front, then starts the set of chronyd processes, each bound to one
+    // of the reserved ports.
+    vector<unique_ptr<Socket>> reserved_sockets;
+    for (auto i = 0; i < opts_.num_ntp_servers; ++i) {
+      unique_ptr<Socket> reserved_socket;
+      RETURN_NOT_OK_PREPEND(ReserveDaemonSocket(
+          DaemonType::EXTERNAL_SERVER, i, opts_.bind_mode, &reserved_socket),
+          "failed to reserve chronyd socket address");
+      Sockaddr addr;
+      RETURN_NOT_OK(reserved_socket->GetSocketAddress(&addr));
+      reserved_sockets.emplace_back(std::move(reserved_socket));
+
+      RETURN_NOT_OK_PREPEND(AddNtpServer(addr),
+                            Substitute("failed to start NTP server $0", i));
+    }
+  }
+#endif // #if !defined(NO_CHRONY) ...
+
+  // Start the Sentry service and the HMS in the following steps, in order
+  // to deal with the circular dependency in terms of configuring each
+  // with the other's IP/port.
+  // 1. Pick a bind IP using UNIQUE_LOOPBACK mode for the Sentry service.
+  //    Statically choose a random port. Since the Sentry service will
+  //    live on its own IP address, there's no danger of collision.
+  // 2. Start the HMS, configured to talk to the Sentry service. Find out
+  //    which port it's on.
+  // 3. Start the Sentry service with the chosen address/port from step 1.
+  //
+  // We can also pick a random port for the HMS in step 2, however, due to
+  // HIVE-18998 (which is addressed in Hive 4.0.0 by HIVE-20794), this is not
+  // an option.
+  // TODO(hao): Pick a static port for the HMS to bind to when we move to Hive 4.
+  //
+  // Note that when UNIQUE_LOOPBACK mode is not supported (i.e. on macOS),
+  // we cannot choose a port at random as that can cause a port collision.
+  // In that case, we start the Sentry service with the picked IP address
+  // and port 0 in step 1. Find out which port it's on by polling lsof.
+  // In step 3, restart the Sentry service and reconfigure it to talk to
+  // the HMS's port.
+
+  if (opts_.enable_sentry) {
+    sentry_.reset(new sentry::MiniSentry());
+    string host = GetBindIpForExternalServer(0);
+    uint16_t port = opts_.bind_mode == BindMode::UNIQUE_LOOPBACK ? 10000 : 0;
+    sentry_->SetAddress(HostPort(host, port));
+    if (opts_.bind_mode != BindMode::UNIQUE_LOOPBACK) {
+      RETURN_NOT_OK_PREPEND(StartSentry(), "Failed to start the Sentry service");
+    }
+  }
+
+  // Start the HMS.
+  if (opts_.hms_mode == HmsMode::DISABLE_HIVE_METASTORE ||
+      opts_.hms_mode == HmsMode::ENABLE_HIVE_METASTORE ||
       opts_.hms_mode == HmsMode::ENABLE_METASTORE_INTEGRATION) {
     hms_.reset(new hms::MiniHms());
     hms_->SetDataRoot(opts_.cluster_root);
 
+    if (opts_.hms_mode == HmsMode::DISABLE_HIVE_METASTORE) {
+      hms_->EnableKuduPlugin(false);
+    }
+
     if (opts_.enable_kerberos) {
-      string spn = "hive/127.0.0.1";
+      string spn = Substitute("hive/$0", hms_->address().host());
       string ktpath;
       RETURN_NOT_OK_PREPEND(kdc_->CreateServiceKeytab(spn, &ktpath),
                             "could not create keytab");
@@ -207,8 +341,23 @@ Status ExternalMiniCluster::Start() {
                            rpc::SaslProtection::kAuthentication);
     }
 
+    if (opts_.enable_sentry) {
+      string sentry_spn = Substitute("sentry/$0@KRBTEST.COM", sentry_->address().host());
+      hms_->EnableSentry(sentry_->address(), sentry_spn);
+    }
+
     RETURN_NOT_OK_PREPEND(hms_->Start(),
                           "Failed to start the Hive Metastore");
+
+    // (Re)start Sentry with the HMS address.
+    if (opts_.enable_sentry) {
+      if (opts_.bind_mode != BindMode::UNIQUE_LOOPBACK) {
+        RETURN_NOT_OK_PREPEND(StopSentry(),
+                              "Failed to stop the Sentry service");
+      }
+      RETURN_NOT_OK_PREPEND(StartSentry(),
+                            "Failed to start the Sentry service");
+    }
   }
 
   RETURN_NOT_OK_PREPEND(StartMasters(), "failed to start masters");
@@ -360,7 +509,7 @@ Status ExternalMiniCluster::StartMasters() {
   } else {
     for (int i = 0; i < num_masters; i++) {
       unique_ptr<Socket> reserved_socket;
-      RETURN_NOT_OK_PREPEND(ReserveDaemonSocket(MiniCluster::MASTER, i, opts_.bind_mode,
+      RETURN_NOT_OK_PREPEND(ReserveDaemonSocket(DaemonType::MASTER, i, opts_.bind_mode,
                                                 &reserved_socket),
                             "failed to reserve master socket address");
       Sockaddr addr;
@@ -370,7 +519,7 @@ Status ExternalMiniCluster::StartMasters() {
     }
   }
 
-  vector<string> flags = opts_.extra_master_flags;
+  vector<string> flags;
   flags.emplace_back("--rpc_reuseport=true");
   if (num_masters > 1) {
     flags.emplace_back(Substitute("--master_addresses=$0",
@@ -399,9 +548,14 @@ Status ExternalMiniCluster::StartMasters() {
     flags.emplace_back("--location_mapping_by_uuid");
 #   endif
   }
-  string exe = GetBinaryPath(kMasterBinaryName);
+  RETURN_NOT_OK(AddTimeSourceFlags(&flags));
+
+  // Add custom master flags.
+  copy(opts_.extra_master_flags.begin(), opts_.extra_master_flags.end(),
+       std::back_inserter(flags));
 
   // Start the masters.
+  const string& exe = GetBinaryPath(kMasterBinaryName);
   for (int i = 0; i < num_masters; i++) {
     string daemon_id = Substitute("master-$0", i);
 
@@ -425,6 +579,13 @@ Status ExternalMiniCluster::StartMasters() {
         opts.extra_flags.emplace_back("--hive_metastore_sasl_enabled=true");
       }
     }
+    if (opts_.enable_sentry) {
+      opts.extra_flags.emplace_back(Substitute("--sentry_service_rpc_addresses=$0",
+                                               sentry_->address().ToString()));
+      if (!opts_.enable_kerberos) {
+        opts.extra_flags.emplace_back("--sentry_service_security_mode=none");
+      }
+    }
     opts.logtostderr = opts_.logtostderr;
 
     scoped_refptr<ExternalMaster> peer = new ExternalMaster(opts);
@@ -441,22 +602,27 @@ Status ExternalMiniCluster::StartMasters() {
 }
 
 string ExternalMiniCluster::GetBindIpForTabletServer(int index) const {
-  return MiniCluster::GetBindIpForDaemon(MiniCluster::TSERVER, index, opts_.bind_mode);
+  return MiniCluster::GetBindIpForDaemonWithType(MiniCluster::TSERVER, index,
+                                                 opts_.bind_mode);
 }
 
 string ExternalMiniCluster::GetBindIpForMaster(int index) const {
-  return MiniCluster::GetBindIpForDaemon(MiniCluster::MASTER, index, opts_.bind_mode);
+  return MiniCluster::GetBindIpForDaemonWithType(MiniCluster::MASTER, index,
+                                                 opts_.bind_mode);
+}
+
+string ExternalMiniCluster::GetBindIpForExternalServer(int index) const {
+  return MiniCluster::GetBindIpForDaemonWithType(MiniCluster::EXTERNAL_SERVER,
+                                                 index, opts_.bind_mode);
 }
 
 Status ExternalMiniCluster::AddTabletServer() {
   CHECK(leader_master() != nullptr)
       << "Must have started at least 1 master before adding tablet servers";
 
-  int idx = tablet_servers_.size();
-  string daemon_id = Substitute("ts-$0", idx);
-
-  vector<HostPort> master_hostports = master_rpc_addrs();
-  string bind_host = GetBindIpForTabletServer(idx);
+  const int idx = tablet_servers_.size();
+  const string daemon_id = Substitute("ts-$0", idx);
+  const string bind_host = GetBindIpForTabletServer(idx);
 
   ExternalDaemonOptions opts;
   opts.messenger = messenger_;
@@ -469,11 +635,16 @@ Status ExternalMiniCluster::AddTabletServer() {
     opts.perf_record_filename =
         Substitute("$0/perf-$1.data", opts.log_dir, daemon_id);
   }
-  opts.extra_flags = SubstituteInFlags(opts_.extra_tserver_flags, idx);
+  vector<string> extra_flags;
+  RETURN_NOT_OK(AddTimeSourceFlags(&extra_flags));
+  auto flags = SubstituteInFlags(opts_.extra_tserver_flags, idx);
+  copy(flags.begin(), flags.end(), std::back_inserter(extra_flags));
+  opts.extra_flags = extra_flags;
   opts.start_process_timeout = opts_.start_process_timeout;
   opts.rpc_bind_address = HostPort(bind_host, 0);
   opts.logtostderr = opts_.logtostderr;
 
+  vector<HostPort> master_hostports = master_rpc_addrs();
   scoped_refptr<ExternalTabletServer> ts = new ExternalTabletServer(opts, master_hostports);
   if (opts_.enable_kerberos) {
     RETURN_NOT_OK_PREPEND(ts->EnableKerberos(kdc_.get(), bind_host),
@@ -484,6 +655,21 @@ Status ExternalMiniCluster::AddTabletServer() {
   tablet_servers_.push_back(ts);
   return Status::OK();
 }
+
+#if !defined(NO_CHRONY)
+Status ExternalMiniCluster::AddNtpServer(const Sockaddr& addr) {
+  clock::MiniChronydOptions options;
+  options.index = ntp_servers_.size();
+  options.data_root = JoinPathSegments(cluster_root(),
+                                       Substitute("chrony.$0", options.index));
+  options.bindaddress = addr.host();
+  options.port = static_cast<uint16_t>(addr.port());
+  unique_ptr<MiniChronyd> chrony(new MiniChronyd(std::move(options)));
+  RETURN_NOT_OK(chrony->Start());
+  ntp_servers_.emplace_back(std::move(chrony));
+  return Status::OK();
+}
+#endif // #if !defined(NO_CHRONY) ...
 
 Status ExternalMiniCluster::WaitForTabletServerCount(int count, const MonoDelta& timeout) {
   MonoTime deadline = MonoTime::Now() + timeout;
@@ -661,6 +847,18 @@ vector<ExternalDaemon*> ExternalMiniCluster::daemons() const {
   }
   return results;
 }
+
+#if !defined(NO_CHRONY)
+vector<MiniChronyd*> ExternalMiniCluster::ntp_servers() const {
+  vector<MiniChronyd*> servers;
+  servers.reserve(ntp_servers_.size());
+  for (const auto& server : ntp_servers_) {
+    DCHECK(server);
+    servers.emplace_back(server.get());
+  }
+  return servers;
+}
+#endif // #if !defined(NO_CHRONY) ...
 
 vector<HostPort> ExternalMiniCluster::master_rpc_addrs() const {
   vector<HostPort> master_hostports;
@@ -897,7 +1095,7 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   if (!success) {
     ignore_result(p->Kill(SIGKILL));
     return Status::TimedOut(
-        Substitute("Timed out after $0s waiting for process ($1) to write info file ($2)",
+        Substitute("Timed out after $0 waiting for process ($1) to write info file ($2)",
                    opts_.start_process_timeout.ToString(), opts_.exe, info_path));
   }
 
@@ -1020,13 +1218,13 @@ void ExternalDaemon::Shutdown() {
   // Before we kill the process, store the addresses. If we're told to
   // start again we'll reuse these. Store only the port if the
   // daemons were using wildcard address for binding.
-  if (rpc_bind_address().host() != MiniCluster::kWildcardIpAddr) {
+  if (rpc_bind_address().host() != kWildcardIpAddr) {
     bound_rpc_ = bound_rpc_hostport();
     bound_http_ = bound_http_hostport();
   } else {
-    bound_rpc_.set_host(MiniCluster::kWildcardIpAddr);
+    bound_rpc_.set_host(kWildcardIpAddr);
     bound_rpc_.set_port(bound_rpc_hostport().port());
-    bound_http_.set_host(MiniCluster::kWildcardIpAddr);
+    bound_http_.set_host(kWildcardIpAddr);
     bound_http_.set_port(bound_http_hostport().port());
   }
 

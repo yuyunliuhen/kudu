@@ -26,22 +26,26 @@ under the License.
       <th>State</th>
       <th title="pseudo-SQL query description">Query</th>
       <th>Requestor</th>
-      <th title="running time of the scan">Duration</th>
+      <th title="amount of time that the scanner was/has been open on the server">Duration</th>
+      <th title="number of round trips">Round trips</th>
       <th title="elapsed time since the scan started">Time since start</th>
+      <th title="{{timing_title}}">Timing</th>
       <th>Column Stats</th>
     </tr>
   </thead>
   <tbody>
     {{#scans}}
     <tr>
-      <td><a href="/tablet?id={{tablet_id}}"><samp>{{tablet_id}}</samp></a></td>
+      <td><a href="{{base_url}}/tablet?id={{tablet_id}}"><samp>{{tablet_id}}</samp></a></td>
       <td><samp>{{scanner_id}}</samp></td>
       <td>{{state}}</td>
       {{! The query string is pre-formatted HTML, so don't escape it (triple-brace). }}
       <td><pre>{{{query}}}</pre></td>
       <td><samp>{{requestor}}</samp></td>
       <td title="{{duration_title}}">{{duration}}</td>
+      <td>{{num_round_trips}}</td>
       <td title="{{time_since_start_title}}">{{time_since_start}}</td>
+      <td>real: {{wall_secs}} user: {{user_secs}} sys: {{sys_secs}}</td>
 
       <td>
         <table class="table table-striped">

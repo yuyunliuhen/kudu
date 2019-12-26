@@ -38,6 +38,8 @@
 #include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/raft_consensus.h"
+#include "kudu/fs/data_dirs.h"
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/bind.h"
 #include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/port.h"
@@ -64,6 +66,7 @@ METRIC_DEFINE_histogram(tablet, op_prepare_queue_length, "Operation Prepare Queu
                         "Number of operations waiting to be prepared within this tablet. "
                         "High queue lengths indicate that the server is unable to process "
                         "operations as fast as they are being written to the WAL.",
+                        kudu::MetricLevel::kInfo,
                         10000, 2);
 
 METRIC_DEFINE_histogram(tablet, op_prepare_queue_time, "Operation Prepare Queue Time",
@@ -71,6 +74,7 @@ METRIC_DEFINE_histogram(tablet, op_prepare_queue_time, "Operation Prepare Queue 
                         "Time that operations spent waiting in the prepare queue before being "
                         "processed. High queue times indicate that the server is unable to "
                         "process operations as fast as they are being written to the WAL.",
+                        kudu::MetricLevel::kInfo,
                         10000000, 2);
 
 METRIC_DEFINE_histogram(tablet, op_prepare_run_time, "Operation Prepare Run Time",
@@ -79,14 +83,21 @@ METRIC_DEFINE_histogram(tablet, op_prepare_run_time, "Operation Prepare Run Time
                         "High values may indicate that the server is under-provisioned or "
                         "that operations are experiencing high contention with one another for "
                         "locks.",
+                        kudu::MetricLevel::kInfo,
                         10000000, 2);
 
 METRIC_DEFINE_gauge_size(tablet, on_disk_size, "Tablet Size On Disk",
                          kudu::MetricUnit::kBytes,
-                         "Space used by this tablet on disk, including metadata.");
+                         "Space used by this tablet on disk, including metadata.",
+                         kudu::MetricLevel::kInfo);
 METRIC_DEFINE_gauge_string(tablet, state, "Tablet State",
                            kudu::MetricUnit::kState,
-                           "State of this tablet.");
+                           "State of this tablet.",
+                           kudu::MetricLevel::kInfo);
+METRIC_DEFINE_gauge_uint64(tablet, live_row_count, "Tablet Live Row Count",
+                           kudu::MetricUnit::kRows,
+                           "Number of live rows in this tablet, excludes deleted rows.",
+                           kudu::MetricLevel::kInfo);
 
 namespace kudu {
 namespace tablet {
@@ -123,7 +134,6 @@ TabletReplica::TabletReplica(
     Callback<void(const std::string& reason)> mark_dirty_clbk)
     : meta_(DCHECK_NOTNULL(std::move(meta))),
       cmeta_manager_(DCHECK_NOTNULL(std::move(cmeta_manager))),
-      tablet_id_(meta_->tablet_id()),
       local_peer_pb_(std::move(local_peer_pb)),
       log_anchor_registry_(new LogAnchorRegistry()),
       apply_pool_(apply_pool),
@@ -163,7 +173,8 @@ Status TabletReplica::Start(const ConsensusBootstrapInfo& bootstrap_info,
                             shared_ptr<Messenger> messenger,
                             scoped_refptr<ResultTracker> result_tracker,
                             scoped_refptr<Log> log,
-                            ThreadPool* prepare_pool) {
+                            ThreadPool* prepare_pool,
+                            DnsResolver* resolver) {
   DCHECK(tablet) << "A TabletReplica must be provided with a Tablet";
   DCHECK(log) << "A TabletReplica must be provided with a Log";
 
@@ -171,7 +182,7 @@ Status TabletReplica::Start(const ConsensusBootstrapInfo& bootstrap_info,
     std::lock_guard<simple_spinlock> state_change_guard(state_change_lock_);
 
     scoped_refptr<MetricEntity> metric_entity;
-    gscoped_ptr<PeerProxyFactory> peer_proxy_factory;
+    unique_ptr<PeerProxyFactory> peer_proxy_factory;
     scoped_refptr<TimeManager> time_manager;
     {
       std::lock_guard<simple_spinlock> l(lock_);
@@ -197,11 +208,19 @@ Status TabletReplica::Start(const ConsensusBootstrapInfo& bootstrap_info,
         txn_tracker_.StartInstrumentation(tablet_->GetMetricEntity());
 
         METRIC_on_disk_size.InstantiateFunctionGauge(
-                tablet_->GetMetricEntity(), Bind(&TabletReplica::OnDiskSize, Unretained(this)))
+            tablet_->GetMetricEntity(), Bind(&TabletReplica::OnDiskSize, Unretained(this)))
             ->AutoDetach(&metric_detacher_);
         METRIC_state.InstantiateFunctionGauge(
             tablet_->GetMetricEntity(), Bind(&TabletReplica::StateName, Unretained(this)))
             ->AutoDetach(&metric_detacher_);
+        if (tablet_->metadata()->supports_live_row_count()) {
+          METRIC_live_row_count.InstantiateFunctionGauge(
+              tablet_->GetMetricEntity(),
+              Bind(&TabletReplica::CountLiveRowsNoFail, Unretained(this)))
+              ->AutoDetach(&metric_detacher_);
+        } else {
+          METRIC_live_row_count.InstantiateInvalid(tablet_->GetMetricEntity(), 0);
+        }
       }
       txn_tracker_.StartMemoryTracking(tablet_->mem_tracker());
 
@@ -209,7 +228,7 @@ Status TabletReplica::Start(const ConsensusBootstrapInfo& bootstrap_info,
       VLOG(2) << "T " << tablet_id() << " P " << consensus_->peer_uuid() << ": Peer starting";
       VLOG(2) << "RaftConfig before starting: " << SecureDebugString(consensus_->CommittedConfig());
 
-      peer_proxy_factory.reset(new RpcPeerProxyFactory(messenger_));
+      peer_proxy_factory.reset(new RpcPeerProxyFactory(messenger_, resolver));
       time_manager.reset(new TimeManager(clock_, tablet_->mvcc_manager()->GetCleanTimestamp()));
     }
 
@@ -436,11 +455,23 @@ void TabletReplica::GetTabletStatusPB(TabletStatusPB* status_pb_out) const {
     status_pb_out->set_state(state_);
     status_pb_out->set_last_status(last_status_);
   }
-  status_pb_out->set_tablet_id(meta_->tablet_id());
+  const string& tablet_id = meta_->tablet_id();
+  status_pb_out->set_tablet_id(tablet_id);
   status_pb_out->set_table_name(meta_->table_name());
   meta_->partition().ToPB(status_pb_out->mutable_partition());
   status_pb_out->set_tablet_data_state(meta_->tablet_data_state());
   status_pb_out->set_estimated_on_disk_size(OnDiskSize());
+  // There are circumstances where the call to 'FindDataDirsByTabletId' may
+  // fail, like if the tablet is tombstoned or failed. It's alright to return
+  // an empty 'data_dirs' in this case-- the state and last status will inform
+  // the caller.
+  vector<string> data_dirs;
+  ignore_result(
+      meta_->fs_manager()->dd_manager()->FindDataDirsByTabletId(tablet_id,
+                                                                &data_dirs));
+  for (auto& dir : data_dirs) {
+    status_pb_out->add_data_dirs(std::move(dir));
+  }
 }
 
 Status TabletReplica::RunLogGC() {
@@ -781,6 +812,60 @@ size_t TabletReplica::OnDiskSize() const {
     ret += log->OnDiskSize();
   }
   return ret;
+}
+
+Status TabletReplica::CountLiveRows(uint64_t* live_row_count) const {
+  shared_ptr<Tablet> tablet;
+  {
+    std::lock_guard<simple_spinlock> l(lock_);
+    tablet = tablet_;
+  }
+
+  if (!tablet) {
+    return Status::IllegalState("The tablet is shutdown.");
+  }
+
+  return tablet->CountLiveRows(live_row_count);
+}
+
+uint64_t TabletReplica::CountLiveRowsNoFail() const {
+  uint64_t live_row_count = 0;
+  ignore_result(CountLiveRows(&live_row_count));
+  return live_row_count;
+}
+
+void TabletReplica::UpdateTabletStats(vector<string>* dirty_tablets) {
+  // It's necessary to check the state before visiting the "consensus_".
+  if (RUNNING != state()) {
+    return;
+  }
+
+  ReportedTabletStatsPB pb;
+  pb.set_on_disk_size(OnDiskSize());
+  uint64_t live_row_count;
+  Status s = CountLiveRows(&live_row_count);
+  if (s.ok()) {
+    pb.set_live_row_count(live_row_count);
+  }
+
+  // We cannot hold 'lock_' while calling RaftConsensus::role() because
+  // it may invoke TabletReplica::StartFollowerTransaction() and lead to
+  // a deadlock.
+  RaftPeerPB::Role role = consensus_->role();
+
+  std::lock_guard<simple_spinlock> l(lock_);
+  if (stats_pb_.on_disk_size() != pb.on_disk_size() ||
+      stats_pb_.live_row_count() != pb.live_row_count()) {
+    if (consensus::RaftPeerPB_Role_LEADER == role) {
+      dirty_tablets->emplace_back(tablet_id());
+    }
+    stats_pb_.Swap(&pb);
+  }
+}
+
+ReportedTabletStatsPB TabletReplica::GetTabletStats() const {
+  std::lock_guard<simple_spinlock> l(lock_);
+  return stats_pb_;
 }
 
 void TabletReplica::MakeUnavailable(const Status& error) {

@@ -64,8 +64,8 @@ without padding.
 | field | width (bytes) | notes |
 | --- | --- | --- |
 | checksum | 4 | optional CRC-32 checksum of message, magic, and length |
-| magic | 8 | [see below](#versioning) |
 | message | variable | encoded [`CFileFooterPB`][cfile.proto] Protobuf message |
+| magic | 8 | [see below](#versioning) |
 | length | 4 | unsigned 32-bit length of the preceding Protobuf message |
 
 ### Versioning
@@ -128,7 +128,7 @@ exist, the reader can optionally validate them against the read data.
 Block data is encoded before being stored. If compression is enabled, then the
 block is encoded first, and then compressed.
 
-Data blocks are best-effort size limited to `--cfile-default-block-size` bytes, at
+Data blocks are best-effort size limited to `--cfile_default_block_size` bytes, at
 which point a new block will be added to the CFile.
 
 ### Plain Encoding
@@ -152,7 +152,7 @@ follows:
 
 ### Dictionary Encoding
 
-[Dictionary encoding](dictionary-encoding) may be used for BINARY or STRING
+Dictionary encoding may be used for BINARY or STRING
 columns. All dictionary encoded blocks in a CFile share the same dictionary. If
 the dictionary becomes full, subsequent blocks in the CFile switch to plain
 encoding. The dictionary is stored as a plain encoded binary block, and the data

@@ -17,17 +17,22 @@
 
 #include "kudu/common/wire_protocol.h"
 
+#include <time.h>
+
 #include <cstdint>
 #include <cstring>
 #include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
 #include <glog/logging.h>
+#include <google/protobuf/map.h>
+#include <google/protobuf/stubs/common.h>
 
-#include "kudu/common/columnblock.h"
 #include "kudu/common/column_predicate.h"
+#include "kudu/common/columnblock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/row.h"
 #include "kudu/common/rowblock.h"
@@ -38,10 +43,13 @@
 #include "kudu/gutil/fixedarray.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/fastmem.h"
+#include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/walltime.h"
 #include "kudu/util/bitmap.h"
 #include "kudu/util/compression/compression.pb.h"
 #include "kudu/util/faststring.h"
+#include "kudu/util/hash.pb.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
@@ -49,9 +57,11 @@
 #include "kudu/util/safe_math.h"
 #include "kudu/util/slice.h"
 
+using google::protobuf::Map;
 using google::protobuf::RepeatedPtrField;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
+using std::map;
 using std::string;
 using std::vector;
 using strings::Substitute;
@@ -218,6 +228,8 @@ void ColumnSchemaToPB(const ColumnSchema& col_schema, ColumnSchemaPB *pb, int fl
       type == DataType::DECIMAL128) {
     pb->mutable_type_attributes()->set_precision(col_schema.type_attributes().precision);
     pb->mutable_type_attributes()->set_scale(col_schema.type_attributes().scale);
+  } else if (type == DataType::VARCHAR) {
+    pb->mutable_type_attributes()->set_length(col_schema.type_attributes().length);
   }
   if (!(flags & SCHEMA_PB_WITHOUT_STORAGE_ATTRIBUTES)) {
     pb->set_encoding(col_schema.attributes().encoding);
@@ -242,9 +254,12 @@ void ColumnSchemaToPB(const ColumnSchema& col_schema, ColumnSchemaPB *pb, int fl
       pb->set_write_default_value(write_value, col_schema.type_info()->size());
     }
   }
+  if (!col_schema.comment().empty() && !(flags & SCHEMA_PB_WITHOUT_COMMENT)) {
+    pb->set_comment(col_schema.comment());
+  }
 }
 
-ColumnSchema ColumnSchemaFromPB(const ColumnSchemaPB& pb) {
+Status ColumnSchemaFromPB(const ColumnSchemaPB& pb, boost::optional<ColumnSchema>* col_schema) {
   const void *write_default_ptr = nullptr;
   const void *read_default_ptr = nullptr;
   Slice write_default;
@@ -255,6 +270,11 @@ ColumnSchema ColumnSchemaFromPB(const ColumnSchemaPB& pb) {
     if (typeinfo->physical_type() == BINARY) {
       read_default_ptr = &read_default;
     } else {
+      if (typeinfo->size() > read_default.size()) {
+        return Status::Corruption(
+            Substitute("Not enough bytes for $0: read default size ($1) less than type size ($2)",
+                       typeinfo->name(), read_default.size(), typeinfo->size()));
+      }
       read_default_ptr = read_default.data();
     }
   }
@@ -263,6 +283,11 @@ ColumnSchema ColumnSchemaFromPB(const ColumnSchemaPB& pb) {
     if (typeinfo->physical_type() == BINARY) {
       write_default_ptr = &write_default;
     } else {
+      if (typeinfo->size() > write_default.size()) {
+        return Status::Corruption(
+            Substitute("Not enough bytes for $0: write default size ($1) less than type size ($2)",
+                       typeinfo->name(), write_default.size(), typeinfo->size()));
+      }
       write_default_ptr = write_default.data();
     }
   }
@@ -276,6 +301,9 @@ ColumnSchema ColumnSchemaFromPB(const ColumnSchemaPB& pb) {
     if (typeAttributesPB.has_scale()) {
       type_attributes.scale = typeAttributesPB.scale();
     }
+    if (typeAttributesPB.has_length()) {
+      type_attributes.length = typeAttributesPB.length();
+    }
   }
 
   ColumnStorageAttributes attributes;
@@ -288,9 +316,15 @@ ColumnSchema ColumnSchemaFromPB(const ColumnSchemaPB& pb) {
   if (pb.has_cfile_block_size()) {
     attributes.cfile_block_size = pb.cfile_block_size();
   }
-  return ColumnSchema(pb.name(), pb.type(), pb.is_nullable(),
-                      read_default_ptr, write_default_ptr,
-                      attributes, type_attributes);
+
+  // According to the URL below, the default value for strings that are optional
+  // in protobuf is the empty string. So, it's safe to use pb.comment() directly
+  // regardless of whether has_comment() is true or false.
+  // https://developers.google.com/protocol-buffers/docs/proto#optional
+  *col_schema = ColumnSchema(pb.name(), pb.type(), pb.is_nullable(),
+                             read_default_ptr, write_default_ptr,
+                             attributes, type_attributes, pb.comment());
+  return Status::OK();
 }
 
 void ColumnSchemaDeltaToPB(const ColumnSchemaDelta& col_delta, ColumnSchemaDeltaPB *pb) {
@@ -315,6 +349,9 @@ void ColumnSchemaDeltaToPB(const ColumnSchemaDelta& col_delta, ColumnSchemaDelta
   if (col_delta.cfile_block_size) {
     pb->set_block_size(*col_delta.cfile_block_size);
   }
+  if (col_delta.new_comment) {
+    pb->set_new_comment(*col_delta.new_comment);
+  }
 }
 
 ColumnSchemaDelta ColumnSchemaDeltaFromPB(const ColumnSchemaDeltaPB& pb) {
@@ -337,6 +374,9 @@ ColumnSchemaDelta ColumnSchemaDeltaFromPB(const ColumnSchemaDeltaPB& pb) {
   if (pb.has_block_size()) {
     col_delta.cfile_block_size = boost::optional<int32_t>(pb.block_size());
   }
+  if (pb.has_new_comment()) {
+    col_delta.new_comment = boost::optional<string>(pb.new_comment());
+  }
   return col_delta;
 }
 
@@ -349,7 +389,9 @@ Status ColumnPBsToSchema(const RepeatedPtrField<ColumnSchemaPB>& column_pbs,
   int num_key_columns = 0;
   bool is_handling_key = true;
   for (const ColumnSchemaPB& pb : column_pbs) {
-    columns.push_back(ColumnSchemaFromPB(pb));
+    boost::optional<ColumnSchema> column;
+    RETURN_NOT_OK(ColumnSchemaFromPB(pb, &column));
+    columns.push_back(*column);
     if (pb.is_key()) {
       if (!is_handling_key) {
         return Status::InvalidArgument(
@@ -629,6 +671,61 @@ Status ColumnPredicateFromPB(const Schema& schema,
   return Status::OK();
 }
 
+const char kTableHistoryMaxAgeSec[] = "kudu.table.history_max_age_sec";
+const char kTableMaintenancePriority[] = "kudu.table.maintenance_priority";
+Status ExtraConfigPBToMap(const TableExtraConfigPB& pb, map<string, string>* configs) {
+  Map<string, string> tmp;
+  RETURN_NOT_OK(ExtraConfigPBToPBMap(pb, &tmp));
+  map<string, string> result(tmp.begin(), tmp.end());
+  *configs = std::move(result);
+  return Status::OK();
+}
+
+Status ParseInt32Config(const string& name, const string& value, int32_t* result) {
+  CHECK(result);
+  if (!safe_strto32(value, result)) {
+    return Status::InvalidArgument(Substitute("unable to parse $0", name), value);
+  }
+  return Status::OK();
+}
+
+Status ExtraConfigPBFromPBMap(const Map<string, string>& configs, TableExtraConfigPB* pb) {
+  TableExtraConfigPB result;
+  for (const auto& config : configs) {
+    const string& name = config.first;
+    const string& value = config.second;
+    if (name == kTableHistoryMaxAgeSec) {
+      if (!value.empty()) {
+        int32_t history_max_age_sec;
+        RETURN_NOT_OK(ParseInt32Config(name, value, &history_max_age_sec));
+        result.set_history_max_age_sec(history_max_age_sec);
+      }
+    } else if (name == kTableMaintenancePriority) {
+      if (!value.empty()) {
+        int32_t maintenance_priority;
+        RETURN_NOT_OK(ParseInt32Config(name, value, &maintenance_priority));
+        result.set_maintenance_priority(maintenance_priority);
+      }
+    } else {
+      LOG(WARNING) << "Unknown extra configuration property: " << name;
+    }
+  }
+  *pb = std::move(result);
+  return Status::OK();
+}
+
+Status ExtraConfigPBToPBMap(const TableExtraConfigPB& pb, Map<string, string>* configs) {
+  Map<string, string> result;
+  if (pb.has_history_max_age_sec()) {
+    result[kTableHistoryMaxAgeSec] = std::to_string(pb.history_max_age_sec());
+  }
+  if (pb.has_maintenance_priority()) {
+    result[kTableMaintenancePriority] = std::to_string(pb.maintenance_priority());
+  }
+  *configs = std::move(result);
+  return Status::OK();
+}
+
 // Because we use a faststring here, ASAN tests become unbearably slow
 // with the extra verifications.
 ATTRIBUTE_NO_ADDRESS_SAFETY_ANALYSIS
@@ -815,51 +912,40 @@ void AppendRowToString<RowBlockRow>(const RowBlockRow& row, string* buf) {
 // be copied to column 'dst_col_idx' in the output protobuf; otherwise,
 // dst_col_idx must be equal to col_idx.
 template<bool IS_NULLABLE, bool IS_VARLEN>
-static void CopyColumn(const RowBlock& block, int col_idx, int dst_col_idx, uint8_t* dst_base,
-                       faststring* indirect_data, const Schema* dst_schema, size_t row_stride,
-                       size_t schema_byte_size, size_t column_offset) {
+static void CopyColumn(
+    const ColumnBlock& column_block, int dst_col_idx, uint8_t* __restrict__ dst_base,
+    faststring* indirect_data, const Schema* dst_schema, size_t row_stride,
+    size_t schema_byte_size, size_t column_offset,
+    const vector<int>& row_idx_select) {
   DCHECK(dst_schema);
-  ColumnBlock column_block = block.column_block(col_idx);
   uint8_t* dst = dst_base + column_offset;
   size_t offset_to_null_bitmap = schema_byte_size - column_offset;
 
   size_t cell_size = column_block.stride();
   const uint8_t* src = column_block.cell_ptr(0);
 
-  BitmapIterator selected_row_iter(block.selection_vector()->bitmap(), block.nrows());
-  int run_size;
-  bool selected;
-  int row_idx = 0;
-  while ((run_size = selected_row_iter.Next(&selected))) {
-    if (!selected) {
-      src += run_size * cell_size;
-      row_idx += run_size;
-      continue;
-    }
-    for (int i = 0; i < run_size; i++) {
-      if (IS_NULLABLE && column_block.is_null(row_idx)) {
-        BitmapChange(dst + offset_to_null_bitmap, dst_col_idx, true);
-      } else if (IS_VARLEN) {
-        const Slice *slice = reinterpret_cast<const Slice *>(src);
-        size_t offset_in_indirect = indirect_data->size();
-        indirect_data->append(reinterpret_cast<const char*>(slice->data()), slice->size());
+  for (auto index : row_idx_select) {
+    src = column_block.cell_ptr(index);
+    if (IS_NULLABLE && column_block.is_null(index)) {
+      BitmapChange(dst + offset_to_null_bitmap, dst_col_idx, true);
+    } else if (IS_VARLEN) {
+      const Slice* slice = reinterpret_cast<const Slice *>(src);
+      size_t offset_in_indirect = indirect_data->size();
+      indirect_data->append(reinterpret_cast<const char*>(slice->data()), slice->size());
 
-        Slice *dst_slice = reinterpret_cast<Slice *>(dst);
-        *dst_slice = Slice(reinterpret_cast<const uint8_t*>(offset_in_indirect),
-                           slice->size());
-        if (IS_NULLABLE) {
-          BitmapChange(dst + offset_to_null_bitmap, dst_col_idx, false);
-        }
-      } else { // non-string, non-null
-        strings::memcpy_inlined(dst, src, cell_size);
-        if (IS_NULLABLE) {
-          BitmapChange(dst + offset_to_null_bitmap, dst_col_idx, false);
-        }
+      Slice* dst_slice = reinterpret_cast<Slice *>(dst);
+      *dst_slice = Slice(reinterpret_cast<const uint8_t*>(offset_in_indirect),
+                         slice->size());
+      if (IS_NULLABLE) {
+        BitmapChange(dst + offset_to_null_bitmap, dst_col_idx, false);
       }
-      dst += row_stride;
-      src += cell_size;
-      row_idx++;
+    } else { // non-string, non-null
+      strings::memcpy_inlined(dst, src, cell_size);
+      if (IS_NULLABLE) {
+        BitmapChange(dst + offset_to_null_bitmap, dst_col_idx, false);
+      }
     }
+    dst += row_stride;
   }
 }
 
@@ -873,10 +959,10 @@ void SerializeRowBlock(const RowBlock& block,
                        faststring* indirect_data,
                        bool pad_unixtime_micros_to_16_bytes) {
   DCHECK_GT(block.nrows(), 0);
-  const Schema& tablet_schema = block.schema();
+  const Schema* tablet_schema = block.schema();
 
   if (projection_schema == nullptr) {
-    projection_schema = &tablet_schema;
+    projection_schema = tablet_schema;
   }
 
   // Check whether we need to pad or if there are nullable columns, this will dictate whether
@@ -910,14 +996,17 @@ void SerializeRowBlock(const RowBlock& block,
     memset(base, 0, additional_size);
   }
 
+  vector<int> selected_row_indexes;
+  block.selection_vector()->GetSelectedRows(&selected_row_indexes);
   size_t t_schema_idx = 0;
   size_t padding_so_far = 0;
   for (int p_schema_idx = 0; p_schema_idx < projection_schema->num_columns(); p_schema_idx++) {
     const ColumnSchema& col = projection_schema->column(p_schema_idx);
-    t_schema_idx = tablet_schema.find_column(col.name());
+    t_schema_idx = tablet_schema->find_column(col.name());
     DCHECK_NE(t_schema_idx, -1);
 
     size_t column_offset = projection_schema->column_offset(p_schema_idx) + padding_so_far;
+    const ColumnBlock& column_block = block.column_block(t_schema_idx);
 
     // Generating different functions for each of these cases makes them much less
     // branch-heavy -- we do the branch once outside the loop, and then have a
@@ -926,17 +1015,17 @@ void SerializeRowBlock(const RowBlock& block,
     // even bigger gains, since we could inline the constant cell sizes and column
     // offsets.
     if (col.is_nullable() && col.type_info()->physical_type() == BINARY) {
-      CopyColumn<true, true>(block, t_schema_idx, p_schema_idx, base, indirect_data,
-                             projection_schema, row_stride, schema_byte_size, column_offset);
+      CopyColumn<true, true>(column_block, p_schema_idx, base, indirect_data, projection_schema,
+                             row_stride, schema_byte_size, column_offset, selected_row_indexes);
     } else if (col.is_nullable() && col.type_info()->physical_type() != BINARY) {
-      CopyColumn<true, false>(block, t_schema_idx, p_schema_idx, base, indirect_data,
-                              projection_schema, row_stride, schema_byte_size, column_offset);
+      CopyColumn<true, false>(column_block, p_schema_idx, base, indirect_data, projection_schema,
+                              row_stride, schema_byte_size, column_offset, selected_row_indexes);
     } else if (!col.is_nullable() && col.type_info()->physical_type() == BINARY) {
-      CopyColumn<false, true>(block, t_schema_idx, p_schema_idx, base, indirect_data,
-                              projection_schema, row_stride, schema_byte_size, column_offset);
+      CopyColumn<false, true>(column_block, p_schema_idx, base, indirect_data, projection_schema,
+                              row_stride, schema_byte_size, column_offset, selected_row_indexes);
     } else if (!col.is_nullable() && col.type_info()->physical_type() != BINARY) {
-      CopyColumn<false, false>(block, t_schema_idx, p_schema_idx, base, indirect_data,
-                               projection_schema, row_stride, schema_byte_size, column_offset);
+      CopyColumn<false, false>(column_block, p_schema_idx, base, indirect_data, projection_schema,
+                               row_stride, schema_byte_size, column_offset, selected_row_indexes);
     } else {
       LOG(FATAL) << "cannot reach here";
     }
@@ -946,6 +1035,19 @@ void SerializeRowBlock(const RowBlock& block,
     }
   }
   rowblock_pb->set_num_rows(rowblock_pb->num_rows() + num_rows);
+}
+
+string StartTimeToString(const ServerRegistrationPB& reg) {
+  string start_time;
+  if (reg.has_start_time()) {
+    // Convert epoch time to localtime.
+    StringAppendStrftime(&start_time, "%Y-%m-%d %H:%M:%S %Z",
+                         static_cast<time_t>(reg.start_time()), true);
+  } else {
+    start_time = "<unknown>";
+  }
+
+  return start_time;
 }
 
 } // namespace kudu

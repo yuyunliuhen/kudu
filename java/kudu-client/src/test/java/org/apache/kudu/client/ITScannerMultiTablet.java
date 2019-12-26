@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
 import static org.apache.kudu.test.ClientTestUtil.getBasicSchema;
@@ -23,11 +24,11 @@ import static org.junit.Assert.assertTrue;
 import java.util.Random;
 
 import com.google.common.collect.Lists;
-import org.apache.kudu.test.KuduTestHarness;
 import org.junit.Before;
+import org.junit.Rule;
 
 import org.apache.kudu.Schema;
-import org.junit.Rule;
+import org.apache.kudu.test.KuduTestHarness;
 
 /**
  * Integration test that inserts enough data to trigger flushes and getting multiple data
@@ -36,12 +37,12 @@ import org.junit.Rule;
 public class ITScannerMultiTablet {
 
   private static final String TABLE_NAME =
-      ITScannerMultiTablet.class.getName()+"-"+System.currentTimeMillis();
+      ITScannerMultiTablet.class.getName() + "-" + System.currentTimeMillis();
   protected static final int ROW_COUNT = 20000;
   protected static final int TABLET_COUNT = 3;
 
   private static Schema schema = getBasicSchema();
-  protected static KuduTable table;
+  protected KuduTable table;
 
   private static Random random = new Random(1234);
 
@@ -177,7 +178,7 @@ public class ITScannerMultiTablet {
       // Forcefully disconnects the current connection and fails all outstanding RPCs
       // in the middle of scanning.
       harness.getAsyncClient().newRpcProxy(scanner.currentTablet().getReplicaSelectedServerInfo(
-          scanner.getReplicaSelection())).getConnection().disconnect();
+          scanner.getReplicaSelection(), /* location= */"")).getConnection().disconnect();
 
       while (scanner.hasMoreRows()) {
         loopCount++;

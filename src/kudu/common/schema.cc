@@ -21,6 +21,7 @@
 #include <unordered_set>
 
 #include "kudu/common/row.h"
+#include "kudu/common/rowblock.h" // IWYU pragma: keep
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/strcat.h"
@@ -49,6 +50,36 @@ static const ColumnId kFirstColumnId(0);
 static const ColumnId  kFirstColumnId(10);
 #endif
 
+namespace {
+
+Status FindFirstIsDeletedVirtualColumnIdx(
+    const vector<ColumnSchema>& cols, int* idx) {
+  for (int i = 0; i < cols.size(); i++) {
+    const auto& col = cols[i];
+    if (col.type_info()->type() == IS_DELETED) {
+      // Enforce some properties on the virtual column that simplify our
+      // implementation.
+      // TODO(KUDU-2692): Consider removing these requirements.
+      if (col.is_nullable()) {
+        return Status::InvalidArgument(Substitute(
+            "Virtual column $0 $1 must not be nullable",
+            col.name(), col.TypeToString()));
+      }
+      if (!col.has_read_default()) {
+        return Status::InvalidArgument(Substitute(
+            "Virtual column $0 $1 must have a default value for read",
+            col.name(), col.TypeToString()));
+      }
+      *idx = i;
+      return Status::OK();
+    }
+  }
+  *idx = Schema::kColumnNotFound;
+  return Status::OK();
+}
+
+} // anonymous namespace
+
 bool ColumnTypeAttributes::EqualsForType(ColumnTypeAttributes other,
                                          DataType type) const {
   switch (type) {
@@ -56,6 +87,8 @@ bool ColumnTypeAttributes::EqualsForType(ColumnTypeAttributes other,
     case DECIMAL64:
     case DECIMAL128:
       return precision == other.precision && scale == other.scale;
+    case VARCHAR:
+      return length == other.length;
     default:
       return true; // true because unhandled types don't use ColumnTypeAttributes.
   }
@@ -67,6 +100,8 @@ string ColumnTypeAttributes::ToStringForType(DataType type) const {
     case DECIMAL64:
     case DECIMAL128:
       return Substitute("($0, $1)", precision, scale);
+    case VARCHAR:
+      return Substitute("($0)", length);
     default:
       return "";
   }
@@ -115,13 +150,17 @@ Status ColumnSchema::ApplyDelta(const ColumnSchemaDelta& col_delta) {
   if (col_delta.cfile_block_size) {
     attributes_.cfile_block_size = *col_delta.cfile_block_size;
   }
+  if (col_delta.new_comment) {
+    comment_ = col_delta.new_comment.value();
+  }
   return Status::OK();
 }
 
-string ColumnSchema::ToString() const {
-  return Substitute("$0 $1",
+string ColumnSchema::ToString(ToStringMode mode) const {
+  return Substitute("$0 $1$2",
                     name_,
-                    TypeToString());
+                    TypeToString(),
+                    mode == ToStringMode::WITH_ATTRIBUTES ? " " + AttrToString() : "");
 }
 
 string ColumnSchema::TypeToString() const {
@@ -133,6 +172,13 @@ string ColumnSchema::TypeToString() const {
                     is_nullable_ ? "NULLABLE" : "NOT NULL");
 }
 
+string ColumnSchema::AttrToString() const {
+  return Substitute("$0 $1 $2",
+                    attributes_.ToString(),
+                    has_read_default() ? Stringify(read_default_value()) : "-",
+                    has_write_default() ? Stringify(write_default_value()) : "-");
+}
+
 size_t ColumnSchema::memory_footprint_excluding_this() const {
   // Rough approximation.
   return name_.capacity();
@@ -142,9 +188,11 @@ size_t ColumnSchema::memory_footprint_including_this() const {
   return kudu_malloc_usable_size(this) + memory_footprint_excluding_this();
 }
 
+const int Schema::kColumnNotFound = -1;
+
 Schema::Schema(const Schema& other)
   : name_to_index_bytes_(0),
-    name_to_index_(/*bucket_count=*/10,
+    name_to_index_(/*bucket_count*/ 10,
                    NameToIndexMap::hasher(),
                    NameToIndexMap::key_equal(),
                    NameToIndexMapAllocator(&name_to_index_bytes_)) {
@@ -162,6 +210,7 @@ void Schema::CopyFrom(const Schema& other) {
   num_key_columns_ = other.num_key_columns_;
   cols_ = other.cols_;
   col_ids_ = other.col_ids_;
+  max_col_id_ = other.max_col_id_;
   col_offsets_ = other.col_offsets_;
   id_to_index_ = other.id_to_index_;
 
@@ -174,6 +223,7 @@ void Schema::CopyFrom(const Schema& other) {
     name_to_index_[col.name()] = i++;
   }
 
+  first_is_deleted_virtual_column_idx_ = other.first_is_deleted_virtual_column_idx_;
   has_nullables_ = other.has_nullables_;
 }
 
@@ -181,13 +231,15 @@ Schema::Schema(Schema&& other) noexcept
     : cols_(std::move(other.cols_)),
       num_key_columns_(other.num_key_columns_),
       col_ids_(std::move(other.col_ids_)),
+      max_col_id_(other.max_col_id_),
       col_offsets_(std::move(other.col_offsets_)),
       name_to_index_bytes_(0),
-      name_to_index_(/*bucket_count=*/10,
+      name_to_index_(/*bucket_count*/ 10,
                      NameToIndexMap::hasher(),
                      NameToIndexMap::key_equal(),
                      NameToIndexMapAllocator(&name_to_index_bytes_)),
       id_to_index_(std::move(other.id_to_index_)),
+      first_is_deleted_virtual_column_idx_(other.first_is_deleted_virtual_column_idx_),
       has_nullables_(other.has_nullables_) {
   // 'name_to_index_' uses a customer allocator which holds a pointer to
   // 'name_to_index_bytes_'. swap() will swap the contents but not the
@@ -207,8 +259,10 @@ Schema& Schema::operator=(Schema&& other) noexcept {
     cols_ = std::move(other.cols_);
     num_key_columns_ = other.num_key_columns_;
     col_ids_ = std::move(other.col_ids_);
+    max_col_id_ = other.max_col_id_;
     col_offsets_ = std::move(other.col_offsets_);
     id_to_index_ = std::move(other.id_to_index_);
+    first_is_deleted_virtual_column_idx_ = other.first_is_deleted_virtual_column_idx_;
     has_nullables_ = other.has_nullables_;
 
     // See the comment in the move constructor implementation for why we swap.
@@ -278,6 +332,9 @@ Status Schema::Reset(const vector<ColumnSchema>& cols,
     id_to_index_.set(ids[i], i);
   }
 
+  RETURN_NOT_OK(FindFirstIsDeletedVirtualColumnIdx(
+      cols_, &first_is_deleted_virtual_column_idx_));
+
   // Determine whether any column is nullable
   has_nullables_ = false;
   for (const ColumnSchema& col : cols_) {
@@ -287,6 +344,16 @@ Status Schema::Reset(const vector<ColumnSchema>& cols,
     }
   }
 
+  return Status::OK();
+}
+
+Status Schema::FindColumn(Slice col_name, int* idx) const {
+  DCHECK(idx);
+  StringPiece sp(reinterpret_cast<const char*>(col_name.data()), col_name.size());
+  *idx = find_column(sp);
+  if (PREDICT_FALSE(*idx == kColumnNotFound)) {
+    return Status::NotFound("No such column", col_name);
+  }
   return Status::OK();
 }
 
@@ -332,7 +399,6 @@ Schema Schema::CopyWithColumnIds() const {
 }
 
 Schema Schema::CopyWithoutColumnIds() const {
-  CHECK(has_column_ids());
   return Schema(cols_, num_key_columns_);
 }
 
@@ -345,11 +411,16 @@ Status Schema::VerifyProjectionCompatibility(const Schema& projection) const {
 
   vector<string> missing_columns;
   for (const ColumnSchema& pcol : projection.columns()) {
+    if (pcol.type_info()->is_virtual()) {
+      // Virtual columns may appear in a projection without appearing in the
+      // schema being projected onto.
+      continue;
+    }
     int index = find_column(pcol.name());
     if (index < 0) {
       missing_columns.push_back(pcol.name());
     } else if (!pcol.EqualsType(cols_[index])) {
-      // TODO: We don't support query with type adaptors yet
+      // TODO(matteo): We don't support query with type adaptors yet.
       return Status::InvalidArgument("The column '" + pcol.name() + "' must have type " +
                                      cols_[index].TypeToString() + " found " + pcol.TypeToString());
     }
@@ -380,8 +451,18 @@ Status Schema::GetMappedReadProjection(const Schema& projection,
   mapped_cols.reserve(projection.num_columns());
   mapped_ids.reserve(projection.num_columns());
 
+  int32_t proj_max_col_id = max_col_id_;
   for (const ColumnSchema& col : projection.columns()) {
     int index = find_column(col.name());
+    if (col.type_info()->is_virtual()) {
+      DCHECK_EQ(kColumnNotFound, index) << "virtual column not expected in tablet schema";
+      DCHECK(!col.is_nullable()); // enforced by Schema constructor
+      DCHECK(col.has_read_default()); // enforced by Schema constructor
+      mapped_cols.push_back(col);
+      // Generate a "fake" column id for virtual columns.
+      mapped_ids.emplace_back(++proj_max_col_id);
+      continue;
+    }
     DCHECK_GE(index, 0) << col.name();
     mapped_cols.push_back(cols_[index]);
     mapped_ids.push_back(col_ids_[index]);
@@ -395,18 +476,23 @@ string Schema::ToString(ToStringMode mode) const {
   if (cols_.empty()) return "()";
 
   vector<string> pk_strs;
+  pk_strs.reserve(num_key_columns_);
   for (int i = 0; i < num_key_columns_; i++) {
     pk_strs.push_back(cols_[i].name());
   }
 
+  auto col_mode = ColumnSchema::ToStringMode::WITHOUT_ATTRIBUTES;
+  if (mode & ToStringMode::WITH_COLUMN_ATTRIBUTES) {
+    col_mode = ColumnSchema::ToStringMode::WITH_ATTRIBUTES;
+  }
   vector<string> col_strs;
-  if (has_column_ids() && mode != ToStringMode::WITHOUT_COLUMN_IDS) {
+  if (has_column_ids() && (mode & ToStringMode::WITH_COLUMN_IDS)) {
     for (int i = 0; i < cols_.size(); ++i) {
-      col_strs.push_back(Substitute("$0:$1", col_ids_[i], cols_[i].ToString()));
+      col_strs.push_back(Substitute("$0:$1", col_ids_[i], cols_[i].ToString(col_mode)));
     }
   } else {
     for (const ColumnSchema &col : cols_) {
-      col_strs.push_back(col.ToString());
+      col_strs.push_back(col.ToString(col_mode));
     }
   }
 
@@ -419,11 +505,10 @@ string Schema::ToString(ToStringMode mode) const {
                 "\n)");
 }
 
+template <class RowType>
 Status Schema::DecodeRowKey(Slice encoded_key,
-                            uint8_t* buffer,
+                            RowType* row,
                             Arena* arena) const {
-  ContiguousRow row(this, buffer);
-
   for (size_t col_idx = 0; col_idx < num_key_columns(); ++col_idx) {
     const ColumnSchema& col = column(col_idx);
     const KeyEncoder<faststring>& key_encoder = GetKeyEncoder<faststring>(col.type_info());
@@ -431,7 +516,7 @@ Status Schema::DecodeRowKey(Slice encoded_key,
     RETURN_NOT_OK_PREPEND(key_encoder.Decode(&encoded_key,
                                              is_last,
                                              arena,
-                                             row.mutable_cell_ptr(col_idx)),
+                                             row->mutable_cell_ptr(col_idx)),
                           Substitute("Error decoding composite key component '$0'",
                                      col.name()));
   }
@@ -448,11 +533,11 @@ string Schema::DebugEncodedRowKey(Slice encoded_key, StartOrEnd start_or_end) co
 
   Arena arena(256);
   uint8_t* buf = reinterpret_cast<uint8_t*>(arena.AllocateBytes(key_byte_size()));
-  Status s = DecodeRowKey(encoded_key, buf, &arena);
+  ContiguousRow row(this, buf);
+  Status s = DecodeRowKey(encoded_key, &row, &arena);
   if (!s.ok()) {
     return "<invalid key: " + s.ToString() + ">";
   }
-  ConstContiguousRow row(this, buf);
   return DebugRowKey(row);
 }
 
@@ -480,6 +565,10 @@ size_t Schema::memory_footprint_excluding_this() const {
 size_t Schema::memory_footprint_including_this() const {
   return kudu_malloc_usable_size(this) + memory_footprint_excluding_this();
 }
+
+// Explicit specialization for callers outside this compilation unit.
+template
+Status Schema::DecodeRowKey(Slice encoded_key, RowBlockRow* row, Arena* arena) const;
 
 // ============================================================================
 //  Schema Builder

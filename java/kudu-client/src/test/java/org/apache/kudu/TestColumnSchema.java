@@ -14,28 +14,43 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-package org.apache.kudu;
 
-import org.apache.kudu.ColumnSchema.ColumnSchemaBuilder;
-import org.apache.kudu.util.DecimalUtil;
-import org.junit.Test;
+package org.apache.kudu;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.ExpectedException;
+
+import org.apache.kudu.ColumnSchema.ColumnSchemaBuilder;
+import org.apache.kudu.test.junit.RetryRule;
+import org.apache.kudu.util.CharUtil;
+import org.apache.kudu.util.DecimalUtil;
+
 public class TestColumnSchema {
+
+  @Rule
+  public RetryRule retryRule = new RetryRule();
+
+  @Rule
+  public ExpectedException expectedException = ExpectedException.none();
 
   @Test
   public void testToString() {
-    ColumnSchema col1 = new ColumnSchemaBuilder("col1", Type.STRING).build();
-    ColumnSchema col2 = new ColumnSchemaBuilder("col2", Type.INT64).build();
-    ColumnSchema col3 = new ColumnSchemaBuilder("col3", Type.DECIMAL)
+    final ColumnSchema col1 = new ColumnSchemaBuilder("col1", Type.STRING).build();
+    final ColumnSchema col2 = new ColumnSchemaBuilder("col2", Type.INT64).build();
+    final ColumnSchema col3 = new ColumnSchemaBuilder("col3", Type.DECIMAL)
         .typeAttributes(DecimalUtil.typeAttributes(5, 2))
         .build();
+    final ColumnSchema col4 = new ColumnSchemaBuilder("col4", Type.INT16)
+        .comment("test comment").build();
 
     assertEquals("Column name: col1, type: string", col1.toString());
     assertEquals("Column name: col2, type: int64", col2.toString());
     assertEquals("Column name: col3, type: decimal(5, 2)", col3.toString());
+    assertEquals("Column name: col4, type: int16, comment: test comment", col4.toString());
   }
 
   @Test
@@ -78,6 +93,29 @@ public class TestColumnSchema {
         .build();
     assertNotEquals(decCol1, decCol3);
 
+    // Same with comment
+    ColumnSchema commentInt1 = new ColumnSchemaBuilder("col1", Type.INT32).comment("test").build();
+    ColumnSchema commentInt2 = new ColumnSchemaBuilder("col1", Type.INT32).comment("test").build();
+    assertEquals(commentInt1, commentInt2);
 
+    // Different by comment
+    ColumnSchema commentInt3 = new ColumnSchemaBuilder("col1", Type.INT32).comment("Test").build();
+    assertNotEquals(commentInt1, commentInt3);
   }
+
+  @Test
+  public void testOutOfRangeVarchar() throws Exception {
+    expectedException.expect(IllegalArgumentException.class);
+    expectedException.expectMessage("VARCHAR's length must be set and between 1 and 65535");
+    new ColumnSchemaBuilder("col1", Type.VARCHAR)
+      .typeAttributes(CharUtil.typeAttributes(70000)).build();
+  }
+
+  @Test
+  public void testVarcharWithoutLength() throws Exception {
+    expectedException.expect(IllegalArgumentException.class);
+    expectedException.expectMessage("VARCHAR's length must be set and between 1 and 65535");
+    new ColumnSchemaBuilder("col1", Type.VARCHAR).build();
+  }
+
 }

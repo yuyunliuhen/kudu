@@ -17,178 +17,126 @@
 
 #include "kudu/master/sentry_authz_provider.h"
 
-#include <ostream>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include <boost/algorithm/string/predicate.hpp>
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
+#include "kudu/common/common.pb.h"
 #include "kudu/common/table_util.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/master/sentry_privileges_fetcher.h"
+#include "kudu/security/token.pb.h"
 #include "kudu/sentry/sentry_action.h"
-#include "kudu/sentry/sentry_client.h"
-#include "kudu/sentry/sentry_policy_service_types.h"
-#include "kudu/thrift/client.h"
+#include "kudu/sentry/sentry_authorizable_scope.h"
 #include "kudu/util/flag_tags.h"
-#include "kudu/util/monotime.h"
-#include "kudu/util/net/net_util.h"
 #include "kudu/util/slice.h"
+#include "kudu/util/trace.h"
 
-using sentry::TListSentryPrivilegesRequest;
-using sentry::TListSentryPrivilegesResponse;
-using sentry::TSentryAuthorizable;
-using sentry::TSentryGrantOption;
+DEFINE_bool(sentry_require_db_privileges_for_list_tables, false,
+            "Whether Kudu will require database-level privileges to authorize "
+            "ListTables requests. When set to false, table-level privileges are "
+            "required for each table.");
+TAG_FLAG(sentry_require_db_privileges_for_list_tables, advanced);
+
+DECLARE_string(sentry_service_rpc_addresses);
+
+using kudu::security::ColumnPrivilegePB;
+using kudu::security::TablePrivilegePB;
+using kudu::sentry::SentryAction;
+using kudu::sentry::SentryAuthorizableScope;
 using std::string;
+using std::unordered_map;
+using std::unordered_set;
 using std::vector;
-
-DEFINE_string(sentry_service_rpc_addresses, "",
-              "Comma-separated list of RPC addresses of the Sentry service(s). When "
-              "set, Sentry integration is enabled, fine-grained access control is "
-              "enforced in the master, and clients are issued authorization tokens. "
-              "Must match the value of the sentry.service.client.server.rpc-addresses "
-              "option in the Sentry server configuration.");
-TAG_FLAG(sentry_service_rpc_addresses, experimental);
-
-DEFINE_string(server_name, "server1",
-              "Configures which server namespace the Kudu instance belongs to for defining "
-              "server-level privileges in Sentry. Used to distinguish a particular Kudu "
-              "cluster in case of a multi-cluster setup. Must match the value of the "
-              "hive.sentry.server option in the HiveServer2 configuration, and the value "
-              "of the --server_name in Impala configuration.");
-TAG_FLAG(server_name, experimental);
-
-DEFINE_string(kudu_service_name, "kudu",
-              "The service name of the Kudu server. Must match the service name "
-              "used for Kudu server of sentry.service.admin.group option in the "
-              "Sentry server configuration.");
-TAG_FLAG(kudu_service_name, experimental);
-
-DEFINE_string(sentry_service_kerberos_principal, "sentry",
-              "The service principal of the Sentry server. Must match the primary "
-              "(user) portion of sentry.service.server.principal option in the "
-              "Sentry server configuration.");
-TAG_FLAG(sentry_service_kerberos_principal, experimental);
-
-DEFINE_string(sentry_service_security_mode, "kerberos",
-              "Configures whether Thrift connections to the Sentry server use "
-              "SASL (Kerberos) security. Must match the value of the "
-              "‘sentry.service.security.mode’ option in the Sentry server "
-              "configuration.");
-TAG_FLAG(sentry_service_security_mode, experimental);
-
-DEFINE_int32(sentry_service_retry_count, 1,
-             "The number of times that Sentry operations will retry after "
-             "encountering retriable failures, such as network errors.");
-TAG_FLAG(sentry_service_retry_count, advanced);
-TAG_FLAG(sentry_service_retry_count, experimental);
-
-DEFINE_int32(sentry_service_send_timeout_seconds, 60,
-             "Configures the socket send timeout, in seconds, for Thrift "
-             "connections to the Sentry server.");
-TAG_FLAG(sentry_service_send_timeout_seconds, advanced);
-TAG_FLAG(sentry_service_send_timeout_seconds, experimental);
-
-DEFINE_int32(sentry_service_recv_timeout_seconds, 60,
-             "Configures the socket receive timeout, in seconds, for Thrift "
-             "connections to the Sentry server.");
-TAG_FLAG(sentry_service_recv_timeout_seconds, advanced);
-TAG_FLAG(sentry_service_recv_timeout_seconds, experimental);
-
-DEFINE_int32(sentry_service_conn_timeout_seconds, 60,
-             "Configures the socket connect timeout, in seconds, for Thrift "
-             "connections to the Sentry server.");
-TAG_FLAG(sentry_service_conn_timeout_seconds, advanced);
-TAG_FLAG(sentry_service_conn_timeout_seconds, experimental);
-
-DEFINE_int32(sentry_service_max_message_size_bytes, 100 * 1024 * 1024,
-             "Maximum size of Sentry objects that can be received by the "
-             "Sentry client in bytes. Must match the value of the "
-             "sentry.policy.client.thrift.max.message.size option in the "
-             "Sentry server configuration.");
-TAG_FLAG(sentry_service_max_message_size_bytes, advanced);
-TAG_FLAG(sentry_service_max_message_size_bytes, experimental);
-
 using strings::Substitute;
 
 namespace kudu {
-
-using sentry::SentryAction;
-using sentry::SentryClient;
-
 namespace master {
 
-// Validates the sentry_service_rpc_addresses gflag.
-static bool ValidateAddresses(const char* flag_name, const string& addresses) {
-  vector<HostPort> host_ports;
-  Status s = HostPort::ParseStringsWithScheme(addresses,
-                                              SentryClient::kDefaultSentryPort,
-                                              &host_ports);
-  if (!s.ok()) {
-    LOG(ERROR) << "invalid flag " << flag_name << ": " << s.ToString();
+namespace {
+
+// Whether the given privileges 'privileges_branch' allows for the specified
+// action ('required_action') in the specified scope ('required_scope')
+// with GRANT ALL option, if any required ('requires_all_with_grant').
+bool IsActionAllowed(SentryAction::Action required_action,
+                     SentryAuthorizableScope::Scope required_scope,
+                     SentryGrantRequired requires_all_with_grant,
+                     const SentryPrivilegesBranch& privileges_branch) {
+  // In general, a privilege implies another when:
+  // 1. the authorizable from the former implies the authorizable from the latter
+  //    (authorizable with a higher scope on the hierarchy can imply authorizables
+  //    with a lower scope on the hierarchy, but not vice versa), and
+  // 2. the action from the former implies the action from the latter, and
+  // 3. grant option from the former implies the grant option from the latter.
+  //
+  // See org.apache.sentry.policy.common.CommonPrivilege. Note that policy validation
+  // in CommonPrivilege also allows wildcard authorizable matching. For example,
+  // authorizable 'server=server1->db=*' can imply authorizable 'server=server1'.
+  // However, wildcard authorizable granting is neither practical nor useful (semantics
+  // of granting such privilege are not supported in Apache Hive, Impala and Hue. And
+  // 'server=server1->db=*' has exactly the same meaning as 'server=server1'). Therefore,
+  // wildcard authorizable matching is dropped in this implementation.
+  //
+  // Moreover, because ListPrivilegesByUser lists all Sentry privileges granted to the
+  // user that match the authorizable of each scope in the input authorizable hierarchy,
+  // privileges with lower scope will also be returned in the response. This contradicts
+  // rule (1) mentioned above. Therefore, we need to validate privilege scope, in addition
+  // to action and grant option. Otherwise, privilege escalation can happen.
+  TRACE("Evaluating privileges");
+  SentryAction action(required_action);
+  SentryAuthorizableScope scope(required_scope);
+  const auto& privileges = privileges_branch.privileges();
+  for (const auto& privilege : privileges) {
+    // A grant option cannot imply the other if the latter is set but the
+    // former is not.
+    if (requires_all_with_grant == REQUIRED && !privilege.all_with_grant) {
+      continue;
+    }
+    // Both privilege scope and action need to imply the other.
+    if (SentryAuthorizableScope(privilege.scope).Implies(scope)) {
+      for (const auto& allowed_action : privilege.allowed_actions) {
+        if (SentryAction(allowed_action).Implies(action)) {
+          return true;
+        }
+      }
+    }
   }
-  return s.ok();
+  return false;
 }
-DEFINE_validator(sentry_service_rpc_addresses, &ValidateAddresses);
+
+} // anonymous namespace
+
+SentryAuthzProvider::SentryAuthzProvider(
+    scoped_refptr<MetricEntity> metric_entity)
+    : fetcher_(std::move(metric_entity)) {
+}
 
 SentryAuthzProvider::~SentryAuthzProvider() {
   Stop();
 }
 
 Status SentryAuthzProvider::Start() {
-  vector<HostPort> addresses;
-  RETURN_NOT_OK(HostPort::ParseStringsWithScheme(FLAGS_sentry_service_rpc_addresses,
-                                                 SentryClient::kDefaultSentryPort,
-                                                 &addresses));
-
-  thrift::ClientOptions options;
-  options.enable_kerberos = boost::iequals(FLAGS_sentry_service_security_mode, "kerberos");
-  options.service_principal = FLAGS_sentry_service_kerberos_principal;
-  options.send_timeout = MonoDelta::FromSeconds(FLAGS_sentry_service_send_timeout_seconds);
-  options.recv_timeout = MonoDelta::FromSeconds(FLAGS_sentry_service_recv_timeout_seconds);
-  options.conn_timeout = MonoDelta::FromSeconds(FLAGS_sentry_service_conn_timeout_seconds);
-  options.max_buf_size = FLAGS_sentry_service_max_message_size_bytes;
-  options.retry_count = FLAGS_sentry_service_retry_count;
-  return ha_client_.Start(std::move(addresses), std::move(options));
+  return fetcher_.Start();
 }
 
 void SentryAuthzProvider::Stop() {
-  ha_client_.Stop();
+  fetcher_.Stop();
 }
 
-namespace {
-
-// Returns an authorizable based on the table name and the given scope.
-Status GetAuthorizable(const string& table_name,
-                       SentryAuthzProvider::AuthorizableScope scope,
-                       TSentryAuthorizable* authorizable) {
-  Slice database;
-  Slice table;
-  switch (scope) {
-    case SentryAuthzProvider::AuthorizableScope::TABLE:
-      RETURN_NOT_OK(ParseHiveTableIdentifier(table_name, &database, &table));
-      authorizable->__set_table(table.ToString());
-      FALLTHROUGH_INTENDED;
-    case SentryAuthzProvider::AuthorizableScope::DATABASE:
-      if (database.empty() && table.empty()) {
-        RETURN_NOT_OK(ParseHiveTableIdentifier(table_name, &database, &table));
-      }
-      authorizable->__set_db(database.ToString());
-      FALLTHROUGH_INTENDED;
-    case SentryAuthzProvider::AuthorizableScope::SERVER:
-      authorizable->__set_server(FLAGS_server_name);
-      break;
-    default:
-      LOG(FATAL) << "unsupported authorizable scope";
-      break;
-  }
-
-  return Status::OK();
+Status SentryAuthzProvider::ResetCache() {
+  return fetcher_.ResetCache();
 }
 
-} // anonymous namespace
+bool SentryAuthzProvider::IsEnabled() {
+  return !FLAGS_sentry_service_rpc_addresses.empty();
+}
 
 Status SentryAuthzProvider::AuthorizeCreateTable(const string& table_name,
                                                  const string& user,
@@ -198,27 +146,29 @@ Status SentryAuthzProvider::AuthorizeCreateTable(const string& table_name,
   // design doc in [SENTRY-2151](https://issues.apache.org/jira/browse/SENTRY-2151).
   //
   // Otherwise, table creation requires 'CREATE ON DATABASE' privilege.
-  TSentryAuthorizable authorizable;
-  RETURN_NOT_OK(GetAuthorizable(table_name, AuthorizableScope::DATABASE, &authorizable));
-  SentryAction action;
-  bool grant_option;
+  SentryAction::Action action;
+  SentryGrantRequired grant_option;
   if (user == owner) {
-    action = SentryAction(SentryAction::Action::CREATE);
-    grant_option = false;
+    action = SentryAction::Action::CREATE;
+    grant_option = NOT_REQUIRED;
   } else {
-    action = SentryAction(SentryAction::Action::ALL);
-    grant_option = true;
+    action = SentryAction::Action::ALL;
+    grant_option = REQUIRED;
   }
-  return Authorize(authorizable, action, user, grant_option);
+  // Note: in our request to Sentry, we shouldn't cache table- or column-level
+  // privileges for the table, since Sentry may automatically grant privileges
+  // upon creation of new tables that caching might miss.
+  return Authorize(SentryAuthorizableScope::Scope::DATABASE, action,
+                   table_name, user, grant_option,
+                   SentryCaching::SERVER_AND_DB_ONLY);
 }
 
 Status SentryAuthzProvider::AuthorizeDropTable(const string& table_name,
                                                const string& user) {
   // Table deletion requires 'DROP ON TABLE' privilege.
-  TSentryAuthorizable authorizable;
-  RETURN_NOT_OK(GetAuthorizable(table_name, AuthorizableScope::TABLE, &authorizable));
-  SentryAction action = SentryAction(SentryAction::Action::DROP);
-  return Authorize(authorizable, action, user);
+  return Authorize(SentryAuthorizableScope::Scope::TABLE,
+                   SentryAction::Action::DROP,
+                   table_name, user);
 }
 
 Status SentryAuthzProvider::AuthorizeAlterTable(const string& old_table,
@@ -231,75 +181,185 @@ Status SentryAuthzProvider::AuthorizeAlterTable(const string& old_table,
   //  2. 'CREATE ON DATABASE <new-database>'.
   // See [SENTRY-2264](https://issues.apache.org/jira/browse/SENTRY-2264).
   // TODO(hao): add inline hierarchy validation to avoid multiple RPCs.
-  TSentryAuthorizable table_authorizable;
-  RETURN_NOT_OK(GetAuthorizable(old_table, AuthorizableScope::TABLE, &table_authorizable));
   if (old_table == new_table) {
-    SentryAction action = SentryAction(SentryAction::Action::ALTER);
-    return Authorize(table_authorizable, action, user);
+    return Authorize(SentryAuthorizableScope::Scope::TABLE,
+                     SentryAction::Action::ALTER,
+                     old_table, user);
   }
-
-  SentryAction table_action = SentryAction(SentryAction::Action::ALL);
-  RETURN_NOT_OK(Authorize(table_authorizable, table_action, user));
-  TSentryAuthorizable db_authorizable;
-  RETURN_NOT_OK(GetAuthorizable(new_table, AuthorizableScope::DATABASE, &db_authorizable));
-  SentryAction db_action = SentryAction(SentryAction::Action::CREATE);
-  return Authorize(db_authorizable, db_action, user);
+  RETURN_NOT_OK(Authorize(SentryAuthorizableScope::Scope::TABLE,
+                          SentryAction::Action::ALL,
+                          old_table, user));
+  // Note: in our request to Sentry, we shouldn't cache table- or column-level
+  // privileges for the table, since Sentry may automatically alter privileges
+  // upon altering tables that caching might miss.
+  return Authorize(SentryAuthorizableScope::Scope::DATABASE,
+                   SentryAction::Action::CREATE, new_table, user,
+                   SentryGrantRequired::NOT_REQUIRED,
+                   SentryCaching::SERVER_AND_DB_ONLY);
 }
 
-Status SentryAuthzProvider::AuthorizeGetTableMetadata(const std::string& table_name,
-                                                      const std::string& user) {
+Status SentryAuthzProvider::AuthorizeGetTableMetadata(const string& table_name,
+                                                      const string& user) {
   // Retrieving table metadata requires 'METADATA ON TABLE' privilege.
-  TSentryAuthorizable authorizable;
-  RETURN_NOT_OK(GetAuthorizable(table_name, AuthorizableScope::TABLE, &authorizable));
-  SentryAction action = SentryAction(SentryAction::Action::METADATA);
-  return Authorize(authorizable, action, user);
+  return Authorize(SentryAuthorizableScope::Scope::TABLE,
+                   SentryAction::Action::METADATA,
+                   table_name, user);
 }
 
-Status SentryAuthzProvider::Authorize(const TSentryAuthorizable& authorizable,
-                                      const SentryAction& action,
-                                      const string& user,
-                                      bool grant_option) {
-
-  // In general, a privilege implies another when the authorizable from
-  // the former implies the authorizable from the latter, the action
-  // from the former implies the action from the latter, and grant option
-  // from the former implies the grant option from the latter.
-  //
-  // ListPrivilegesByUser returns all privileges granted to the user that
-  // imply the given authorizable. Therefore, we only need to validate if
-  // the granted actions can imply the required one.
-
-  TListSentryPrivilegesRequest request;
-  request.__set_requestorUserName(FLAGS_kudu_service_name);
-  request.__set_principalName(user);
-  request.__set_authorizableHierarchy(authorizable);
-  TListSentryPrivilegesResponse response;
-
-  RETURN_NOT_OK(ha_client_.Execute(
-      [&] (SentryClient* client) {
-        return client->ListPrivilegesByUser(request, &response);
-      }));
-
-  for (const auto& privilege : response.privileges) {
-    // A grant option cannot imply the other if the former is set
-    // but the latter is not.
-    if (grant_option && privilege.grantOption != TSentryGrantOption::TRUE) {
+Status SentryAuthzProvider::AuthorizeListTables(const string& user,
+                                                unordered_set<string>* table_names,
+                                                bool* checked_table_names) {
+  if (IsTrustedUser(user)) {
+    *checked_table_names = false;
+    return Status::OK();
+  }
+  unordered_set<string> authorized_tables;
+  unordered_map<string, vector<string>> tables_by_db;
+  for (auto table_name : *table_names) {
+    Slice db_slice;
+    Slice unused_table_slice;
+    Status s = ParseHiveTableIdentifier(table_name, &db_slice, &unused_table_slice);
+    if (!s.ok()) {
       continue;
     }
-
-    SentryAction granted_action;
-    Status s = SentryAction::FromString(privilege.action, &granted_action);
-    WARN_NOT_OK(s, Substitute("failed to construct sentry action from $0", privilege.action));
-    if (s.ok() && granted_action.Implies(action)) {
-      return Status::OK();
+    LookupOrInsert(&tables_by_db, db_slice.ToString(), {}).emplace_back(std::move(table_name));
+  }
+  for (auto db_and_tables : tables_by_db) {
+    auto tables_in_db = db_and_tables.second;
+    DCHECK(!tables_in_db.empty());
+    // Authorize database-level privileges first in case the user has
+    // database-level privileges. This would allow us to avoid authorizing each
+    // indiviudual table.
+    // Note: the exact table isn't particularly important, as long as we pass
+    // in a table within the database we're interested in.
+    const string& first_table_name_in_db = tables_in_db[0];
+    Status s = Authorize(SentryAuthorizableScope::Scope::DATABASE, SentryAction::METADATA,
+                         first_table_name_in_db, user);
+    if (s.ok()) {
+      for (auto table_name : tables_in_db) {
+        EmplaceOrDie(&authorized_tables, std::move(table_name));
+      }
+    } else if (!FLAGS_sentry_require_db_privileges_for_list_tables) {
+      for (auto table_name : tables_in_db) {
+        s = AuthorizeGetTableMetadata(table_name, user);
+        if (s.ok()) {
+          EmplaceOrDie(&authorized_tables, std::move(table_name));
+        }
+      }
     }
   }
+  *table_names = authorized_tables;
+  *checked_table_names = true;
+  return Status::OK();
+}
 
-  // Logs an error if the action is not authorized for debugging purpose, and
-  // only returns generic error back to the users to avoid side channel leak,
-  // e.g. 'whether table A exists'.
-  LOG(ERROR) << "Action <" << action.action() << "> on authorizable <"
-             << authorizable << "> is not permitted for user <" << user << ">";
+Status SentryAuthzProvider::AuthorizeGetTableStatistics(const std::string& table_name,
+                                                        const std::string& user) {
+  // Statistics contain data (e.g. number of rows) that requires the 'SELECT ON TABLE'
+  // privilege.
+  return Authorize(SentryAuthorizableScope::Scope::TABLE,
+                   SentryAction::Action::SELECT,
+                   table_name, user);
+}
+
+Status SentryAuthzProvider::FillTablePrivilegePB(const string& table_name,
+                                                 const string& user,
+                                                 const SchemaPB& schema_pb,
+                                                 TablePrivilegePB* pb) {
+  DCHECK(pb);
+  DCHECK(pb->has_table_id());
+  if (AuthzProvider::IsTrustedUser(user)) {
+    pb->set_delete_privilege(true);
+    pb->set_insert_privilege(true);
+    pb->set_scan_privilege(true);
+    pb->set_update_privilege(true);
+    return Status::OK();
+  }
+  static ColumnPrivilegePB scan_col_privilege;
+  scan_col_privilege.set_scan_privilege(true);
+
+  // Note: it might seem like we could cache these TablePrivilegePBs rather
+  // than parsing them from Sentry privileges every time. This is tricky
+  // because the column-level privileges depend on the input schema, which may
+  // be different upon subsequent calls to this function.
+  SentryPrivilegesBranch privileges_branch;
+  RETURN_NOT_OK(fetcher_.GetSentryPrivileges(
+      SentryAuthorizableScope::TABLE, table_name, user,
+      SentryCaching::ALL, &privileges_branch));
+  unordered_set<string> scannable_col_names;
+  static const SentryAuthorizableScope kTableScope(SentryAuthorizableScope::TABLE);
+  for (const auto& privilege : privileges_branch.privileges()) {
+    if (SentryAuthorizableScope(privilege.scope).Implies(kTableScope)) {
+      // Pull out any privileges at the table scope or higher.
+      if (ContainsKey(privilege.allowed_actions, SentryAction::ALL) ||
+          ContainsKey(privilege.allowed_actions, SentryAction::OWNER)) {
+        // Generate privilege with everything.
+        pb->set_delete_privilege(true);
+        pb->set_insert_privilege(true);
+        pb->set_scan_privilege(true);
+        pb->set_update_privilege(true);
+        return Status::OK();
+      }
+      if (ContainsKey(privilege.allowed_actions, SentryAction::DELETE)) {
+        pb->set_delete_privilege(true);
+      }
+      if (ContainsKey(privilege.allowed_actions, SentryAction::INSERT)) {
+        pb->set_insert_privilege(true);
+      }
+      if (ContainsKey(privilege.allowed_actions, SentryAction::SELECT)) {
+        pb->set_scan_privilege(true);
+      }
+      if (ContainsKey(privilege.allowed_actions, SentryAction::UPDATE)) {
+        pb->set_update_privilege(true);
+      }
+    } else if (!pb->scan_privilege() &&
+               (ContainsKey(privilege.allowed_actions, SentryAction::ALL) ||
+                ContainsKey(privilege.allowed_actions, SentryAction::OWNER) ||
+                ContainsKey(privilege.allowed_actions, SentryAction::SELECT))) {
+      // Pull out any scan privileges at the column scope.
+      DCHECK_EQ(SentryAuthorizableScope::COLUMN, privilege.scope);
+      DCHECK(!privilege.column_name.empty());
+      EmplaceIfNotPresent(&scannable_col_names, privilege.column_name);
+    }
+  }
+  // If we got any column-level scan privileges and we don't already have
+  // table-level scan privileges, set them now.
+  if (!pb->scan_privilege()) {
+    for (const auto& col : schema_pb.columns()) {
+      if (ContainsKey(scannable_col_names, col.name())) {
+        InsertIfNotPresent(pb->mutable_column_privileges(), col.id(), scan_col_privilege);
+      }
+    }
+  }
+  return Status::OK();
+}
+
+Status SentryAuthzProvider::Authorize(SentryAuthorizableScope::Scope scope,
+                                      SentryAction::Action action,
+                                      const string& table_ident,
+                                      const string& user,
+                                      SentryGrantRequired require_grant_option,
+                                      SentryCaching caching) {
+  if (AuthzProvider::IsTrustedUser(user)) {
+    return Status::OK();
+  }
+
+  SentryPrivilegesBranch privileges;
+  RETURN_NOT_OK(fetcher_.GetSentryPrivileges(scope, table_ident, user,
+      caching, &privileges));
+  if (IsActionAllowed(action, scope, require_grant_option, privileges)) {
+    return Status::OK();
+  }
+
+  // Log a warning if the action is not authorized for debugging purpose, and
+  // only return a generic error to users to avoid a side channel leak, e.g.
+  // whether table A exists.
+  LOG(WARNING) << Substitute("Action <$0> on table <$1> with authorizable scope "
+                             "<$2> is not permitted for user <$3>",
+                             sentry::ActionToString(action),
+                             table_ident,
+                             sentry::ScopeToString(scope),
+                             user);
   return Status::NotAuthorized("unauthorized action");
 }
 

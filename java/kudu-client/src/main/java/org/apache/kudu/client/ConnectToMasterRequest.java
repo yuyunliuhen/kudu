@@ -25,6 +25,7 @@ import java.util.Collections;
 
 import com.google.protobuf.Message;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.jboss.netty.util.Timer;
 
 import org.apache.kudu.master.Master.ConnectToMasterResponsePB;
 import org.apache.kudu.master.Master.MasterFeatures;
@@ -51,8 +52,10 @@ public class ConnectToMasterRequest extends KuduRpc<ConnectToMasterResponsePB> {
    */
   private String method = CONNECT_TO_MASTER;
 
-  public ConnectToMasterRequest(KuduTable masterTable) {
-    super(masterTable);
+  public ConnectToMasterRequest(KuduTable masterTable,
+                                Timer timer,
+                                long timeoutMillis) {
+    super(masterTable, timer, timeoutMillis);
     // TODO(todd): get rid of 'masterTable' hack
   }
 
@@ -83,13 +86,13 @@ public class ConnectToMasterRequest extends KuduRpc<ConnectToMasterResponsePB> {
   Pair<ConnectToMasterResponsePB, Object> deserialize(CallResponse callResponse,
                                                        String tsUUID) throws KuduException {
     if (CONNECT_TO_MASTER.equals(method)) {
-      return deserializeNewRpc(callResponse, tsUUID);
+      return deserializeNewRpc(callResponse);
     }
-    return deserializeOldRpc(callResponse, tsUUID);
+    return deserializeOldRpc(callResponse);
   }
 
   private Pair<ConnectToMasterResponsePB, Object> deserializeNewRpc(
-      CallResponse callResponse, String tsUUID) {
+      CallResponse callResponse) {
 
     final ConnectToMasterResponsePB.Builder respBuilder =
         ConnectToMasterResponsePB.newBuilder();
@@ -99,8 +102,8 @@ public class ConnectToMasterRequest extends KuduRpc<ConnectToMasterResponsePB> {
         respBuilder.hasError() ? respBuilder.getError() : null);
   }
 
-  private Pair<ConnectToMasterResponsePB, Object> deserializeOldRpc(CallResponse callResponse,
-      String tsUUID) throws KuduException {
+  private Pair<ConnectToMasterResponsePB, Object> deserializeOldRpc(CallResponse callResponse)
+      throws KuduException {
     final GetMasterRegistrationResponsePB.Builder resp =
         GetMasterRegistrationResponsePB.newBuilder();
     readProtobuf(callResponse.getPBMessage(), resp);

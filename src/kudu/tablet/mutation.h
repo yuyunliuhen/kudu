@@ -79,27 +79,27 @@ class Mutation {
   // This should only be used for debugging/logging.
   static std::string StringifyMutationList(const Schema &schema, const Mutation *head);
 
-  // Append this mutation to the list at the given pointer.
-  // This operation uses "Release" memory semantics
-  // (see atomicops.h). The pointer as well as all of the mutations in the list
-  // must be word-aligned.
-  void AppendToListAtomic(Mutation **list);
+  // Appends this mutation to the list given by 'redo_head' and 'redo_tail'.
+  //
+  // This function is atomic provided that callers are externally synchronized
+  // on a per mutation list (i.e. per row) basis. Without this synchronization,
+  // the non-atomicity between 'redo_head' and 'redo_tail' writes may cause errors.
+  //
+  // This operation uses "Release" memory semantics (see atomicops.h). The
+  // pointers as well as all of the mutations in the list must be word-aligned.
+  void AppendToListAtomic(Mutation** redo_head, Mutation** redo_tail);
 
   void PrependToList(Mutation** list) {
     this->next_ = *list;
     *list = this;
   }
 
-  // O(n) algorithm to reverse the order of a linked list of
-  // mutations.
+  // O(n) algorithm to reverse the order of a linked list of mutations.
   static void ReverseMutationList(Mutation** list);
 
  private:
   friend class MSRow;
   friend class MemRowSet;
-
-  template<bool ATOMIC>
-  void DoAppendToList(Mutation **list);
 
   // The transaction ID which made this mutation. If this transaction is not
   // committed in the snapshot of the reader, this mutation should be ignored.

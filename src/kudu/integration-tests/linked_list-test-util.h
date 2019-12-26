@@ -307,47 +307,57 @@ class ScopedRowUpdater {
 class PeriodicWebUIChecker {
  public:
   PeriodicWebUIChecker(const cluster::ExternalMiniCluster& cluster,
-                       const std::string& tablet_id, MonoDelta period)
+                       MonoDelta period,
+                       const std::string& tablet_id = "")
       : period_(period), is_running_(true) {
-    // List of master and ts web pages to fetch
-    std::vector<std::string> master_pages, ts_pages;
+    // List of master web pages to fetch.
+    const std::vector<std::string> master_pages = {
+      "/dump-entities",
+      "/masters",
+      "/mem-trackers",
+      "/metrics",
+      "/stacks",
+      "/tables",
+      "/tablet-servers",
+      "/threadz",
+      "/threadz?group=all",
+    };
 
-    master_pages.emplace_back("/dump-entities");
-    master_pages.emplace_back("/masters");
-    master_pages.emplace_back("/mem-trackers");
-    master_pages.emplace_back("/metrics");
-    master_pages.emplace_back("/stacks");
-    master_pages.emplace_back("/tables");
-    master_pages.emplace_back("/tablet-servers");
-
-    ts_pages.emplace_back("/maintenance-manager");
-    ts_pages.emplace_back("/mem-trackers");
-    ts_pages.emplace_back("/metrics");
-    ts_pages.emplace_back("/scans");
-    ts_pages.emplace_back("/stacks");
-    ts_pages.emplace_back("/tablets");
-    if (!tablet_id.empty()) {
-      ts_pages.push_back(strings::Substitute("/transactions?tablet_id=$0",
-                                             tablet_id));
-    }
+    // List of tserver web pages to fetch.
+    const std::vector<std::string> ts_pages = {
+      "/maintenance-manager",
+      "/mem-trackers",
+      "/metrics",
+      "/scans",
+      "/stacks",
+      "/tablets",
+      "/threadz",
+      "/threadz?group=all",
+      tablet_id.empty()
+          ? "/transactions"
+          : strings::Substitute("/transactions?tablet_id=$0", tablet_id),
+    };
 
     // Generate list of urls for each master and tablet server
     for (int i = 0; i < cluster.num_masters(); i++) {
-      for (std::string page : master_pages) {
-        urls_.push_back(strings::Substitute(
+      for (const auto& page : master_pages) {
+        urls_.emplace_back(strings::Substitute(
             "http://$0$1",
             cluster.master(i)->bound_http_hostport().ToString(),
             page));
       }
     }
     for (int i = 0; i < cluster.num_tablet_servers(); i++) {
-      for (std::string page : ts_pages) {
-        urls_.push_back(strings::Substitute(
+      for (const auto& page : ts_pages) {
+        urls_.emplace_back(strings::Substitute(
             "http://$0$1",
             cluster.tablet_server(i)->bound_http_hostport().ToString(),
             page));
       }
     }
+    std::random_device rdev;
+    std::mt19937 gen(rdev());
+    std::shuffle(urls_.begin(), urls_.end(), gen);
     CHECK_OK(Thread::Create("linked_list-test", "checker",
                             &PeriodicWebUIChecker::CheckThread, this, &checker_));
   }
@@ -459,6 +469,8 @@ std::vector<int64_t> LinkedListTester::GenerateSplitInts() {
 
 Status LinkedListTester::CreateLinkedListTable() {
   gscoped_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   RETURN_NOT_OK_PREPEND(table_creator->table_name(table_name_)
                         .schema(&schema_)
                         .set_range_partition_columns({ kKeyColumnName })
@@ -466,6 +478,7 @@ Status LinkedListTester::CreateLinkedListTable() {
                         .num_replicas(num_replicas_)
                         .Create(),
                         "Failed to create table");
+#pragma GCC diagnostic pop
   return Status::OK();
 }
 
@@ -559,21 +572,7 @@ void LinkedListTester::DumpInsertHistogram(bool print_flags) {
   }
   cout << "Note: each insert is a batch of " << num_chains_ << " rows." << endl;
   cout << "------------------------------------------------------------" << endl;
-  cout << "Count: " << h->TotalCount() << endl;
-  cout << "Mean: " << h->MeanValue() << endl;
-  cout << "Percentiles:" << endl;
-  cout << "   0%  (min) = " << h->MinValue() << endl;
-  cout << "  25%        = " << h->ValueAtPercentile(25) << endl;
-  cout << "  50%  (med) = " << h->ValueAtPercentile(50) << endl;
-  cout << "  75%        = " << h->ValueAtPercentile(75) << endl;
-  cout << "  95%        = " << h->ValueAtPercentile(95) << endl;
-  cout << "  99%        = " << h->ValueAtPercentile(99) << endl;
-  cout << "  99.9%      = " << h->ValueAtPercentile(99.9) << endl;
-  cout << "  99.99%     = " << h->ValueAtPercentile(99.99) << endl;
-  cout << "  100% (max) = " << h->MaxValue() << endl;
-  if (h->MaxValue() >= h->highest_trackable_value()) {
-    cout << "*NOTE: some values were greater than highest trackable value" << endl;
-  }
+  h->DumpHumanReadable(&std::cout);
 }
 
 // Verify that the given sorted vector does not contain any duplicate entries.
@@ -604,7 +603,7 @@ Status LinkedListTester::VerifyLinkedListRemote(
   }
 
   client::KuduScanner scanner(table.get());
-  RETURN_NOT_OK_PREPEND(scanner.SetProjectedColumns(verify_projection_), "Bad projection");
+  RETURN_NOT_OK_PREPEND(scanner.SetProjectedColumnNames(verify_projection_), "Bad projection");
   RETURN_NOT_OK(scanner.SetBatchSizeBytes(0)); // Force at least one NextBatch RPC.
   RETURN_NOT_OK(scanner.SetTimeoutMillis(60 * 1000 /* 60 seconds */));
 
@@ -629,7 +628,6 @@ Status LinkedListTester::VerifyLinkedListRemote(
   verifier.StartScanTimer();
 
   bool cb_called = false;
-  std::vector<client::KuduRowResult> rows;
   while (scanner.HasMoreRows()) {
     // If we're doing a snapshot scan with a big enough cluster, call the callback on the scanner's
     // tserver. Do this only once.
@@ -642,8 +640,9 @@ Status LinkedListTester::VerifyLinkedListRemote(
       RETURN_NOT_OK(cb(down_ts));
       cb_called = true;
     }
-    RETURN_NOT_OK_PREPEND(scanner.NextBatch(&rows), "Couldn't fetch next row batch");
-    for (const client::KuduRowResult& row : rows) {
+    client::KuduScanBatch batch;
+    RETURN_NOT_OK_PREPEND(scanner.NextBatch(&batch), "Couldn't fetch next row batch");
+    for (const client::KuduScanBatch::RowPtr row : batch) {
       int64_t key;
       int64_t link;
       bool updated;
@@ -680,13 +679,13 @@ Status LinkedListTester::VerifyLinkedListLocal(const tablet::Tablet* tablet,
   const Schema* tablet_schema = tablet->schema();
   // Cannot use schemas with col indexes in a scan (assertions fire).
   Schema projection(tablet_schema->columns(), tablet_schema->num_key_columns());
-  gscoped_ptr<RowwiseIterator> iter;
+  std::unique_ptr<RowwiseIterator> iter;
   RETURN_NOT_OK_PREPEND(tablet->NewRowIterator(projection, &iter),
                         "Cannot create new row iterator");
-  RETURN_NOT_OK_PREPEND(iter->Init(NULL), "Cannot initialize row iterator");
+  RETURN_NOT_OK_PREPEND(iter->Init(nullptr), "Cannot initialize row iterator");
 
   Arena arena(1024);
-  RowBlock block(projection, 100, &arena);
+  RowBlock block(&projection, 100, &arena);
   while (iter->HasNext()) {
     RETURN_NOT_OK(iter->NextBlock(&block));
     for (int i = 0; i < block.nrows(); i++) {

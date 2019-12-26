@@ -254,6 +254,9 @@ TEST_P(TsRecoveryITest, TestNoBlockIDReuseIfMissingBlocks) {
     write_workload->set_table_name(table_name);
     write_workload->set_num_tablets(1);
     write_workload->set_num_replicas(1);
+    // We want to generate orphaned blocks, so use a workload that we expect to
+    // cause a lot of delta compaction.
+    write_workload->set_write_pattern(TestWorkload::UPDATE_ONE_ROW);
     write_workload->Setup();
     write_workload->Start();
     return write_workload;
@@ -375,16 +378,10 @@ TEST_P(TsRecoveryITest, TestRestartWithOrphanedReplicates) {
   // Restart the server and check to make sure that the change is eventually applied.
   ASSERT_OK(cluster_->tablet_server(0)->Restart());
 
-  // TODO(KUDU-796): after a restart, we may have to replay some
-  // orphaned replicates from the log. However, we currently
-  // allow reading while those are being replayed, which means we
-  // can "go back in time" briefly. So, we have some retries here.
-  // When KUDU-796 is fixed, remove the retries.
   ClusterVerifier v(cluster_.get());
-  NO_FATALS(v.CheckRowCountWithRetries(work.table_name(),
-                                       ClusterVerifier::AT_LEAST,
-                                       work.rows_inserted(),
-                                       MonoDelta::FromSeconds(40)));
+  NO_FATALS(v.CheckRowCount(work.table_name(),
+                            ClusterVerifier::AT_LEAST,
+                            work.rows_inserted()));
 }
 
 // Regression test for KUDU-1477: a pending commit message would cause
@@ -421,10 +418,9 @@ TEST_P(TsRecoveryITest, TestRestartWithPendingCommitFromFailedOp) {
   ASSERT_OK(cluster_->tablet_server(0)->Restart());
 
   ClusterVerifier v(cluster_.get());
-  NO_FATALS(v.CheckRowCountWithRetries(work.table_name(),
-                                       ClusterVerifier::AT_LEAST,
-                                       work.rows_inserted(),
-                                       MonoDelta::FromSeconds(20)));
+  NO_FATALS(v.CheckRowCount(work.table_name(),
+                            ClusterVerifier::AT_LEAST,
+                            work.rows_inserted()));
 }
 
 // Test that we replay from the recovery directory, if it exists.
@@ -466,10 +462,9 @@ TEST_P(TsRecoveryITest, TestCrashDuringLogReplay) {
   ASSERT_OK(cluster_->tablet_server(0)->Restart());
 
   ClusterVerifier v(cluster_.get());
-  NO_FATALS(v.CheckRowCountWithRetries(work.table_name(),
-                                       ClusterVerifier::AT_LEAST,
-                                       work.rows_inserted(),
-                                       MonoDelta::FromSeconds(30)));
+  NO_FATALS(v.CheckRowCount(work.table_name(),
+                            ClusterVerifier::AT_LEAST,
+                            work.rows_inserted()));
 }
 
 // Regression test for KUDU-1551: if the tserver crashes after preallocating a segment
@@ -501,10 +496,9 @@ TEST_P(TsRecoveryITest, TestCrashBeforeWriteLogSegmentHeader) {
   ignore_result(cluster_->tablet_server(0)->Restart());
 
   ClusterVerifier v(cluster_.get());
-  NO_FATALS(v.CheckRowCountWithRetries(work.table_name(),
-                                       ClusterVerifier::AT_LEAST,
-                                       work.rows_inserted(),
-                                       MonoDelta::FromSeconds(60)));
+  NO_FATALS(v.CheckRowCount(work.table_name(),
+                            ClusterVerifier::AT_LEAST,
+                            work.rows_inserted()));
 }
 
 // Test the following scenario:
@@ -550,10 +544,9 @@ TEST_P(TsRecoveryITest, TestChangeMaxCellSize) {
   ts->mutable_flags()->pop_back();
   ASSERT_OK(ts->Restart());
   ClusterVerifier v(cluster_.get());
-  NO_FATALS(v.CheckRowCountWithRetries(work.table_name(),
-                                       ClusterVerifier::EXACTLY,
-                                       work.rows_inserted(),
-                                       MonoDelta::FromSeconds(60)));
+  NO_FATALS(v.CheckRowCount(work.table_name(),
+                            ClusterVerifier::EXACTLY,
+                            work.rows_inserted()));
 }
 
 class TsRecoveryITestDeathTest : public TsRecoveryITest {};

@@ -56,20 +56,26 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
     return status_;
   }
 
-  if (!rename_to_.is_initialized() && steps_.empty()) {
+  if (!rename_to_ && !new_extra_configs_ && steps_.empty()) {
     return Status::InvalidArgument("No alter steps provided");
   }
 
   req->Clear();
   req->set_modify_external_catalogs(modify_external_catalogs_);
   req->mutable_table()->set_table_name(table_name_);
-  if (rename_to_.is_initialized()) {
+  if (rename_to_) {
     req->set_new_table_name(rename_to_.get());
+  }
+  if (new_extra_configs_) {
+    req->mutable_new_extra_configs()->insert(new_extra_configs_->begin(),
+                                             new_extra_configs_->end());
   }
 
   if (schema_ != nullptr) {
     RETURN_NOT_OK(SchemaToPB(*schema_, req->mutable_schema(),
-                             SCHEMA_PB_WITHOUT_IDS | SCHEMA_PB_WITHOUT_WRITE_DEFAULT));
+                             SCHEMA_PB_WITHOUT_IDS |
+                             SCHEMA_PB_WITHOUT_WRITE_DEFAULT |
+                             SCHEMA_PB_WITHOUT_COMMENT));
   }
 
   for (const Step& s : steps_) {
@@ -93,34 +99,34 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
       }
       case AlterTableRequestPB::ALTER_COLUMN:
       {
-        if (s.spec->data_->has_type ||
-            s.spec->data_->has_nullable ||
+        if (s.spec->data_->type ||
+            s.spec->data_->nullable ||
             s.spec->data_->primary_key) {
           return Status::NotSupported("unsupported alter operation",
                                       s.spec->data_->name);
         }
-        if (!s.spec->data_->has_rename_to &&
-            !s.spec->data_->has_default &&
+        if (!s.spec->data_->rename_to &&
             !s.spec->data_->default_val &&
             !s.spec->data_->remove_default &&
-            !s.spec->data_->has_encoding &&
-            !s.spec->data_->has_compression &&
-            !s.spec->data_->has_block_size) {
+            !s.spec->data_->encoding &&
+            !s.spec->data_->compression &&
+            !s.spec->data_->block_size &&
+            !s.spec->data_->comment) {
           return Status::InvalidArgument("no alter operation specified",
                                          s.spec->data_->name);
         }
         // If the alter is solely a column rename, fall back to using
         // RENAME_COLUMN, for backwards compatibility.
         // TODO(wdb) Change this when compat can be broken.
-        if (!s.spec->data_->has_default &&
-            !s.spec->data_->default_val &&
+        if (!s.spec->data_->default_val &&
             !s.spec->data_->remove_default &&
-            !s.spec->data_->has_encoding &&
-            !s.spec->data_->has_compression &&
-            !s.spec->data_->has_block_size) {
+            !s.spec->data_->encoding &&
+            !s.spec->data_->compression &&
+            !s.spec->data_->block_size &&
+            !s.spec->data_->comment) {
           pb_step->set_type(AlterTableRequestPB::RENAME_COLUMN);
           pb_step->mutable_rename_column()->set_old_name(s.spec->data_->name);
-          pb_step->mutable_rename_column()->set_new_name(s.spec->data_->rename_to);
+          pb_step->mutable_rename_column()->set_new_name(s.spec->data_->rename_to.value());
           break;
         }
         ColumnSchemaDelta col_delta(s.spec->data_->name);
@@ -146,6 +152,10 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
 
         encoder.Add(lower_bound_type, *s.lower_bound);
         encoder.Add(upper_bound_type, *s.upper_bound);
+
+        if (s.dimension_label) {
+          pb_step->mutable_add_range_partition()->set_dimension_label(s.dimension_label.get());
+        }
         break;
       }
       case AlterTableRequestPB::DROP_RANGE_PARTITION:

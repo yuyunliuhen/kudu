@@ -31,7 +31,6 @@
 
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #include "kudu/clock/clock.h"
@@ -55,20 +54,27 @@
 #include "kudu/consensus/raft_consensus.h"
 #include "kudu/consensus/replica_management.pb.h"
 #include "kudu/consensus/time_manager.h"
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/casts.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/rpc/inbound_call.h"
 #include "kudu/rpc/remote_user.h"
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/rpc_sidecar.h"
+#include "kudu/rpc/rpc_verification_util.h"
+#include "kudu/security/token.pb.h"
+#include "kudu/security/token_verifier.h"
 #include "kudu/server/server_base.h"
 #include "kudu/tablet/compaction.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/mvcc.h"
+#include "kudu/tablet/rowset.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_metrics.h"
@@ -87,6 +93,7 @@
 #include "kudu/util/crc.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/faststring.h"
+#include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/memory/arena.h"
@@ -97,6 +104,7 @@
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/status_callback.h"
+#include "kudu/util/stopwatch.h"
 #include "kudu/util/trace.h"
 #include "kudu/util/trace_metrics.h"
 
@@ -111,7 +119,9 @@ DEFINE_int32(scanner_max_batch_size_bytes, 8 * 1024 * 1024,
 TAG_FLAG(scanner_max_batch_size_bytes, advanced);
 TAG_FLAG(scanner_max_batch_size_bytes, runtime);
 
-DEFINE_int32(scanner_batch_size_rows, 100,
+// The default value is sized to a power of 2 to improve BitmapCopy performance
+// when copying a RowBlock (in ORDERED scans).
+DEFINE_int32(scanner_batch_size_rows, 128,
              "The number of rows to batch for servicing scan requests.");
 TAG_FLAG(scanner_batch_size_rows, advanced);
 TAG_FLAG(scanner_batch_size_rows, runtime);
@@ -137,6 +147,15 @@ DEFINE_bool(scanner_inject_service_unavailable_on_continue_scan, false,
            "If set, the scanner will return a ServiceUnavailable Status on "
            "any Scan continuation RPC call. Used for tests.");
 TAG_FLAG(scanner_inject_service_unavailable_on_continue_scan, unsafe);
+
+DEFINE_bool(tserver_enforce_access_control, false,
+            "If set, the server will apply fine-grained access control rules "
+            "to client RPCs.");
+TAG_FLAG(tserver_enforce_access_control, runtime);
+
+DEFINE_double(tserver_inject_invalid_authz_token_ratio, 0.0,
+              "Fraction of the time that authz token validation will fail. Used for tests.");
+TAG_FLAG(tserver_inject_invalid_authz_token_ratio, hidden);
 
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_int32(memory_limit_warn_threshold_percentage);
@@ -165,18 +184,27 @@ using kudu::consensus::UnsafeChangeConfigRequestPB;
 using kudu::consensus::UnsafeChangeConfigResponsePB;
 using kudu::consensus::VoteRequestPB;
 using kudu::consensus::VoteResponsePB;
+using kudu::fault_injection::MaybeTrue;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
+using kudu::rpc::ParseVerificationResult;
+using kudu::rpc::ErrorStatusPB;
 using kudu::rpc::RpcContext;
 using kudu::rpc::RpcSidecar;
+using kudu::security::TokenVerifier;
+using kudu::security::TokenPB;
 using kudu::server::ServerBase;
 using kudu::tablet::AlterSchemaTransactionState;
+using kudu::tablet::MvccSnapshot;
 using kudu::tablet::TABLET_DATA_COPYING;
 using kudu::tablet::TABLET_DATA_DELETED;
 using kudu::tablet::TABLET_DATA_TOMBSTONED;
 using kudu::tablet::Tablet;
 using kudu::tablet::TabletReplica;
 using kudu::tablet::TransactionCompletionCallback;
+using kudu::tablet::WriteAuthorizationContext;
+using kudu::tablet::WritePrivileges;
+using kudu::tablet::WritePrivilegeType;
 using kudu::tablet::WriteTransactionState;
 using std::shared_ptr;
 using std::string;
@@ -194,6 +222,8 @@ extern const char* CFILE_CACHE_HIT_BYTES_METRIC_NAME;
 
 namespace tserver {
 
+const char* SCANNER_BYTES_READ_METRIC_NAME = "scanner_bytes_read";
+
 namespace {
 
 // Lookup the given tablet, only ensuring that it exists.
@@ -209,8 +239,15 @@ bool LookupTabletReplicaOrRespond(TabletReplicaLookupIf* tablet_manager,
                                   scoped_refptr<TabletReplica>* replica) {
   Status s = tablet_manager->GetTabletReplica(tablet_id, replica);
   if (PREDICT_FALSE(!s.ok())) {
-    SetupErrorAndRespond(resp->mutable_error(), s,
-                         TabletServerErrorPB::TABLET_NOT_FOUND, context);
+    if (s.IsServiceUnavailable()) {
+      // If the tablet manager isn't initialized, the remote should check again
+      // soon.
+      SetupErrorAndRespond(resp->mutable_error(), s,
+                           TabletServerErrorPB::UNKNOWN_ERROR, context);
+    } else {
+      SetupErrorAndRespond(resp->mutable_error(), s,
+                           TabletServerErrorPB::TABLET_NOT_FOUND, context);
+    }
     return false;
   }
   return true;
@@ -364,6 +401,211 @@ static StdStatusCallback BindHandleResponse(
 
 typedef ListTabletsResponsePB::StatusAndSchemaPB StatusAndSchemaPB;
 
+// Populates 'required_column_privileges' with the column-level privileges
+// required to perform the scan specified by 'scan_pb', consulting the column
+// IDs found in 'schema'.
+//
+// Users of NewScanRequestPB (e.g. Scans and Checksums) require the following
+// privileges:
+//   if no projected columns (i.e. a "counting" scan) ||
+//       projected columns has virtual column (e.g. "diff" scan):
+//     SCAN ON TABLE || foreach (column): SCAN ON COLUMN
+//   else:
+//     if uses pk (e.g. ORDERED scan, or primary key fields set):
+//       foreach(primary key column): SCAN ON COLUMN
+//     foreach(projected column): SCAN ON COLUMN
+//     foreach(predicated column): SCAN ON COLUMN
+//
+// Returns false if the request is malformed (e.g. unknown non-virtual column
+// name), and sends an error response via 'context' if so. 'req_type' is used
+// to add context in logs.
+static bool GetScanPrivilegesOrRespond(const NewScanRequestPB& scan_pb, const Schema& schema,
+                                       const string& req_type,
+                                       unordered_set<ColumnId>* required_column_privileges,
+                                       RpcContext* context) {
+  const auto respond_not_authorized = [&] (const string& col_name) {
+    LOG(WARNING) << Substitute("rejecting $0 request from $1: no column named '$2'",
+                               req_type, context->requestor_string(), col_name);
+    context->RespondRpcFailure(rpc::ErrorStatusPB::FATAL_UNAUTHORIZED,
+        Status::NotAuthorized(Substitute("not authorized to $0", req_type)));
+  };
+  // If there is no projection (i.e. this is a "counting" scan), the user
+  // needs full scan privileges on the table.
+  if (scan_pb.projected_columns_size() == 0) {
+    *required_column_privileges = unordered_set<ColumnId>(schema.column_ids().begin(),
+                                                          schema.column_ids().end());
+    return true;
+  }
+  unordered_set<ColumnId> required_privileges;
+  // Determine the scan's projected key column IDs.
+  for (int i = 0; i < scan_pb.projected_columns_size(); i++) {
+    boost::optional<ColumnSchema> projected_column;
+    Status s = ColumnSchemaFromPB(scan_pb.projected_columns(i), &projected_column);
+    if (PREDICT_FALSE(!s.ok())) {
+      LOG(WARNING) << s.ToString();
+      context->RespondRpcFailure(rpc::ErrorStatusPB::ERROR_INVALID_REQUEST, s);
+      return false;
+    }
+    // A projection may contain virtual columns, which don't exist in the
+    // tablet schema. If we were to search for a virtual column, we would
+    // incorrectly get a "not found" error. To reconcile this with the fact
+    // that we want to return an authorization error if the user has requested
+    // a non-virtual column that doesn't exist, we require full scan privileges
+    // for virtual columns.
+    if (projected_column->type_info()->is_virtual()) {
+      *required_column_privileges = unordered_set<ColumnId>(schema.column_ids().begin(),
+                                                            schema.column_ids().end());
+      return true;
+    }
+    int col_idx = schema.find_column(projected_column->name());
+    if (col_idx == Schema::kColumnNotFound) {
+      respond_not_authorized(scan_pb.projected_columns(i).name());
+      return false;
+    }
+    EmplaceIfNotPresent(&required_privileges, schema.column_id(col_idx));
+  }
+  // Ordered scans and any scans that make use of the primary key require
+  // privileges to scan across all primary key columns.
+  if (scan_pb.order_mode() == ORDERED ||
+      scan_pb.has_start_primary_key() ||
+      scan_pb.has_stop_primary_key() ||
+      scan_pb.has_last_primary_key()) {
+    const auto& key_cols = schema.get_key_column_ids();
+    required_privileges.insert(key_cols.begin(), key_cols.end());
+  }
+  // Determine the scan's predicate column IDs.
+  for (int i = 0; i < scan_pb.column_predicates_size(); i++) {
+    int col_idx = schema.find_column(scan_pb.column_predicates(i).column());
+    if (col_idx == Schema::kColumnNotFound) {
+      respond_not_authorized(scan_pb.column_predicates(i).column());
+      return false;
+    }
+    EmplaceIfNotPresent(&required_privileges, schema.column_id(col_idx));
+  }
+  // Do the same for the DEPRECATED_range_predicates field. Even though this
+  // field is deprecated, it is still exposed as a part of our public API and
+  // thus needs to be taken into account.
+  for (int i = 0; i < scan_pb.deprecated_range_predicates_size(); i++) {
+    int col_idx = schema.find_column(scan_pb.deprecated_range_predicates(i).column().name());
+    if (col_idx == Schema::kColumnNotFound) {
+      respond_not_authorized(scan_pb.deprecated_range_predicates(i).column().name());
+      return false;
+    }
+    EmplaceIfNotPresent(&required_privileges, schema.column_id(col_idx));
+  }
+  *required_column_privileges = std::move(required_privileges);
+  return true;
+}
+
+// Checks the column-level privileges required to perform the scan specified by
+// 'scan_pb' against the authorized column IDs listed in
+// 'authorized_column_ids', consulting the column IDs found in 'schema'.
+//
+// Returns false if the scan isn't authorized and uses 'context' to send an
+// error response. 'req_type' is used for logging'.
+static bool CheckScanPrivilegesOrRespond(const NewScanRequestPB& scan_pb, const Schema& schema,
+                                         const unordered_set<ColumnId>& authorized_column_ids,
+                                         const string& req_type, RpcContext* context) {
+  unordered_set<ColumnId> required_column_privileges;
+  if (!GetScanPrivilegesOrRespond(scan_pb, schema, req_type,
+                                  &required_column_privileges, context)) {
+    return false;
+  }
+  for (const auto& required_col_id : required_column_privileges) {
+    if (!ContainsKey(authorized_column_ids, required_col_id)) {
+      LOG(WARNING) << Substitute("rejecting $0 request from $1: authz token doesn't "
+                                 "authorize column ID $2", req_type, context->requestor_string(),
+                                 required_col_id);
+      context->RespondRpcFailure(rpc::ErrorStatusPB::FATAL_UNAUTHORIZED,
+          Status::NotAuthorized(Substitute("not authorized to $0", req_type)));
+      return false;
+    }
+  }
+  return true;
+}
+
+// Returns false if the table ID of 'privilege' doesn't match 'table_id',
+// responding with an error via 'context' if so. Otherwise, returns true.
+// 'req_type' is used for logging purposes.
+static bool CheckMatchingTableIdOrRespond(const security::TablePrivilegePB& privilege,
+                                          const string& table_id, const string& req_type,
+                                          RpcContext* context) {
+  if (privilege.table_id() != table_id) {
+    LOG(WARNING) << Substitute("rejecting $0 request from $1: '$2', expected '$3'",
+                               req_type, context->requestor_string(),
+                               privilege.table_id(), table_id);
+    context->RespondRpcFailure(rpc::ErrorStatusPB::ERROR_INVALID_AUTHORIZATION_TOKEN,
+        Status::NotAuthorized("authorization token is for the wrong table ID"));
+    return false;
+  }
+  return true;
+}
+
+// Returns false if the privilege has neither full scan privileges nor any
+// column-level scan privileges, in which case any scan-like request should be
+// rejected. Otherwise returns true, and returns any column-level scan
+// privileges in 'privilege'.
+static bool CheckMayHaveScanPrivilegesOrRespond(const security::TablePrivilegePB& privilege,
+                                                const string& req_type,
+                                                unordered_set<ColumnId>* authorized_column_ids,
+                                                RpcContext* context) {
+  DCHECK(authorized_column_ids);
+  DCHECK(authorized_column_ids->empty());
+  if (privilege.column_privileges_size() > 0) {
+    for (const auto& col_id_and_privilege : privilege.column_privileges()) {
+      if (col_id_and_privilege.second.scan_privilege()) {
+        EmplaceOrDie(authorized_column_ids, col_id_and_privilege.first);
+      }
+    }
+  }
+  if (privilege.scan_privilege() || !authorized_column_ids->empty()) {
+    return true;
+  }
+  LOG(WARNING) << Substitute("rejecting $0 request from $1: no column privileges",
+                             req_type, context->requestor_string());
+  context->RespondRpcFailure(rpc::ErrorStatusPB::FATAL_UNAUTHORIZED,
+      Status::NotAuthorized(Substitute("not authorized to $0", req_type)));
+  return false;
+}
+
+// Verifies the authorization token's correctness. Returns false and sends an
+// appropriate response if the request's authz token is invalid.
+template <class AuthorizableRequest>
+static bool VerifyAuthzTokenOrRespond(const TokenVerifier& token_verifier,
+                                      const AuthorizableRequest& req,
+                                      rpc::RpcContext* context,
+                                      TokenPB* token) {
+  DCHECK(token);
+  if (!req.has_authz_token()) {
+    context->RespondRpcFailure(rpc::ErrorStatusPB::ERROR_INVALID_AUTHORIZATION_TOKEN,
+        Status::NotAuthorized("no authorization token presented"));
+    return false;
+  }
+  TokenPB token_pb;
+  const auto result = token_verifier.VerifyTokenSignature(req.authz_token(), &token_pb);
+  ErrorStatusPB::RpcErrorCodePB error;
+  Status s = ParseVerificationResult(result,
+      ErrorStatusPB::ERROR_INVALID_AUTHORIZATION_TOKEN, &error);
+  if (!s.ok()) {
+    context->RespondRpcFailure(error, s.CloneAndPrepend("authz token verification failure"));
+    return false;
+  }
+  if (!token_pb.has_authz() ||
+      !token_pb.authz().has_table_privilege() ||
+      token_pb.authz().username() != context->remote_user().username()) {
+    context->RespondRpcFailure(ErrorStatusPB::ERROR_INVALID_AUTHORIZATION_TOKEN,
+        Status::NotAuthorized("invalid authorization token presented"));
+    return false;
+  }
+  if (MaybeTrue(FLAGS_tserver_inject_invalid_authz_token_ratio)) {
+    context->RespondRpcFailure(ErrorStatusPB::ERROR_INVALID_AUTHORIZATION_TOKEN,
+        Status::NotAuthorized("INJECTED FAILURE"));
+    return false;
+  }
+  *token = std::move(token_pb);
+  return true;
+}
+
 static void SetupErrorAndRespond(TabletServerErrorPB* error,
                                  const Status& s,
                                  TabletServerErrorPB::Code code,
@@ -410,6 +652,8 @@ class RpcTransactionCompletionCallback : public TransactionCompletionCallback {
 
   virtual void TransactionCompleted() OVERRIDE {
     if (!status_.ok()) {
+      LOG(WARNING) << Substitute("failed transaction from $0: $1",
+                                 context_->requestor_string(), status_.ToString());
       SetupErrorAndRespond(get_error(), status_, code_, context_);
     } else {
       context_->RespondSuccess();
@@ -450,6 +694,13 @@ class ScanResultCollector {
   //
   // Does nothing by default.
   virtual void set_row_format_flags(uint64_t /* row_format_flags */) {}
+
+  CpuTimes* cpu_times() {
+    return &cpu_times_;
+  }
+
+ private:
+  CpuTimes cpu_times_;
 };
 
 namespace {
@@ -549,7 +800,7 @@ class ScanResultChecksummer : public ScanResultCollector {
 
     const Schema* client_projection_schema = scanner->client_projection_schema();
     if (!client_projection_schema) {
-      client_projection_schema = &row_block.schema();
+      client_projection_schema = row_block.schema();
     }
 
     size_t nrows = row_block.nrows();
@@ -640,6 +891,15 @@ bool TabletServiceImpl::AuthorizeClientOrServiceUser(const google::protobuf::Mes
                                                      rpc::RpcContext* context) {
   return server_->Authorize(context, ServerBase::SUPER_USER | ServerBase::USER |
                             ServerBase::SERVICE_USER);
+}
+
+bool TabletServiceImpl::AuthorizeListTablets(const google::protobuf::Message* req,
+                                             google::protobuf::Message* resp,
+                                             rpc::RpcContext* context) {
+  if (FLAGS_tserver_enforce_access_control) {
+    return server_->Authorize(context, ServerBase::SUPER_USER);
+  }
+  return AuthorizeClient(req, resp, context);
 }
 
 bool TabletServiceImpl::AuthorizeClient(const google::protobuf::Message* /*req*/,
@@ -775,14 +1035,17 @@ void TabletServiceAdminImpl::CreateTablet(const CreateTabletRequestPB* req,
             << partition_schema.PartitionDebugString(partition, schema);
   VLOG(1) << "Full request: " << SecureDebugString(*req);
 
-  s = server_->tablet_manager()->CreateNewTablet(req->table_id(),
-                                                 req->tablet_id(),
-                                                 partition,
-                                                 req->table_name(),
-                                                 schema,
-                                                 partition_schema,
-                                                 req->config(),
-                                                 nullptr);
+  s = server_->tablet_manager()->CreateNewTablet(
+      req->table_id(),
+      req->tablet_id(),
+      partition,
+      req->table_name(),
+      schema,
+      partition_schema,
+      req->config(),
+      req->has_extra_config() ? boost::make_optional(req->extra_config()) : boost::none,
+      req->has_dimension_label() ? boost::make_optional(req->dimension_label()) : boost::none,
+      nullptr);
   if (PREDICT_FALSE(!s.ok())) {
     TabletServerErrorPB::Code code;
     if (s.IsAlreadyPresent()) {
@@ -840,11 +1103,44 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
   TRACE_EVENT1("tserver", "TabletServiceImpl::Write",
                "tablet_id", req->tablet_id());
   DVLOG(3) << "Received Write RPC: " << SecureDebugString(*req);
-
   scoped_refptr<TabletReplica> replica;
   if (!LookupRunningTabletReplicaOrRespond(server_->tablet_manager(), req->tablet_id(), resp,
                                            context, &replica)) {
     return;
+  }
+  boost::optional<WriteAuthorizationContext> authz_context;
+  if (FLAGS_tserver_enforce_access_control) {
+    TokenPB token;
+    if (!VerifyAuthzTokenOrRespond(server_->token_verifier(), *req, context, &token)) {
+      return;
+    }
+    const auto& privilege = token.authz().table_privilege();
+    if (!CheckMatchingTableIdOrRespond(privilege, replica->tablet_metadata()->table_id(),
+                                       "Write", context)) {
+      return;
+    }
+    WritePrivileges privileges;
+    if (privilege.insert_privilege()) {
+      InsertOrDie(&privileges, WritePrivilegeType::INSERT);
+    }
+    if (privilege.update_privilege()) {
+      InsertOrDie(&privileges, WritePrivilegeType::UPDATE);
+    }
+    if (privilege.delete_privilege()) {
+      InsertOrDie(&privileges, WritePrivilegeType::DELETE);
+    }
+    if (privileges.empty()) {
+      // If we know there are no write-related privileges outright, we can
+      // short-circuit further checking and reject the request immediately.
+      // Otherwise, we'll defer the checking to the prepare phase of the
+      // transaction after decoding the operations.
+      LOG(WARNING) << Substitute("rejecting Write request from $0: no write privileges",
+                                 context->requestor_string());
+      context->RespondRpcFailure(rpc::ErrorStatusPB::FATAL_UNAUTHORIZED,
+          Status::NotAuthorized("not authorized to write"));
+      return;
+    }
+    authz_context = { privileges, /*requested_op_types=*/{} };
   }
 
   shared_ptr<Tablet> tablet;
@@ -895,7 +1191,8 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
       replica.get(),
       req,
       context->AreResultsTracked() ? context->request_id() : nullptr,
-      resp));
+      resp,
+      std::move(authz_context)));
 
   // If the client sent us a timestamp, decode it and update the clock so that all future
   // timestamps are greater than the passed timestamp.
@@ -1318,11 +1615,26 @@ void TabletServiceImpl::ScannerKeepAlive(const ScannerKeepAliveRequestPB *req,
 }
 
 namespace {
-void SetResourceMetrics(ResourceMetricsPB* metrics, rpc::RpcContext* context) {
+void SetResourceMetrics(const rpc::RpcContext* context,
+                        const CpuTimes* cpu_times,
+                        ResourceMetricsPB* metrics) {
   metrics->set_cfile_cache_miss_bytes(
     context->trace()->metrics()->GetMetric(cfile::CFILE_CACHE_MISS_BYTES_METRIC_NAME));
   metrics->set_cfile_cache_hit_bytes(
     context->trace()->metrics()->GetMetric(cfile::CFILE_CACHE_HIT_BYTES_METRIC_NAME));
+
+  metrics->set_bytes_read(
+    context->trace()->metrics()->GetMetric(SCANNER_BYTES_READ_METRIC_NAME));
+
+  rpc::InboundCallTiming timing;
+  timing.time_handled = context->GetTimeHandled();
+  timing.time_received = context->GetTimeReceived();
+  timing.time_completed = MonoTime::Now();
+
+  metrics->set_queue_duration_nanos(timing.QueueDuration().ToNanoseconds());
+  metrics->set_total_duration_nanos(timing.TotalDuration().ToNanoseconds());
+  metrics->set_cpu_system_nanos(cpu_times->system);
+  metrics->set_cpu_user_nanos(cpu_times->user);
 }
 } // anonymous namespace
 
@@ -1330,6 +1642,7 @@ void TabletServiceImpl::Scan(const ScanRequestPB* req,
                              ScanResponsePB* resp,
                              rpc::RpcContext* context) {
   TRACE_EVENT0("tserver", "TabletServiceImpl::Scan");
+
   // Validate the request: user must pass a new_scan_request or
   // a scanner ID, but not both.
   if (PREDICT_FALSE(req->has_scanner_id() &&
@@ -1337,6 +1650,39 @@ void TabletServiceImpl::Scan(const ScanRequestPB* req,
     context->RespondFailure(Status::InvalidArgument(
                             "Must not pass both a scanner_id and new_scan_request"));
     return;
+  }
+
+  // If this is a new scan request, we must enforce the appropriate privileges.
+  TokenPB token;
+  if (FLAGS_tserver_enforce_access_control && req->has_new_scan_request()) {
+    const auto& scan_pb = req->new_scan_request();
+    if (!VerifyAuthzTokenOrRespond(server_->token_verifier(),
+                                   req->new_scan_request(), context, &token)) {
+      return;
+    }
+    scoped_refptr<TabletReplica> replica;
+    if (!LookupRunningTabletReplicaOrRespond(server_->tablet_manager(),
+        req->new_scan_request().tablet_id(), resp, context, &replica)) {
+      return;
+    }
+    const auto& privilege = token.authz().table_privilege();
+    if (!CheckMatchingTableIdOrRespond(privilege, replica->tablet_metadata()->table_id(),
+                                       "Scan", context)) {
+      return;
+    }
+    unordered_set<ColumnId> authorized_column_ids;
+    if (!CheckMayHaveScanPrivilegesOrRespond(privilege, "Scan", &authorized_column_ids, context)) {
+      return;
+    }
+    // If the token doesn't have full scan privileges for the table, check
+    // for required privileges based on the scan request.
+    if (!privilege.scan_privilege()) {
+      const auto& schema = replica->tablet_metadata()->schema();
+      if (!CheckScanPrivilegesOrRespond(scan_pb, schema, authorized_column_ids,
+                                        "Scan", context)) {
+        return;
+      }
+    }
   }
 
   size_t batch_size_bytes = GetMaxBatchSizeBytesHint(req);
@@ -1409,7 +1755,8 @@ void TabletServiceImpl::Scan(const ScanRequestPB* req,
     resp->set_last_primary_key(last.ToString());
   }
   resp->set_propagated_timestamp(server_->clock()->Now().ToUint64());
-  SetResourceMetrics(resp->mutable_resource_metrics(), context);
+
+  SetResourceMetrics(context, collector.cpu_times(), resp->mutable_resource_metrics());
   context->RespondSuccess();
 }
 
@@ -1443,6 +1790,64 @@ void TabletServiceImpl::SplitKeyRange(const SplitKeyRangeRequestPB* req,
   if (!LookupRunningTabletReplicaOrRespond(server_->tablet_manager(), req->tablet_id(), resp,
                                            context, &replica)) {
     return;
+  }
+
+  if (FLAGS_tserver_enforce_access_control) {
+    TokenPB token;
+    if (!VerifyAuthzTokenOrRespond(server_->token_verifier(), *req, context, &token)) {
+      return;
+    }
+    const auto& privilege = token.authz().table_privilege();
+    if (!CheckMatchingTableIdOrRespond(privilege, replica->tablet_metadata()->table_id(),
+                                       "SplitKeyRange", context)) {
+      return;
+    }
+    // Split-key requests require:
+    //   if uses pk (e.g. primary key fields set):
+    //     foreach(primary key column): SCAN ON COLUMN
+    //   foreach(requested column): SCAN ON COLUMN
+    //
+    // If the privilege doesn't have full scan privileges, or column-level scan
+    // privileges, the user is definitely not authorized to perform a scan.
+    unordered_set<ColumnId> authorized_column_ids;
+    if (!CheckMayHaveScanPrivilegesOrRespond(privilege, "SplitKeyRange",
+                                             &authorized_column_ids, context)) {
+      return;
+    }
+    if (!privilege.scan_privilege()) {
+      const auto& schema = replica->tablet_metadata()->schema();
+      unordered_set<ColumnId> required_column_privileges;
+      if (req->has_start_primary_key() || req->has_stop_primary_key()) {
+        const auto& key_cols = schema.get_key_column_ids();
+        required_column_privileges.insert(key_cols.begin(), key_cols.end());
+      }
+      bool is_authorized = true;
+      const string rejection_prefix = Substitute("rejecting SplitKeyRange request from $0",
+                                                 context->requestor_string());
+      for (int i = 0; i < req->columns_size(); i++) {
+        const auto& column_name = req->columns(i).name();
+        int col_idx = schema.find_column(req->columns(i).name());
+        if (col_idx == Schema::kColumnNotFound) {
+          LOG(WARNING) << Substitute("$0: no column named '$1'", rejection_prefix, column_name);
+          is_authorized = false;
+          break;
+        }
+        EmplaceIfNotPresent(&required_column_privileges, schema.column_id(col_idx));
+      }
+      for (const auto& required_col_id : required_column_privileges) {
+        if (!ContainsKey(authorized_column_ids, required_col_id)) {
+          LOG(WARNING) << Substitute("$0: authz token doesn't authorize column ID $1",
+                                     rejection_prefix, required_col_id);
+          is_authorized = false;
+          break;
+        }
+      }
+      if (!is_authorized) {
+        context->RespondRpcFailure(rpc::ErrorStatusPB::FATAL_UNAUTHORIZED,
+            Status::NotAuthorized("not authorized to SplitKeyRange"));
+        return;
+      }
+    }
   }
 
   shared_ptr<Tablet> tablet;
@@ -1508,8 +1913,8 @@ void TabletServiceImpl::SplitKeyRange(const SplitKeyRangeRequestPB* req,
 
   vector<ColumnId> column_ids;
   for (const ColumnSchema& column : schema.columns()) {
-    int column_id = tablet_schema.find_column(column.name());
-    if (PREDICT_FALSE(column_id == Schema::kColumnNotFound)) {
+    int column_idx = tablet_schema.find_column(column.name());
+    if (PREDICT_FALSE(column_idx == Schema::kColumnNotFound)) {
       SetupErrorAndRespond(resp->mutable_error(),
                            Status::InvalidArgument(
                                "Invalid SplitKeyRange column name", column.name()),
@@ -1517,7 +1922,7 @@ void TabletServiceImpl::SplitKeyRange(const SplitKeyRangeRequestPB* req,
                            context);
       return;
     }
-    column_ids.emplace_back(column_id);
+    column_ids.emplace_back(tablet_schema.column_id(column_idx));
   }
 
   // Validate the target chunk size are valid
@@ -1562,9 +1967,46 @@ void TabletServiceImpl::Checksum(const ChecksumRequestPB* req,
   ScanResultChecksummer collector;
   bool has_more = false;
   TabletServerErrorPB::Code error_code = TabletServerErrorPB::UNKNOWN_ERROR;
-  if (req->has_new_request()) {
-    scan_req.mutable_new_scan_request()->CopyFrom(req->new_request());
+  // TODO(KUDU-2870): the CLI tool doesn't currently fetch authz tokens when
+  // checksumming. Until it does, allow the super-user to avoid fine-grained
+  // privilege checking.
+  if (FLAGS_tserver_enforce_access_control &&
+      !server_->IsFromSuperUser(context) &&
+      req->has_new_request()) {
     const NewScanRequestPB& new_req = req->new_request();
+    TokenPB token;
+    if (!VerifyAuthzTokenOrRespond(server_->token_verifier(), req->new_request(),
+                                    context, &token)) {
+      return;
+    }
+    scoped_refptr<TabletReplica> replica;
+    if (!LookupRunningTabletReplicaOrRespond(server_->tablet_manager(), new_req.tablet_id(), resp,
+                                             context, &replica)) {
+      return;
+    }
+    const auto& privilege = token.authz().table_privilege();
+    if (!CheckMatchingTableIdOrRespond(privilege, replica->tablet_metadata()->table_id(),
+                                       "Checksum", context)) {
+      return;
+    }
+    unordered_set<ColumnId> authorized_column_ids;
+    if (!CheckMayHaveScanPrivilegesOrRespond(privilege, "Checksum",
+                                             &authorized_column_ids, context)) {
+      return;
+    }
+    // If the token doesn't have full scan privileges for the table, check
+    // for required privileges based on the checksum request.
+    if (!privilege.scan_privilege()) {
+      const auto& schema = replica->tablet_metadata()->schema();
+      if (!CheckScanPrivilegesOrRespond(new_req, schema, authorized_column_ids,
+                                        "Checksum", context)) {
+        return;
+      }
+    }
+  }
+  if (req->has_new_request()) {
+    const NewScanRequestPB& new_req = req->new_request();
+    scan_req.mutable_new_scan_request()->CopyFrom(req->new_request());
     scoped_refptr<TabletReplica> replica;
     if (!LookupRunningTabletReplicaOrRespond(server_->tablet_manager(), new_req.tablet_id(), resp,
                                              context, &replica)) {
@@ -1601,8 +2043,9 @@ void TabletServiceImpl::Checksum(const ChecksumRequestPB* req,
 
   resp->set_checksum(collector.agg_checksum());
   resp->set_has_more_results(has_more);
-  SetResourceMetrics(resp->mutable_resource_metrics(), context);
   resp->set_rows_checksummed(collector.rows_checksummed());
+
+  SetResourceMetrics(context, collector.cpu_times(), resp->mutable_resource_metrics());
   context->RespondSuccess();
 }
 
@@ -1729,53 +2172,39 @@ static Status SetupScanSpec(const NewScanRequestPB& scan_pb,
         string("Invalid predicate ") + SecureShortDebugString(pred_pb) +
         ": has no lower or upper bound.");
     }
-    ColumnSchema col(ColumnSchemaFromPB(pred_pb.column()));
-    if (projection.find_column(col.name()) == Schema::kColumnNotFound &&
-        !ContainsKey(missing_col_names, col.name())) {
-      missing_cols->push_back(col);
-      InsertOrDie(&missing_col_names, col.name());
+    boost::optional<ColumnSchema> col;
+    RETURN_NOT_OK(ColumnSchemaFromPB(pred_pb.column(), &col));
+    if (projection.find_column(col->name()) == Schema::kColumnNotFound &&
+        !ContainsKey(missing_col_names, col->name())) {
+      missing_cols->push_back(*col);
+      InsertOrDie(&missing_col_names, col->name());
     }
 
     const void* lower_bound = nullptr;
     const void* upper_bound = nullptr;
     if (pred_pb.has_lower_bound()) {
       const void* val;
-      RETURN_NOT_OK(ExtractPredicateValue(col, pred_pb.lower_bound(),
+      RETURN_NOT_OK(ExtractPredicateValue(*col, pred_pb.lower_bound(),
                                           scanner->arena(),
                                           &val));
       lower_bound = val;
     }
     if (pred_pb.has_inclusive_upper_bound()) {
       const void* val;
-      RETURN_NOT_OK(ExtractPredicateValue(col, pred_pb.inclusive_upper_bound(),
+      RETURN_NOT_OK(ExtractPredicateValue(*col, pred_pb.inclusive_upper_bound(),
                                           scanner->arena(),
                                           &val));
       upper_bound = val;
     }
 
-    auto pred = ColumnPredicate::InclusiveRange(col, lower_bound, upper_bound, scanner->arena());
+    auto pred = ColumnPredicate::InclusiveRange(*col, lower_bound, upper_bound, scanner->arena());
     if (pred) {
-      if (VLOG_IS_ON(3)) {
-        VLOG(3) << "Parsed predicate " << pred->ToString()
-                << " from " << SecureShortDebugString(scan_pb);
-      }
+      VLOG(3) << Substitute("Parsed predicate $0 from $1",
+                            pred->ToString(), SecureShortDebugString(scan_pb));
       ret->AddPredicate(*pred);
     }
   }
 
-  // When doing an ordered scan, we need to include the key columns to be able to encode
-  // the last row key for the scan response.
-  if (scan_pb.order_mode() == kudu::ORDERED &&
-      projection.num_key_columns() != tablet_schema.num_key_columns()) {
-    for (int i = 0; i < tablet_schema.num_key_columns(); i++) {
-      const ColumnSchema &col = tablet_schema.column(i);
-      if (projection.find_column(col.name()) == -1 &&
-          !ContainsKey(missing_col_names, col.name())) {
-        missing_cols->push_back(col);
-        InsertOrDie(&missing_col_names, col.name());
-      }
-    }
-  }
   // Then any encoded key range predicates.
   RETURN_NOT_OK(DecodeEncodedKeyRange(scan_pb, tablet_schema, scanner, ret.get()));
 
@@ -1792,19 +2221,43 @@ namespace {
 // Checks if 'timestamp' is before the tablet's AHM if this is a
 // READ_AT_SNAPSHOT/READ_YOUR_WRITES scan. Returns Status::OK() if it's
 // not or Status::InvalidArgument() if it is.
-Status VerifyNotAncientHistory(Tablet* tablet, ReadMode read_mode, Timestamp timestamp) {
+Status VerifyNotAncientHistory(Tablet* tablet, ReadMode read_mode, Timestamp timestamp,
+                               const string& timestamp_desc) {
   tablet::HistoryGcOpts history_gc_opts = tablet->GetHistoryGcOpts();
   if ((read_mode == READ_AT_SNAPSHOT || read_mode == READ_YOUR_WRITES) &&
       history_gc_opts.IsAncientHistory(timestamp)) {
     return Status::InvalidArgument(
-        Substitute("Snapshot timestamp is earlier than the ancient history mark. Consider "
-                       "increasing the value of the configuration parameter "
-                       "--tablet_history_max_age_sec. Snapshot timestamp: $0 "
-                       "Ancient History Mark: $1 Physical time difference: $2",
+        Substitute("$0 is earlier than the ancient history mark. Consider "
+                   "increasing the value of the configuration parameter "
+                   "--tablet_history_max_age_sec. Snapshot timestamp: $1 "
+                   "Ancient History Mark: $2 Physical time difference: $3",
+                   timestamp_desc,
                    tablet->clock()->Stringify(timestamp),
                    tablet->clock()->Stringify(history_gc_opts.ancient_history_mark()),
                    tablet->clock()->GetPhysicalComponentDifference(
                        timestamp, history_gc_opts.ancient_history_mark()).ToString()));
+  }
+  return Status::OK();
+}
+
+// Verify that the start (if specified) and end snapshot timestamps are legal
+// to read by checking against the ancient history mark and ensuring that the
+// start timestamp is earlier than the end timestamp.
+Status VerifyLegalSnapshotTimestamps(Tablet* tablet, ReadMode read_mode,
+                                     const boost::optional<Timestamp>& snap_start_timestamp,
+                                     const Timestamp& snap_end_timestamp) {
+  RETURN_NOT_OK(VerifyNotAncientHistory(tablet, read_mode, snap_end_timestamp,
+                                        "snapshot scan end timestamp"));
+  if (snap_start_timestamp) {
+    // Validate diff scan start timestamp, if set.
+    RETURN_NOT_OK(VerifyNotAncientHistory(tablet, read_mode, *snap_start_timestamp,
+                                          "snapshot scan start timestamp"));
+    if (snap_start_timestamp->CompareTo(snap_end_timestamp) > 0) {
+      return Status::InvalidArgument(
+          Substitute("start timestamp ($0) must be less than or equal to end timestamp ($1)",
+                     tablet->clock()->Stringify(*snap_start_timestamp),
+                     tablet->clock()->Stringify(snap_end_timestamp)));
+    }
   }
   return Status::OK();
 }
@@ -1838,9 +2291,10 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   // If we early-exit out of this function, automatically unregister
   // the scanner.
   ScopedUnregisterScanner unreg_scanner(server_->scanner_manager(), scanner->id());
+  ScopedAddScannerTiming scanner_timer(scanner.get(), result_collector->cpu_times());
 
   // Create the user's requested projection.
-  // TODO: add test cases for bad projections including 0 columns
+  // TODO(todd): Add test cases for bad projections including 0 columns.
   Schema projection;
   Status s = ColumnPBsToSchema(scan_pb.projected_columns(), &projection);
   if (PREDICT_FALSE(!s.ok())) {
@@ -1853,20 +2307,25 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
     return Status::InvalidArgument("User requests should not have Column IDs");
   }
 
+  if (scan_pb.order_mode() == UNKNOWN_ORDER_MODE) {
+    *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
+    return Status::InvalidArgument("Unknown order mode specified");
+  }
+
   if (scan_pb.order_mode() == ORDERED) {
     // Ordered scans must be at a snapshot so that we perform a serializable read (which can be
     // resumed). Otherwise, this would be read committed isolation, which is not resumable.
     if (scan_pb.read_mode() != READ_AT_SNAPSHOT) {
-      *error_code = TabletServerErrorPB::INVALID_SNAPSHOT;
+      *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
           return Status::InvalidArgument("Cannot do an ordered scan that is not a snapshot read");
     }
   }
 
   gscoped_ptr<ScanSpec> spec(new ScanSpec);
 
-  // Missing columns will contain the columns that are not mentioned in the client
-  // projection but are actually needed for the scan, such as columns referred to by
-  // predicates or key columns (if this is an ORDERED scan).
+  // Missing columns will contain the columns that are not mentioned in the
+  // client projection but are actually needed for the scan, such as columns
+  // referred to by predicates.
   vector<ColumnSchema> missing_cols;
   s = SetupScanSpec(scan_pb, tablet_schema, projection, &missing_cols, &spec, scanner);
   if (PREDICT_FALSE(!s.ok())) {
@@ -1888,21 +2347,47 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   gscoped_ptr<Schema> orig_projection(new Schema(projection));
   scanner->set_client_projection_schema(std::move(orig_projection));
 
-  // Build a new projection with the projection columns and the missing columns. Make
-  // sure to set whether the column is a key column appropriately.
+  // Build a new projection with the projection columns and the missing columns,
+  // annotating each column as a key column appropriately.
+  //
+  // Note: the projection is a consistent schema (i.e. no duplicate columns).
+  // However, it has some different semantics as compared to the tablet schema:
+  // - It might not contain all of the columns in the tablet.
+  // - It might contain extra columns not found in the tablet schema. Virtual
+  //   columns are permitted, while others will cause the scan to fail later,
+  //   when the tablet validates the projection.
+  // - It doesn't know which of its columns are key columns. That's fine for
+  //   an UNORDERED scan, but we'll need to fix this for an ORDERED scan, which
+  //   requires all key columns in tablet schema order.
   SchemaBuilder projection_builder;
-  vector<ColumnSchema> projection_columns = projection.columns();
-  for (const ColumnSchema& col : missing_cols) {
-    projection_columns.push_back(col);
-  }
-  for (const ColumnSchema& col : projection_columns) {
-    CHECK_OK(projection_builder.AddColumn(col, tablet_schema.is_key_column(col.name())));
+  if (scan_pb.order_mode() == ORDERED) {
+    for (int i = 0; i < tablet_schema.num_key_columns(); i++) {
+      const auto& col = tablet_schema.column(i);
+      // CHECK_OK is safe because the tablet schema has no duplicate columns.
+      CHECK_OK(projection_builder.AddColumn(col, /* is_key= */ true));
+    }
+    for (int i = 0; i < projection.num_columns(); i++) {
+      const auto& col = projection.column(i);
+      // Any key columns in the projection will be ignored.
+      ignore_result(projection_builder.AddColumn(col, /* is_key= */ false));
+    }
+    for (const ColumnSchema& col : missing_cols) {
+      // Any key columns in 'missing_cols' will be ignored.
+      ignore_result(projection_builder.AddColumn(col, /* is_key= */ false));
+    }
+  } else {
+    projection_builder.Reset(projection);
+    for (const ColumnSchema& col : missing_cols) {
+      // CHECK_OK is safe because the builder's columns (from the projection)
+      // and the missing columns are disjoint sets.
+      //
+      // UNORDERED scans don't need to know which columns are part of the key.
+      CHECK_OK(projection_builder.AddColumn(col, /* is_key= */ false));
+    }
   }
   projection = projection_builder.BuildWithoutIds();
 
-  gscoped_ptr<RowwiseIterator> iter;
-  // Preset the error code for when creating the iterator on the tablet fails
-  TabletServerErrorPB::Code tmp_error_code = TabletServerErrorPB::MISMATCHED_SCHEMA;
+  unique_ptr<RowwiseIterator> iter;
 
   // It's important to keep the reference to the tablet for the case when the
   // tablet replica's shutdown is run concurrently with the code below.
@@ -1919,6 +2404,9 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
     *error_code = TabletServerErrorPB::TABLET_NOT_RUNNING;
     return s;
   }
+
+  boost::optional<Timestamp> snap_start_timestamp;
+
   {
     TRACE("Creating iterator");
     TRACE_EVENT0("tserver", "Create iterator");
@@ -1926,10 +2414,14 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
     switch (scan_pb.read_mode()) {
       case UNKNOWN_READ_MODE: {
         *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
-        s = Status::NotSupported("Unknown read mode.");
-        return s;
+        return Status::NotSupported("Unknown read mode.");
       }
       case READ_LATEST: {
+        if (scan_pb.has_snap_start_timestamp()) {
+          *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
+          return Status::InvalidArgument("scan start timestamp is only supported "
+                                         "in READ_AT_SNAPSHOT read mode");
+        }
         s = tablet->NewRowIterator(projection, &iter);
         break;
       }
@@ -1937,16 +2429,8 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
       case READ_AT_SNAPSHOT: {
         scoped_refptr<consensus::TimeManager> time_manager = replica->time_manager();
         s = HandleScanAtSnapshot(scan_pb, rpc_context, projection, tablet.get(),
-                                 time_manager.get(), &iter, snap_timestamp);
-        // If we got a Status::ServiceUnavailable() from HandleScanAtSnapshot() it might
-        // mean we're just behind so let the client try again.
-        if (s.IsServiceUnavailable()) {
-          *error_code = TabletServerErrorPB::THROTTLED;
-          return s;
-        }
-        if (!s.ok()) {
-          tmp_error_code = TabletServerErrorPB::INVALID_SNAPSHOT;
-        }
+                                 time_manager.get(), &iter, &snap_start_timestamp, snap_timestamp,
+                                 error_code);
         break;
       }
     }
@@ -1962,25 +2446,27 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   if (PREDICT_TRUE(s.ok())) {
     TRACE_EVENT0("tserver", "iter->Init");
     s = iter->Init(spec.get());
+    if (PREDICT_FALSE(s.IsInvalidArgument())) {
+      // Tablet::Iterator::Init() returns InvalidArgument when an invalid
+      // projection is specified.
+      // TODO(todd): would be nice if we threaded these more specific
+      // error codes throughout Kudu.
+      *error_code = TabletServerErrorPB::MISMATCHED_SCHEMA;
+      return s;
+    }
   }
 
   TRACE("Iterator init: $0", s.ToString());
 
-  if (PREDICT_FALSE(s.IsInvalidArgument())) {
-    // An invalid projection returns InvalidArgument above.
-    // TODO: would be nice if we threaded these more specific
-    // error codes throughout Kudu.
-    *error_code = tmp_error_code;
-    return s;
-  }
   if (PREDICT_FALSE(!s.ok())) {
     LOG(WARNING) << Substitute("Error setting up scanner with request $0: $1",
                                SecureShortDebugString(*req), s.ToString());
     // If the replica has been stopped, e.g. due to disk failure, return
     // TABLET_FAILED so the scan can be handled appropriately (fail over to
     // another tablet server if fault-tolerant).
-    *error_code = tablet->HasBeenStopped() ?
-        TabletServerErrorPB::TABLET_FAILED : TabletServerErrorPB::UNKNOWN_ERROR;
+    if (tablet->HasBeenStopped()) {
+      *error_code = TabletServerErrorPB::TABLET_FAILED;
+    }
     return s;
   }
 
@@ -2005,12 +2491,11 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   // Now that we have initialized our row iterator at a snapshot, return an
   // error if the snapshot timestamp was prior to the ancient history mark.
   // We have to check after we open the iterator in order to avoid a TOCTOU
-  // error.
-  s = VerifyNotAncientHistory(tablet.get(), scan_pb.read_mode(), *snap_timestamp);
-  if (!s.ok()) {
-    *error_code = TabletServerErrorPB::INVALID_SNAPSHOT;
-    return s;
-  }
+  // error since it's possible that initializing the row iterator could race
+  // against the tablet history GC maintenance task.
+  RETURN_NOT_OK_EVAL(VerifyLegalSnapshotTimestamps(tablet.get(), scan_pb.read_mode(),
+                                                   snap_start_timestamp, *snap_timestamp),
+                     *error_code = TabletServerErrorPB::INVALID_SNAPSHOT);
 
   *has_more_results = iter->HasNext() && !scanner->has_fulfilled_limit();
   TRACE("has_more: $0", *has_more_results);
@@ -2021,6 +2506,9 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   }
 
   scanner->Init(std::move(iter), std::move(orig_spec));
+
+  // Stop the scanner timer because ContinueScanRequest starts its own timer.
+  scanner_timer.Stop();
   unreg_scanner.Cancel();
   *scanner_id = scanner->id();
 
@@ -2029,8 +2517,11 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   size_t batch_size_bytes = GetMaxBatchSizeBytesHint(req);
   if (batch_size_bytes > 0) {
     TRACE("Continuing scan request");
-    // TODO: instead of copying the pb, instead split HandleContinueScanRequest
-    // and call the second half directly
+    // TODO(wdberkeley): Instead of copying the pb, instead split
+    // HandleContinueScanRequest and call the second half directly. Once that's
+    // done, remove the call to ScopedAddScannerTiming::Stop() above (and the
+    // method as it won't be used) and start the timing for continue requests
+    // from the first half that is no longer executed in this codepath.
     ScanRequestPB continue_req(*req);
     continue_req.set_scanner_id(scanner->id());
     RETURN_NOT_OK(HandleContinueScanRequest(&continue_req, rpc_context, result_collector,
@@ -2085,6 +2576,7 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
 
   // If we early-exit out of this function, automatically unregister the scanner.
   ScopedUnregisterScanner unreg_scanner(server_->scanner_manager(), scanner->id());
+  ScopedAddScannerTiming scanner_timer(scanner.get(), result_collector->cpu_times());
 
   VLOG(2) << "Found existing scanner " << scanner->id() << " for request: "
           << SecureShortDebugString(*req);
@@ -2100,7 +2592,6 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
     return Status::InvalidArgument("Invalid call sequence ID in scan request");
   }
   scanner->IncrementCallSeqId();
-  scanner->UpdateAccessTime();
 
   RowwiseIterator* iter = scanner->iter();
 
@@ -2108,7 +2599,7 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
   // If people had really large indirect objects, we would currently overshoot
   // their requested batch size by a lot.
   Arena arena(32 * 1024);
-  RowBlock block(scanner->iter()->schema(),
+  RowBlock block(&scanner->iter()->schema(),
                  FLAGS_scanner_batch_size_rows, &arena);
 
   // TODO(todd): in the future, use the client timeout to set a budget. For now,
@@ -2197,6 +2688,7 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
 
   IteratorStats delta_stats = total_stats - scanner->already_reported_stats();
   scanner->set_already_reported_stats(total_stats);
+  TRACE_COUNTER_INCREMENT(SCANNER_BYTES_READ_METRIC_NAME, delta_stats.bytes_read);
 
   if (tablet) {
     tablet->metrics()->scanner_rows_scanned->IncrementBy(rows_scanned);
@@ -2204,7 +2696,6 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
     tablet->metrics()->scanner_bytes_scanned_from_disk->IncrementBy(delta_stats.bytes_read);
   }
 
-  scanner->UpdateAccessTime();
   *has_more_results = !req->close_scanner() && iter->HasNext() &&
       !scanner->has_fulfilled_limit();
   if (*has_more_results) {
@@ -2220,7 +2711,7 @@ namespace {
 // Helper to clamp a client deadline for a scan to the max supported by the server.
 MonoTime ClampScanDeadlineForWait(const MonoTime& deadline, bool* was_clamped) {
   MonoTime now = MonoTime::Now();
-  if (deadline.GetDeltaSince(now).ToMilliseconds() > FLAGS_scanner_max_wait_ms) {
+  if ((deadline - now).ToMilliseconds() > FLAGS_scanner_max_wait_ms) {
     *was_clamped = true;
     return now + MonoDelta::FromMilliseconds(FLAGS_scanner_max_wait_ms);
   }
@@ -2234,8 +2725,10 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
                                                const Schema& projection,
                                                Tablet* tablet,
                                                consensus::TimeManager* time_manager,
-                                               gscoped_ptr<RowwiseIterator>* iter,
-                                               Timestamp* snap_timestamp) {
+                                               unique_ptr<RowwiseIterator>* iter,
+                                               boost::optional<Timestamp>* snap_start_timestamp,
+                                               Timestamp* snap_timestamp,
+                                               TabletServerErrorPB::Code* error_code) {
   switch (scan_pb.read_mode()) {
     case READ_AT_SNAPSHOT: // Fallthrough intended
     case READ_YOUR_WRITES:
@@ -2246,7 +2739,11 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
 
   // Based on the read mode, pick a timestamp and verify it.
   Timestamp tmp_snap_timestamp;
-  RETURN_NOT_OK(PickAndVerifyTimestamp(scan_pb, tablet, &tmp_snap_timestamp));
+  Status s = PickAndVerifyTimestamp(scan_pb, tablet, &tmp_snap_timestamp);
+  if (PREDICT_FALSE(!s.ok())) {
+    *error_code = TabletServerErrorPB::INVALID_SNAPSHOT;
+    return s.CloneAndPrepend("cannot verify timestamp");
+  }
 
   // Reduce the client's deadline by a few msecs to allow for overhead.
   MonoTime client_deadline = rpc_context->GetClientDeadline() - MonoDelta::FromMilliseconds(10);
@@ -2255,8 +2752,9 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
   // server will have one less available thread and the client might be stuck spending all
   // of the allotted time for the scan on a partitioned server that will never have a consistent
   // snapshot at 'snap_timestamp'.
-  // Because of this we clamp the client's deadline to the max. configured. If the client
-  // sets a long timeout then it can use it by trying in other servers.
+  // Because of this we clamp the client's deadline to the maximum configured
+  // scanner wait time. If the client sets a longer timeout then it can use it
+  // by retrying (possibly on other servers).
   bool was_clamped = false;
   MonoTime final_deadline = ClampScanDeadlineForWait(client_deadline, &was_clamped);
 
@@ -2266,19 +2764,20 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
   // the same timestamp (repeatable reads).
   TRACE("Waiting safe time to advance");
   MonoTime before = MonoTime::Now();
-  Status s = time_manager->WaitUntilSafe(tmp_snap_timestamp, final_deadline);
+  s = time_manager->WaitUntilSafe(tmp_snap_timestamp, final_deadline);
 
   tablet::MvccSnapshot snap;
-  tablet::MvccManager* mvcc_manager = tablet->mvcc_manager();
-  if (s.ok()) {
+  if (PREDICT_TRUE(s.ok())) {
     // Wait for the in-flights in the snapshot to be finished.
     TRACE("Waiting for operations to commit");
-    s = mvcc_manager->WaitForSnapshotWithAllCommitted(tmp_snap_timestamp, &snap, client_deadline);
+    s = tablet->mvcc_manager()->WaitForSnapshotWithAllCommitted(
+          tmp_snap_timestamp, &snap, client_deadline);
   }
 
   // If we got an TimeOut but we had clamped the deadline, return a ServiceUnavailable instead
   // so that the client retries.
-  if (s.IsTimedOut() && was_clamped) {
+  if (PREDICT_FALSE(s.IsTimedOut() && was_clamped)) {
+    *error_code = TabletServerErrorPB::THROTTLED;
     return Status::ServiceUnavailable(s.CloneAndPrepend(
         "could not wait for desired snapshot timestamp to be consistent").ToString());
   }
@@ -2288,13 +2787,47 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
   tablet->metrics()->snapshot_read_inflight_wait_duration->Increment(duration_usec);
   TRACE("All operations in snapshot committed. Waited for $0 microseconds", duration_usec);
 
-  if (scan_pb.order_mode() == UNKNOWN_ORDER_MODE) {
-    return Status::InvalidArgument("Unknown order mode specified");
+  tablet::RowIteratorOptions opts;
+  opts.projection = &projection;
+  opts.snap_to_include = snap;
+  opts.order = scan_pb.order_mode();
+
+  boost::optional<Timestamp> tmp_snap_start_timestamp;
+  if (scan_pb.has_snap_start_timestamp()) {
+    if (scan_pb.read_mode() != READ_AT_SNAPSHOT) {
+      // TODO(mpercy): Should we allow READ_YOUR_WRITES mode? There is no
+      // obvious use for it, but also no obvious reason not to support it,
+      // except for the fact that we would also have to test it.
+      *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
+      return Status::InvalidArgument("scan start timestamp is only supported "
+                                     "in READ_AT_SNAPSHOT read mode");
+    }
+    if (scan_pb.order_mode() != ORDERED) {
+      *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
+      return Status::InvalidArgument("scan start timestamp is only supported "
+                                     "in ORDERED order mode");
+    }
+    tmp_snap_start_timestamp = Timestamp(scan_pb.snap_start_timestamp());
+    opts.snap_to_exclude = MvccSnapshot(*tmp_snap_start_timestamp);
+    opts.include_deleted_rows = true;
   }
-  RETURN_NOT_OK(tablet->NewRowIterator(projection, snap, scan_pb.order_mode(), iter));
+
+  // Before we open / wait on anything check that the timestamp(s) are after
+  // the AHM. This is not the final check. We'll check this again after the
+  // iterators are open but there is no point in doing the work to initialize
+  // the iterators and spending the time to wait for a snapshot timestamp to be
+  // readable when we can't read back to one of the requested timestamps.
+  RETURN_NOT_OK_EVAL(VerifyLegalSnapshotTimestamps(tablet, scan_pb.read_mode(),
+                                                   tmp_snap_start_timestamp,
+                                                   tmp_snap_timestamp),
+                     *error_code = TabletServerErrorPB::INVALID_SNAPSHOT);
+
+  RETURN_NOT_OK(tablet->NewRowIterator(std::move(opts), iter));
 
   // Return the picked snapshot timestamp for both READ_AT_SNAPSHOT
-  // and READ_YOUR_WRITES mode.
+  // and READ_YOUR_WRITES mode, as well as the parsed start timestamp for
+  // READ_AT_SNAPSHOT mode, if specified.
+  *snap_start_timestamp = std::move(tmp_snap_start_timestamp);
   *snap_timestamp = tmp_snap_timestamp;
   return Status::OK();
 }
@@ -2366,13 +2899,6 @@ Status TabletServiceImpl::PickAndVerifyTimestamp(const NewScanRequestPB& scan_pb
                                     scan_pb.propagated_timestamp() : Timestamp::kMin.ToUint64();
     tmp_snap_timestamp = Timestamp(std::max(propagated_timestamp + 1, clean_timestamp));
   }
-
-  // Before we wait on anything check that the timestamp is after the AHM.
-  // This is not the final check. We'll check this again after the iterators are open but
-  // there is no point in waiting if we can't actually scan afterwards.
-  RETURN_NOT_OK(VerifyNotAncientHistory(tablet,
-                                        read_mode,
-                                        tmp_snap_timestamp));
   *snap_timestamp = tmp_snap_timestamp;
   return Status::OK();
 }

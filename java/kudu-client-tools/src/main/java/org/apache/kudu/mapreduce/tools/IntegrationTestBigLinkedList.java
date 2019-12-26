@@ -356,7 +356,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
       public List<InputSplit> getSplits(JobContext job) throws IOException, InterruptedException {
         int numMappers = job.getConfiguration().getInt(GENERATOR_NUM_MAPPERS_KEY, 1);
 
-        ArrayList<InputSplit> splits = new ArrayList<InputSplit>(numMappers);
+        ArrayList<InputSplit> splits = new ArrayList<>(numMappers);
 
         for (int i = 0; i < numMappers; i++) {
           splits.add(new GeneratorInputSplit());
@@ -406,7 +406,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
       private byte[][] current = null;
       private String id;
       private long rowId = 0;
-      private int i;
+      private int position;
       private KuduClient client;
       private KuduTable table;
       private KuduSession session;
@@ -447,11 +447,11 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
 
       @Override
       protected void map(BytesWritable key, NullWritable value, Context output) throws IOException {
-        current[i] = new byte[key.getLength()];
-        System.arraycopy(key.getBytes(), 0, current[i], 0, key.getLength());
-        if (++i == current.length) {
+        current[position] = new byte[key.getLength()];
+        System.arraycopy(key.getBytes(), 0, current[position], 0, key.getLength());
+        if (++position == current.length) {
           persist(output, current, false);
-          i = 0;
+          position = 0;
 
           // Keep track of the first row so that we can point to it at the end.
           if (first == null) {
@@ -581,6 +581,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
       client.createTable(tableName, schema, builder);
     }
 
+    @SuppressWarnings("deprecation")
     public int runRandomInputGenerator(int numMappers, long numNodes, Path tmpOutput,
                                        Integer width, Integer wrapMultiplier) throws Exception {
       LOG.info("Running RandomInputGenerator with numMappers=" + numMappers +
@@ -607,6 +608,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
       return success ? 0 : 1;
     }
 
+    @SuppressWarnings("deprecation")
     public int runGenerator(int numMappers, long numNodes, int numTablets, Path tmpOutput,
                             Integer width, Integer wrapMultiplier) throws Exception {
       LOG.info("Running Generator with numMappers=" + numMappers + ", numNodes=" + numNodes);
@@ -667,6 +669,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
       private BytesWritable ref = new BytesWritable();
 
       @Override
+      @SuppressWarnings("unchecked")
       protected void map(NullWritable key, RowResult value, Mapper.Context context)
           throws IOException, InterruptedException {
         Bytes.setLong(rowKey, value.getLong(0));
@@ -688,7 +691,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
     }
 
     public static class VerifyReducer extends Reducer<BytesWritable,BytesWritable,Text,Text> {
-      private ArrayList<byte[]> refs = new ArrayList<byte[]>();
+      private ArrayList<byte[]> refs = new ArrayList<>();
 
       @Override
       public void reduce(BytesWritable key, Iterable<BytesWritable> values, Context context)
@@ -733,9 +736,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
           context.getCounter(Counts.UNREFERENCED).increment(1);
         } else {
           if (refs.size() > 1) {
-            if (refsList != null) {
-              context.write(new Text(keyString), new Text(refsList.toString()));
-            }
+            context.write(new Text(keyString), new Text(refsList.toString()));
             context.getCounter(Counts.EXTRAREFERENCES).increment(refs.size() - 1);
           }
           // node is defined and referenced
@@ -764,6 +765,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
       return run(new Path(outputDir), numReducers);
     }
 
+    @SuppressWarnings("deprecation")
     public int run(Path outputDir, int numReducers) throws Exception {
       LOG.info("Running Verify with outputDir=" + outputDir + ", numReducers=" + numReducers);
 
@@ -793,7 +795,6 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
       return success ? 0 : 1;
     }
 
-    @SuppressWarnings("deprecation")
     public boolean verify(long expectedReferenced) throws Exception {
       if (job == null) {
         throw new IllegalStateException("You should call run() first");
@@ -977,7 +978,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
         System.err.println();
         HelpFormatter formatter = new HelpFormatter();
         formatter.printHelp(getClass().getSimpleName(), options);
-        System.exit(-1);
+        throw new RuntimeException(e);
       }
 
       CommandLineParser cmdLineParser = new CommandLineParser(getConf());
@@ -1104,8 +1105,8 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
         // Add as many heads as we need, then we skip the rest.
         do {
           if (headsCache.size() < numUpdatesPerMapper) {
-            value = (RowResult)context.getCurrentValue();
-            headsCache.add(new Pair<Long, Long>(value.getLong(0), value.getLong(1)));
+            RowResult realValue = (RowResult) context.getCurrentValue();
+            headsCache.add(new Pair<>(realValue.getLong(0), realValue.getLong(1)));
           }
         } while (context.nextKeyValue());
 
@@ -1240,6 +1241,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
       }
     }
 
+    @SuppressWarnings("deprecation")
     public int run(long maxLinkUpdatesPerMapper) throws Exception {
       LOG.info("Running Updater with maxLinkUpdatesPerMapper=" + maxLinkUpdatesPerMapper);
 
@@ -1323,9 +1325,8 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
     }
   }
 
-  /**
-   * A stand alone program that deletes a single node.
-   * TODO
+  /*
+   * TODO: A stand alone program that deletes a single node.
    */
   /*private static class Delete extends Configured implements Tool {
     @Override
@@ -1464,7 +1465,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
   }
 
   private static void printCINodeString(CINode node) {
-    System.out.printf("%s:%s:%012d:%s:%s\n", node.key, node.prev, node.rowId, node.client,
+    System.out.printf("%s:%s:%012d:%s:%s%n", node.key, node.prev, node.rowId, node.client,
         node.updateCount);
   }
 
@@ -1487,7 +1488,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
   private void usage() {
     System.err.println("Usage: " + this.getClass().getSimpleName() + " COMMAND [COMMAND options]");
     System.err.println("  where COMMAND is one of:");
-    System.err.println("");
+    System.err.println();
     System.err.println("  Generator                  A map only job that generates data.");
     System.err.println("  Verify                     A map reduce job that looks for holes");
     System.err.println("                             Look at the counts after running");
@@ -1521,24 +1522,30 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
   public int run(String[] args) throws Exception {
     Tool tool;
     processOptions(args);
-    if (toRun.equals("Generator")) {
-      tool = new Generator();
-    } else if (toRun.equals("Verify")) {
-      tool = new Verify();
-    } else if (toRun.equals("Loop")) {
-      Loop loop = new Loop();
-      loop.it = this;
-      tool = loop;
-
-    } else if (toRun.equals("Print")) {
-      tool = new Print();
-    } else if (toRun.equals("Update")) {
-      tool = new Updater();
-    } else if (toRun.equals("Walker")) {
-      tool = new Walker();
-    } else {
-      usage();
-      throw new RuntimeException("Unknown arg");
+    switch (toRun) {
+      case "Generator":
+        tool = new Generator();
+        break;
+      case "Verify":
+        tool = new Verify();
+        break;
+      case "Loop":
+        Loop loop = new Loop();
+        loop.it = this;
+        tool = loop;
+        break;
+      case "Print":
+        tool = new Print();
+        break;
+      case "Update":
+        tool = new Updater();
+        break;
+      case "Walker":
+        tool = new Walker();
+        break;
+      default:
+        usage();
+        throw new RuntimeException("Unknown arg");
     }
 
     return ToolRunner.run(getConf(), tool, otherArgs);

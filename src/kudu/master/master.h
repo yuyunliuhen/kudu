@@ -14,8 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_MASTER_MASTER_H
-#define KUDU_MASTER_MASTER_H
+#pragma once
 
 #include <atomic>
 #include <cstdint>
@@ -24,7 +23,6 @@
 #include <vector>
 
 #include "kudu/common/wire_protocol.pb.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
 #include "kudu/kserver/kserver.h"
@@ -38,6 +36,10 @@ class HostPortPB;
 class MaintenanceManager;
 class MonoDelta;
 class ThreadPool;
+
+namespace master {
+class LocationCache;
+}  // namespace master
 
 namespace security {
 class TokenSigner;
@@ -71,8 +73,6 @@ class Master : public kserver::KuduServer {
   Status WaitUntilCatalogManagerIsLeaderAndReadyForTests(const MonoDelta& timeout)
       WARN_UNUSED_RESULT;
 
-  std::string ToString() const;
-
   MasterCertAuthority* cert_authority() { return cert_authority_.get(); }
 
   security::TokenSigner* token_signer() { return token_signer_.get(); }
@@ -82,6 +82,8 @@ class Master : public kserver::KuduServer {
   CatalogManager* catalog_manager() { return catalog_manager_.get(); }
 
   const MasterOptions& opts() { return opts_; }
+
+  LocationCache* location_cache() { return location_cache_.get(); }
 
   // Get the RPC and HTTP addresses for this master instance.
   Status GetMasterRegistration(ServerRegistrationPB* registration) const;
@@ -102,6 +104,12 @@ class Master : public kserver::KuduServer {
   // This is not as complete as ListMasters() above, but operates just
   // based on local state.
   Status GetMasterHostPorts(std::vector<HostPortPB>* hostports) const;
+
+  // Crash the master on disk error.
+  void CrashMasterOnDiskError(const std::string& uuid);
+
+  // Crash the master on CFile corruption.
+  void CrashMasterOnCFileCorruption(const std::string& tablet_id);
 
   bool IsShutdown() const {
     return state_ == kStopped;
@@ -131,12 +139,11 @@ class Master : public kserver::KuduServer {
 
   std::unique_ptr<MasterCertAuthority> cert_authority_;
   std::unique_ptr<security::TokenSigner> token_signer_;
-  gscoped_ptr<TSManager> ts_manager_;
-  gscoped_ptr<CatalogManager> catalog_manager_;
-  gscoped_ptr<MasterPathHandlers> path_handlers_;
+  std::unique_ptr<CatalogManager> catalog_manager_;
+  std::unique_ptr<MasterPathHandlers> path_handlers_;
 
   // For initializing the catalog manager.
-  gscoped_ptr<ThreadPool> init_pool_;
+  std::unique_ptr<ThreadPool> init_pool_;
 
   // The status of the master initialization. This is set
   // by the async initialization task.
@@ -151,9 +158,13 @@ class Master : public kserver::KuduServer {
   // The maintenance manager for this master.
   std::shared_ptr<MaintenanceManager> maintenance_manager_;
 
+  // A simplistic cache to track already assigned locations.
+  std::unique_ptr<LocationCache> location_cache_;
+
+  std::unique_ptr<TSManager> ts_manager_;
+
   DISALLOW_COPY_AND_ASSIGN(Master);
 };
 
 } // namespace master
 } // namespace kudu
-#endif

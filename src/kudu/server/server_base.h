@@ -14,8 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_SERVER_SERVER_BASE_H
-#define KUDU_SERVER_SERVER_BASE_H
+#pragma once
 
 #include <cstdint>
 #include <memory>
@@ -32,6 +31,7 @@
 
 namespace kudu {
 
+class DnsResolver;
 class FsManager;
 class MemTracker;
 class MetricEntity;
@@ -104,14 +104,23 @@ class ServerBase {
   // Returns this server's clock.
   clock::Clock* clock() { return clock_.get(); }
 
+  DnsResolver* dns_resolver() { return dns_resolver_.get(); }
+
   // Return a PB describing the status of the server (version info, bound ports, etc)
   Status GetStatusPB(ServerStatusPB* status) const;
+
+  int64_t start_time() const {
+    return start_time_;
+  }
 
   enum {
     SUPER_USER = 1,
     USER = 1 << 1,
     SERVICE_USER = 1 << 2
   };
+
+  // Returns whether or not the rpc is from a super-user.
+  bool IsFromSuperUser(const rpc::RpcContext* rpc);
 
   // Authorize an RPC. 'allowed_roles' is a bitset of which roles from the above
   // enum should be allowed to make hthe RPC.
@@ -161,6 +170,8 @@ class ServerBase {
   void LogUnauthorizedAccess(rpc::RpcContext* rpc) const;
 
   const std::string name_;
+  // Seconds since the epoch.
+  int64_t start_time_;
 
   std::unique_ptr<MinidumpExceptionHandler> minidump_handler_;
   std::shared_ptr<MemTracker> mem_tracker_;
@@ -187,6 +198,7 @@ class ServerBase {
 
   // The ACL of users who may act as part of the Kudu service.
   security::SimpleAcl service_acl_;
+
  private:
   Status InitAcls();
   void GenerateInstanceID();
@@ -203,10 +215,22 @@ class ServerBase {
   Status StartExcessLogFileDeleterThread();
   void ExcessLogFileDeleterThread();
 
+#ifdef TCMALLOC_ENABLED
+  // Start thread to GC tcmalloc allocated memory.
+  Status StartTcmallocMemoryGcThread();
+  void TcmallocMemoryGcThread();
+#endif
+
+  // Utility object for DNS name resolutions.
+  std::unique_ptr<DnsResolver> dns_resolver_;
+
   ServerBaseOptions options_;
 
   std::unique_ptr<DiagnosticsLog> diag_log_;
   scoped_refptr<Thread> excess_log_deleter_thread_;
+#ifdef TCMALLOC_ENABLED
+  scoped_refptr<Thread> tcmalloc_memory_gc_thread_;
+#endif
   CountDownLatch stop_background_threads_latch_;
 
   gscoped_ptr<ScopedGLogMetrics> glog_metrics_;
@@ -216,4 +240,3 @@ class ServerBase {
 
 } // namespace server
 } // namespace kudu
-#endif /* KUDU_SERVER_SERVER_BASE_H */

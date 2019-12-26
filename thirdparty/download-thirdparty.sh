@@ -258,11 +258,12 @@ fetch_and_patch \
  $LIBEV_SOURCE \
  $LIBEV_PATCHLEVEL
 
-RAPIDJSON_PATCHLEVEL=0
+RAPIDJSON_PATCHLEVEL=1
 fetch_and_patch \
  rapidjson-${RAPIDJSON_VERSION}.zip \
  $RAPIDJSON_SOURCE \
- $RAPIDJSON_PATCHLEVEL
+ $RAPIDJSON_PATCHLEVEL \
+ "patch -p1 < $TP_DIR/patches/rapidjson-fix-signed-unsigned-conversion-error.patch"
 
 SQUEASEL_PATCHLEVEL=0
 fetch_and_patch \
@@ -276,7 +277,7 @@ fetch_and_patch \
  $MUSTACHE_SOURCE \
  $MUSTACHE_PATCHLEVEL
 
-GSG_PATCHLEVEL=1
+GSG_PATCHLEVEL=2
 fetch_and_patch \
  google-styleguide-${GSG_VERSION}.tar.gz \
  $GSG_SOURCE \
@@ -296,19 +297,17 @@ fetch_and_patch \
  $CURL_PATCHLEVEL \
  "autoreconf -fvi"
 
-CRCUTIL_PATCHLEVEL=1
+CRCUTIL_PATCHLEVEL=0
 fetch_and_patch \
  crcutil-${CRCUTIL_VERSION}.tar.gz \
  $CRCUTIL_SOURCE \
- $CRCUTIL_PATCHLEVEL \
- "patch -p0 < $TP_DIR/patches/crcutil-fix-libtoolize-on-osx.patch"
+ $CRCUTIL_PATCHLEVEL
 
-LIBUNWIND_PATCHLEVEL=2
+LIBUNWIND_PATCHLEVEL=1
 fetch_and_patch \
  libunwind-${LIBUNWIND_VERSION}.tar.gz \
  $LIBUNWIND_SOURCE \
  $LIBUNWIND_PATCHLEVEL \
- "patch -p1 < $TP_DIR/patches/libunwind-Use-syscall-directly-in-write_validate-to-avoid-ASAN.patch" \
  "patch -p1 < $TP_DIR/patches/libunwind-trace-cache-destructor.patch"
 
 PYTHON_PATCHLEVEL=0
@@ -317,24 +316,19 @@ fetch_and_patch \
  $PYTHON_SOURCE \
  $PYTHON_PATCHLEVEL
 
-LLVM_PATCHLEVEL=2
+LLVM_PATCHLEVEL=4
 fetch_and_patch \
  llvm-${LLVM_VERSION}-iwyu-${IWYU_VERSION}.src.tar.gz \
  $LLVM_SOURCE \
  $LLVM_PATCHLEVEL \
-  "patch -p1 < $TP_DIR/patches/llvm-fix-amazon-linux.patch" \
   "patch -p1 < $TP_DIR/patches/llvm-add-iwyu.patch" \
-  "patch -p1 < $TP_DIR/patches/llvm-iwyu-nocurses.patch" \
-  "patch -p1 < $TP_DIR/patches/llvm-iwyu-include-picker.patch" \
-  "patch -d tools/clang/tools/include-what-you-use -p1 < $TP_DIR/patches/llvm-iwyu-llvm-6-compat.patch" \
-  "patch -d projects/compiler-rt -p1 < $TP_DIR/patches/llvm-tsan-disable-trace-switching-after-multithreaded-for.patch"
+  "patch -p1 < $TP_DIR/patches/llvm-iwyu-include-picker.patch"
 
-LZ4_PATCHLEVEL=1
+LZ4_PATCHLEVEL=0
 fetch_and_patch \
- lz4-lz4-$LZ4_VERSION.tar.gz \
+ lz4-$LZ4_VERSION.tar.gz \
  $LZ4_SOURCE \
- $LZ4_PATCHLEVEL \
- "patch -p1 < $TP_DIR/patches/lz4-0001-Fix-cmake-build-to-use-gnu-flags-on-clang.patch"
+ $LZ4_PATCHLEVEL
 
 BITSHUFFLE_PATCHLEVEL=0
 fetch_and_patch \
@@ -347,12 +341,6 @@ fetch_and_patch \
  kudu-trace-viewer-${TRACE_VIEWER_VERSION}.tar.gz \
  $TRACE_VIEWER_SOURCE \
  $TRACE_VIEWER_PATCHLEVEL
-
-NVML_PATCHLEVEL=0
-fetch_and_patch \
- nvml-${NVML_VERSION}.tar.gz \
- $NVML_SOURCE \
- $NVML_PATCHLEVEL
 
 BOOST_PATCHLEVEL=1
 fetch_and_patch \
@@ -400,16 +388,13 @@ fetch_and_patch \
  $THRIFT_SOURCE \
  $THRIFT_PATCHLEVEL
 
-BISON_PATCHLEVEL=1
+BISON_PATCHLEVEL=0
 fetch_and_patch \
  $BISON_NAME.tar.gz \
  $BISON_SOURCE \
- $BISON_PATCHLEVEL \
- "patch -p0 < $TP_DIR/patches/bison-fix-high-sierra-compilation-issue.patch"
- # Fix compilation issue in macOS High Sierra
- # See: https://github.com/spack/spack/issues/5521
+ $BISON_PATCHLEVEL
  # This would normally call autoreconf, but it does not succeed with
- # autoreconf 2.69 (RHEL 7): "autoreconf: 'configure.ac' or 'configure.in' is required".
+ # autoreconf 2.69-11 (RHEL 7): "autoreconf: 'configure.ac' or 'configure.in' is required".
 
 HIVE_PATCHLEVEL=0
 fetch_and_patch \
@@ -428,6 +413,35 @@ fetch_and_patch \
  $SENTRY_NAME.tar.gz \
  $SENTRY_SOURCE \
  $SENTRY_PATCHLEVEL
+
+YAML_PATCHLEVEL=0
+fetch_and_patch \
+ $YAML_NAME.tar.gz \
+ $YAML_SOURCE \
+ $YAML_PATCHLEVEL
+
+CHRONY_PATCHLEVEL=2
+fetch_and_patch \
+ $CHRONY_NAME.tar.gz \
+ $CHRONY_SOURCE \
+ $CHRONY_PATCHLEVEL \
+ "patch -p1 < $TP_DIR/patches/chrony-no-superuser.patch" \
+ "patch -p1 < $TP_DIR/patches/chrony-reuseport.patch"
+
+GUMBO_PARSER_PATCHLEVEL=1
+fetch_and_patch \
+ $GUMBO_PARSER_NAME.tar.gz \
+ $GUMBO_PARSER_SOURCE \
+ $GUMBO_PARSER_PATCHLEVEL \
+ "patch -p1 < $TP_DIR/patches/gumbo-parser-autoconf-263.patch" \
+ "autoreconf -fvi"
+
+GUMBO_QUERY_PATCHLEVEL=1
+fetch_and_patch \
+ $GUMBO_QUERY_NAME.tar.gz \
+ $GUMBO_QUERY_SOURCE \
+ $GUMBO_QUERY_PATCHLEVEL \
+ "patch -p1 < $TP_DIR/patches/gumbo-query-namespace.patch"
 
 echo "---------------"
 echo "Thirdparty dependencies downloaded successfully"

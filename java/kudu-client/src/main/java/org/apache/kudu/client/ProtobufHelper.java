@@ -23,6 +23,7 @@ import java.math.BigDecimal;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
 
 import com.google.common.base.Joiner;
@@ -42,39 +43,72 @@ import org.apache.kudu.util.DecimalUtil;
 public class ProtobufHelper {
 
   /**
+   * The flags that are not included while serializing.
+   */
+  public enum SchemaPBConversionFlags {
+    SCHEMA_PB_WITHOUT_COMMENT,
+    SCHEMA_PB_WITHOUT_ID
+  }
+
+  /**
    * Utility method to convert a Schema to its wire format.
    * @param schema Schema to convert
    * @return a list of ColumnSchemaPB
    */
   public static List<Common.ColumnSchemaPB> schemaToListPb(Schema schema) {
-    ArrayList<Common.ColumnSchemaPB> columns =
-        new ArrayList<Common.ColumnSchemaPB>(schema.getColumnCount());
+    return schemaToListPb(schema, EnumSet.noneOf(SchemaPBConversionFlags.class));
+  }
+
+  public static List<Common.ColumnSchemaPB> schemaToListPb(Schema schema,
+                                                           EnumSet<SchemaPBConversionFlags> flags) {
+    ArrayList<Common.ColumnSchemaPB> columns = new ArrayList<>(schema.getColumnCount());
     Common.ColumnSchemaPB.Builder schemaBuilder = Common.ColumnSchemaPB.newBuilder();
     for (ColumnSchema col : schema.getColumns()) {
-      columns.add(columnToPb(schemaBuilder, col));
+      int id = schema.hasColumnIds() ? schema.getColumnId(col.getName()) : -1;
+      columns.add(columnToPb(schemaBuilder, id, col, flags));
       schemaBuilder.clear();
     }
     return columns;
   }
 
   public static Common.SchemaPB schemaToPb(Schema schema) {
+    return schemaToPb(schema, EnumSet.noneOf(SchemaPBConversionFlags.class));
+  }
+
+  public static Common.SchemaPB schemaToPb(Schema schema,
+                                           EnumSet<SchemaPBConversionFlags> flags) {
     Common.SchemaPB.Builder builder = Common.SchemaPB.newBuilder();
-    builder.addAllColumns(schemaToListPb(schema));
+    builder.addAllColumns(schemaToListPb(schema, flags));
     return builder.build();
   }
 
   public static Common.ColumnSchemaPB columnToPb(ColumnSchema column) {
-    return columnToPb(Common.ColumnSchemaPB.newBuilder(), column);
+    return columnToPb(Common.ColumnSchemaPB.newBuilder(), -1, column);
   }
 
   public static Common.ColumnSchemaPB columnToPb(Common.ColumnSchemaPB.Builder schemaBuilder,
+                                                 int colId,
                                                  ColumnSchema column) {
+    return columnToPb(schemaBuilder,
+                      colId,
+                      column,
+                      EnumSet.noneOf(SchemaPBConversionFlags.class));
+  }
+
+  public static Common.ColumnSchemaPB columnToPb(Common.ColumnSchemaPB.Builder schemaBuilder,
+                                                 int colId,
+                                                 ColumnSchema column,
+                                                 EnumSet<SchemaPBConversionFlags> flags) {
     schemaBuilder
         .setName(column.getName())
-        .setType(column.getType().getDataType(column.getTypeAttributes()))
+        .setType(column.getWireType())
         .setIsKey(column.isKey())
         .setIsNullable(column.isNullable())
         .setCfileBlockSize(column.getDesiredBlockSize());
+
+    if (!flags.contains(SchemaPBConversionFlags.SCHEMA_PB_WITHOUT_ID) && colId >= 0) {
+      schemaBuilder.setId(colId);
+    }
     if (column.getEncoding() != null) {
       schemaBuilder.setEncoding(column.getEncoding().getInternalPbType());
     }
@@ -85,9 +119,13 @@ public class ProtobufHelper {
       schemaBuilder.setReadDefaultValue(UnsafeByteOperations.unsafeWrap(
           objectToWireFormat(column, column.getDefaultValue())));
     }
-    if(column.getTypeAttributes() != null) {
+    if (column.getTypeAttributes() != null) {
       schemaBuilder.setTypeAttributes(
           columnTypeAttributesToPb(Common.ColumnTypeAttributesPB.newBuilder(), column));
+    }
+    if (!flags.contains(SchemaPBConversionFlags.SCHEMA_PB_WITHOUT_COMMENT) &&
+        !column.getComment().isEmpty()) {
+      schemaBuilder.setComment(column.getComment());
     }
     return schemaBuilder.build();
   }
@@ -100,6 +138,9 @@ public class ProtobufHelper {
     }
     if (typeAttributes.hasScale()) {
       builder.setScale(typeAttributes.getScale());
+    }
+    if (typeAttributes.hasLength()) {
+      builder.setLength(typeAttributes.getLength());
     }
     return builder.build();
   }
@@ -122,17 +163,21 @@ public class ProtobufHelper {
                            .compressionAlgorithm(compressionAlgorithm)
                            .desiredBlockSize(desiredBlockSize)
                            .typeAttributes(typeAttributes)
+                           .comment(pb.getComment())
                            .build();
   }
 
   public static ColumnTypeAttributes pbToColumnTypeAttributes(Common.ColumnTypeAttributesPB pb) {
     ColumnTypeAttributes.ColumnTypeAttributesBuilder builder =
         new ColumnTypeAttributes.ColumnTypeAttributesBuilder();
-    if(pb.hasPrecision()) {
+    if (pb.hasPrecision()) {
       builder.precision(pb.getPrecision());
     }
-    if(pb.hasScale()) {
+    if (pb.hasScale()) {
       builder.scale(pb.getScale());
+    }
+    if (pb.hasLength()) {
+      builder.length(pb.getLength());
     }
     return builder.build();
   }
@@ -231,6 +276,7 @@ public class ProtobufHelper {
       case INT64:
       case UNIXTIME_MICROS:
         return Bytes.fromLong((Long) value);
+      case VARCHAR:
       case STRING:
         return ((String) value).getBytes(UTF_8);
       case BINARY:
@@ -267,6 +313,7 @@ public class ProtobufHelper {
         return buf.getFloat();
       case DOUBLE:
         return buf.getDouble();
+      case VARCHAR:
       case STRING:
         return value.toStringUtf8();
       case BINARY:

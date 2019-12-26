@@ -34,13 +34,15 @@
 #include <boost/optional/optional.hpp>
 #include <glog/logging.h>
 #include <gtest/gtest_prod.h>
+#include <sparsehash/dense_hash_map>
 
 #include "kudu/consensus/metadata.pb.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/master/master.pb.h"
+#include "kudu/tablet/metadata.pb.h"
 #include "kudu/tserver/tablet_replica_lookup.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/cow_object.h"
@@ -51,14 +53,20 @@
 #include "kudu/util/rw_mutex.h"
 #include "kudu/util/status.h"
 
+template <class X> struct GoodFastHash;
+
 namespace kudu {
 
+class AuthzTokenTest_TestSingleMasterUnavailable_Test;
 class CreateTableStressTest_TestConcurrentCreateTableAndReloadMetadata_Test;
+class MetricEntity;
+class MetricRegistry;
 class MonitoredTask;
 class NodeInstancePB;
 class PartitionPB;
 class PartitionSchema;
 class Schema;
+class TableExtraConfigPB;
 class ThreadPool;
 struct ColumnId;
 
@@ -67,6 +75,15 @@ namespace client {
 class ServiceUnavailableRetryClientTest_CreateTable_Test;
 } // namespace client
 
+namespace consensus {
+class RaftConsensus;
+class StartTabletCopyRequestPB;
+} // namespace consensus
+
+namespace hms {
+class HmsCatalog;
+} // namespace hms
+
 namespace rpc {
 class RpcContext;
 } // namespace rpc
@@ -74,24 +91,21 @@ class RpcContext;
 namespace security {
 class Cert;
 class PrivateKey;
+class TokenSigner;
 class TokenSigningPublicKeyPB;
 } // namespace security
 
-namespace consensus {
-class RaftConsensus;
-class StartTabletCopyRequestPB;
-} // namespace consensus
+namespace tserver {
+class TsTabletManagerITest_TestTableStats_Test;
+}
 
 namespace tablet {
 class TabletReplica;
 } // namespace tablet
 
-namespace hms {
-class HmsCatalog;
-} // namespace hms
-
 namespace master {
 
+class AuthzProvider;
 class CatalogManagerBgTasks;
 class HmsNotificationLogListenerTask;
 class Master;
@@ -99,8 +113,8 @@ class PlacementPolicy;
 class SysCatalogTable;
 class TSDescriptor;
 class TableInfo;
-
 struct DeferredAssignmentActions;
+struct TableMetrics;
 
 // The data related to a tablet which is persisted on disk.
 // This portion of TableInfo is managed via CowObject.
@@ -123,12 +137,12 @@ struct PersistentTabletInfo {
   SysTabletsEntryPB pb;
 };
 
-// The information about a single tablet which exists in the cluster,
+// The information about a single tablet which exists in the cluster.
 //
 // This object uses copy-on-write for the portions of data which are persisted
 // on disk. This allows the mutated data to be staged and written to disk
 // while readers continue to access the previous version. These portions
-// of data are in PersistentTableInfo above, and typically accessed using
+// of data are in PersistentTabletInfo above, and typically accessed using
 // TabletMetadataLock. For example:
 //
 //   TabletInfo* table = ...;
@@ -177,6 +191,12 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo> {
   // No synchronization needed.
   std::string ToString() const;
 
+  // Update the stats.
+  void UpdateStats(tablet::ReportedTabletStatsPB stats);
+
+  // Return the stats.
+  tablet::ReportedTabletStatsPB GetStats() const;
+
  private:
   friend class RefCountedThreadSafe<TabletInfo>;
   ~TabletInfo();
@@ -197,6 +217,9 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo> {
   //
   // Set to NOT_YET_REPORTED when the tablet hasn't yet reported.
   int64_t reported_schema_version_;
+
+  // Cached stats for the LEADER replica.
+  tablet::ReportedTabletStatsPB stats_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletInfo);
 };
@@ -240,6 +263,7 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
   explicit TableInfo(std::string table_id);
 
   std::string ToString() const;
+  uint32_t schema_version() const;
 
   // Return the table's ID. Does not require synchronization.
   const std::string& id() const { return table_id_; }
@@ -269,10 +293,14 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
   // Returns true if an "Alter" operation is in-progress
   bool IsAlterInProgress(uint32_t version) const;
 
-  void AddTask(MonitoredTask *task);
-  void RemoveTask(MonitoredTask *task);
+  void AddTask(const std::string& tablet_id, const scoped_refptr<MonitoredTask>& task);
+  void RemoveTask(const std::string& tablet_id, MonitoredTask* task);
   void AbortTasks();
   void WaitTasksCompletion();
+
+  // Returns true if pending_tasks_ contains a task whose description
+  // is the same as task_description.
+  bool ContainsTask(const std::string& tablet_id, const std::string& task_description);
 
   // Allow for showing outstanding tasks in the master UI.
   void GetTaskList(std::vector<scoped_refptr<MonitoredTask> > *tasks);
@@ -293,9 +321,32 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
     return tablet_map_.size();
   }
 
+  // Register metrics for the table.
+  void RegisterMetrics(MetricRegistry* metric_registry, const std::string& table_name);
+
+  // Unregister metrics for the table.
+  void UnregisterMetrics();
+
+  // Update stats belonging to 'tablet_id' in the table's metrics.
+  void UpdateMetrics(const std::string& tablet_id,
+                     const tablet::ReportedTabletStatsPB& old_stats,
+                     const tablet::ReportedTabletStatsPB& new_stats);
+
+  // Remove stats belonging to 'tablet_id' from table metrics.
+  void RemoveMetrics(const std::string& tablet_id,
+                     const tablet::ReportedTabletStatsPB& old_stats);
+
+  // Update the attributes of the metrics.
+  void UpdateMetricsAttrs(const std::string& new_table_name);
+
+  // Return the metrics.
+  const TableMetrics* GetMetrics() const;
+
  private:
   friend class RefCountedThreadSafe<TableInfo>;
   friend class TabletInfo;
+  FRIEND_TEST(kudu::tserver::TsTabletManagerITest, TestTableStats);
+
   ~TableInfo();
 
   // Increments or decrements the value for the key 'version' in
@@ -319,8 +370,8 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
 
   CowObject<PersistentTableInfo> metadata_;
 
-  // List of pending tasks (e.g. create/alter tablet requests)
-  std::unordered_set<MonitoredTask*> pending_tasks_;
+  // Map of tablet_id to pending tasks (e.g. create/alter tablet requests).
+  std::unordered_multimap<std::string, scoped_refptr<MonitoredTask>> pending_tasks_;
 
   // Map of schema version to the number of tablets that reported that version.
   //
@@ -330,6 +381,9 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
   // The contents of this map are equivalent to iterating over every table in
   // tablet_map_ and summing up the tablets' reported schema versions.
   std::map<int64_t, int64_t> schema_version_counts_;
+
+  scoped_refptr<MetricEntity> metric_entity_;
+  std::unique_ptr<TableMetrics> metrics_;
 
   DISALLOW_COPY_AND_ASSIGN(TableInfo);
 };
@@ -524,7 +578,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   void Shutdown();
   Status CheckOnline() const;
 
-  // Create a new Table with the specified attributes
+  // Create a new Table with the specified attributes.
   //
   // The RPC context is provided for logging/tracing purposes,
   // but this function does not itself respond to the RPC.
@@ -532,9 +586,11 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                      CreateTableResponsePB* resp,
                      rpc::RpcContext* rpc);
 
-  // Get the information about an in-progress create operation
+  // Get the information about an in-progress create operation. If 'user' is
+  // provided, checks that the user is authorized to get such information.
   Status IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
-                           IsCreateTableDoneResponsePB* resp);
+                           IsCreateTableDoneResponsePB* resp,
+                           boost::optional<const std::string&> user);
 
   // Delete the specified table in response to a DeleteTableRequest RPC.
   //
@@ -565,36 +621,66 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                         const std::string& new_table_name,
                         int64_t notification_log_event_id) WARN_UNUSED_RESULT;
 
-  // Get the information about an in-progress alter operation
-  //
-  // The RPC context is provided for logging/tracing purposes,
-  // but this function does not itself respond to the RPC.
+  // Get the information about an in-progress alter operation. If 'user' is
+  // provided, checks that the user is authorized to get such information.
   Status IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
                           IsAlterTableDoneResponsePB* resp,
-                          rpc::RpcContext* rpc);
+                          boost::optional<const std::string&> user);
 
-  // Get the information about the specified table
+  // Get the information about the specified table. If 'user' is provided,
+  // checks that the user is authorized to get such information. If a token
+  // signer is provided (e.g. authz token generation is enabled), an authz
+  // token will be attached to the response.
   Status GetTableSchema(const GetTableSchemaRequestPB* req,
-                        GetTableSchemaResponsePB* resp);
+                        GetTableSchemaResponsePB* resp,
+                        boost::optional<const std::string&> user,
+                        const security::TokenSigner* token_signer);
 
-  // List all the running tables
+  // Lists all the running tables. If 'user' is provided, only lists those that
+  // the given user is authorized to see.
   Status ListTables(const ListTablesRequestPB* req,
-                    ListTablesResponsePB* resp);
+                    ListTablesResponsePB* resp,
+                    boost::optional<const std::string&> user);
 
-  // Lookup the tablets contained in the partition range of the request.
+  // Get table statistics. If 'user' is provided, checks if the user is
+  // authorized to get such statistics.
+  Status GetTableStatistics(const GetTableStatisticsRequestPB* req,
+                            GetTableStatisticsResponsePB* resp,
+                            boost::optional<const std::string&> user);
+
+  // Lookup the tablets contained in the partition range of the request. If 'user'
+  // is provided, checks that the user is authorized to get such information.
+  //
   // Returns an error if any of the tablets are not running.
   Status GetTableLocations(const GetTableLocationsRequestPB* req,
-                           GetTableLocationsResponsePB* resp);
+                           GetTableLocationsResponsePB* resp,
+                           boost::optional<const std::string&> user);
 
-  // Look up the locations of the given tablet. Adds only information on
-  // replicas which satisfy the 'filter'. The locations vector is overwritten
-  // (not appended to). If the tablet is not found, returns Status::NotFound.
+  struct TSInfosDict {
+    std::vector<std::unique_ptr<TSInfoPB>> ts_info_pbs;
+    google::dense_hash_map<StringPiece, int, GoodFastHash<StringPiece>> uuid_to_idx;
+    TSInfosDict() {
+      uuid_to_idx.set_empty_key(StringPiece());
+    }
+  };
+
+  // Look up the locations of the given tablet. If 'user' is provided, checks
+  // that the user is authorized to get such information. Adds only information
+  // on replicas which satisfy the 'filter'. The locations vector is overwritten
+  // (not appended to).
+  //
+  // If 'ts_infos_dict' is not null, the returned locations use it as a dictionary
+  // to reference TSInfoPBs instead of making many copies.
+  //
+  // If the tablet is not found, returns Status::NotFound.
   // If the tablet is not running, returns Status::ServiceUnavailable.
   // Otherwise, returns Status::OK and puts the result in 'locs_pb'.
   // This only returns tablets which are in RUNNING state.
   Status GetTabletLocations(const std::string& tablet_id,
                             master::ReplicaTypeFilter filter,
-                            TabletLocationsPB* locs_pb);
+                            TabletLocationsPB* locs_pb,
+                            TSInfosDict* ts_infos_dict,
+                            boost::optional<const std::string&> user);
 
   // Replace the given tablet with a new, empty one. The replaced tablet is
   // deleted and its data is permanently lost.
@@ -649,10 +735,6 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // NOTE: This should only be used by tests
   Status TableNameExists(const std::string& table_name, bool* exists);
 
-  // Let the catalog manager know that the the given tablet server successfully
-  // deleted the specified tablet.
-  void NotifyTabletDeleteSuccess(const std::string& permanent_uuid, const std::string& tablet_id);
-
   // Used by ConsensusService to retrieve the TabletReplica for a system
   // table specified by 'tablet_id'.
   //
@@ -679,6 +761,10 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
     return hms_catalog_.get();
   }
 
+  master::AuthzProvider* authz_provider() const {
+    return authz_provider_.get();
+  }
+
   // Returns the normalized form of the provided table name.
   //
   // If the HMS integration is configured and the table name is a valid HMS
@@ -693,6 +779,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // These tests call ElectedAsLeaderCb() directly.
   FRIEND_TEST(MasterTest, TestShutdownDuringTableVisit);
   FRIEND_TEST(MasterTest, TestGetTableLocationsDuringRepeatedTableVisit);
+  FRIEND_TEST(kudu::AuthzTokenTest, TestSingleMasterUnavailable);
 
   // This test calls VisitTablesAndTablets() directly.
   FRIEND_TEST(kudu::CreateTableStressTest, TestConcurrentCreateTableAndReloadMetadata);
@@ -706,21 +793,29 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   typedef std::unordered_map<std::string, scoped_refptr<TableInfo>> TableInfoMap;
   typedef std::unordered_map<std::string, scoped_refptr<TabletInfo>> TabletInfoMap;
 
-  // Delete the specified table in the catalog.
+  // Delete the specified table in the catalog. If 'user' is provided,
+  // checks that the user is authorized to delete the table. Otherwise,
+  // it indicates its an internal operation (originates from catalog
+  // manager).
   //
   // If a notification log event ID is provided, it will be written to the sys
   // catalog.
   Status DeleteTable(const DeleteTableRequestPB& req,
                      DeleteTableResponsePB* resp,
-                     boost::optional<int64_t> hms_notification_log_event_id) WARN_UNUSED_RESULT;
+                     boost::optional<int64_t> hms_notification_log_event_id,
+                     boost::optional<const std::string&> user) WARN_UNUSED_RESULT;
 
-  // Alter the specified table in the catalog.
+  // Alter the specified table in the catalog. If 'user' is provided,
+  // checks that the user is authorized to alter the table. Otherwise,
+  // it indicates its an internal operation (originates from catalog
+  // manager).
   //
   // If a notification log event ID is provided, it will be written to the sys
   // catalog along with the altered table metadata.
   Status AlterTable(const AlterTableRequestPB& req,
                     AlterTableResponsePB* resp,
-                    boost::optional<int64_t> hms_notification_log_event_id) WARN_UNUSED_RESULT;
+                    boost::optional<int64_t> hms_notification_log_event_id,
+                    boost::optional<const std::string&> user) WARN_UNUSED_RESULT;
 
   // Called by SysCatalog::SysCatalogStateChanged when this node
   // becomes the leader of a consensus configuration. Executes
@@ -808,31 +903,55 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // "dirty" state field.
   scoped_refptr<TableInfo> CreateTableInfo(const CreateTableRequestPB& req,
                                            const Schema& schema,
-                                           const PartitionSchema& partition_schema);
+                                           const PartitionSchema& partition_schema,
+                                           TableExtraConfigPB extra_config_pb);
 
   // Helper for creating the initial TabletInfo state.
   // Leaves the tablet "write locked" with the new info in the
   // "dirty" state field.
   scoped_refptr<TabletInfo> CreateTabletInfo(const scoped_refptr<TableInfo>& table,
-                                             const PartitionPB& partition);
+                                             const PartitionPB& partition,
+                                             const boost::optional<std::string>& dimension_label);
+
 
   // Builds the TabletLocationsPB for a tablet based on the provided TabletInfo
   // and the replica type fiter specified. Populates locs_pb and returns
-  // Status::OK on success. Returns Status::ServiceUnavailable if tablet is
-  // not running.
+  // Status::OK on success.
+  //
+  // If 'ts_infos_dict' is not null, the returned locations use it as a dictionary
+  // to reference TSInfoPBs.
+  //
+  // Returns Status::ServiceUnavailable if tablet is not running.
   Status BuildLocationsForTablet(const scoped_refptr<TabletInfo>& tablet,
                                  master::ReplicaTypeFilter filter,
-                                 TabletLocationsPB* locs_pb);
+                                 TabletLocationsPB* locs_pb,
+                                 TSInfosDict* ts_infos_dict);
 
-  // Looks up the table and locks it with the provided lock mode. If the table
-  // does not exist an error status is returned, and the appropriate error code
-  // is set in the response.
-  template<typename ReqClass, typename RespClass>
-  Status FindAndLockTable(const ReqClass& request,
-                          RespClass* response,
-                          LockMode lock_mode,
-                          scoped_refptr<TableInfo>* table_info,
-                          TableMetadataLock* table_lock) WARN_UNUSED_RESULT;
+  // Looks up the table, locks it with the provided lock mode, and, if 'user' is
+  // provided, checks that the user is authorized to operate on the table.
+  //
+  // We expect that our external authorization metadata store uses table name to
+  // identify the protected resource. Therefore, the authorization step happens
+  // after table locking to ensure the table name is consistent between authorization
+  // of a particular action on the table and the client-visible execution of that
+  // action. Consider the following scenario,
+  //  1. Alice has RENAME privileges on table B. Bob has DROP privileges on table B.
+  //  2. Alice tries to rename B to A, at the same time that Bob tries to drop B.
+  //  3. If we were to authorize before locking, there may be a privilege
+  //     escalation where Bob drops table A that he has no permission to drop.
+  //
+  // If the table does not exist, NOT_AUTHORIZED error status is returned and the
+  // appropriate error code is set in the response, to avoid leaking whether the
+  // table exists. One exception is when the user is authorized to operate on the
+  // table, then TABLE_NOT_FOUND error status is returned.
+  template<typename ReqClass, typename RespClass, typename F>
+  Status FindLockAndAuthorizeTable(const ReqClass& request,
+                                   RespClass* response,
+                                   LockMode lock_mode,
+                                   F authz_func,
+                                   boost::optional<const std::string&> user,
+                                   scoped_refptr<TableInfo>* table_info,
+                                   TableMetadataLock* table_lock) WARN_UNUSED_RESULT;
 
   // Extract the set of tablets that must be processed because not running yet.
   void ExtractTabletsToProcess(std::vector<scoped_refptr<TabletInfo>>* tablets_to_process);
@@ -941,7 +1060,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   Status WaitForNotificationLogListenerCatchUp(RespClass* resp,
                                                rpc::RpcContext* rpc) WARN_UNUSED_RESULT;
 
-  // TODO: the maps are a little wasteful of RAM, since the TableInfo/TabletInfo
+  // TODO(unknown): the maps are a little wasteful of RAM, since the TableInfo/TabletInfo
   // objects have a copy of the string key. But STL doesn't make it
   // easy to make a "gettable set".
 
@@ -975,15 +1094,17 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // Random number generator used for selecting replica locations.
   ThreadSafeRandom rng_;
 
-  gscoped_ptr<SysCatalogTable> sys_catalog_;
+  std::unique_ptr<SysCatalogTable> sys_catalog_;
 
   // Background thread, used to execute the catalog manager tasks
   // like the assignment and cleaner
   friend class CatalogManagerBgTasks;
-  gscoped_ptr<CatalogManagerBgTasks> background_tasks_;
+  std::unique_ptr<CatalogManagerBgTasks> background_tasks_;
 
   std::unique_ptr<hms::HmsCatalog> hms_catalog_;
   std::unique_ptr<HmsNotificationLogListenerTask> hms_notification_log_listener_;
+
+  std::unique_ptr<master::AuthzProvider> authz_provider_;
 
   enum State {
     kConstructed,
@@ -999,7 +1120,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   State state_;
 
   // Singleton pool that serializes invocations of ElectedAsLeaderCb().
-  gscoped_ptr<ThreadPool> leader_election_pool_;
+  std::unique_ptr<ThreadPool> leader_election_pool_;
 
   // This field is updated when a node becomes leader master,
   // waits for all outstanding uncommitted metadata (table and tablet metadata)

@@ -54,6 +54,8 @@ def run_tidy(sha="HEAD", is_rev_range=False):
 
     # Produce a separate diff for each file and run clang-tidy-diff on it
     # in parallel.
+    #
+    # Note: this will incorporate any configuration from .clang-tidy.
     def tidy_on_path(path):
         patch_file = tempfile.NamedTemporaryFile()
         cmd = diff_cmdline + [

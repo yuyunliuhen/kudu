@@ -16,10 +16,16 @@
 // under the License.
 #include "kudu/common/rowblock.h"
 
+#include <numeric>
+#include <vector>
+
 #include <glog/logging.h>
 
 #include "kudu/gutil/bits.h"
+#include "kudu/gutil/port.h"
 #include "kudu/util/bitmap.h"
+
+using std::vector;
 
 namespace kudu {
 
@@ -29,19 +35,19 @@ SelectionVector::SelectionVector(size_t row_capacity)
     n_bytes_(bytes_capacity_),
     bitmap_(new uint8_t[n_bytes_]) {
   CHECK_GT(n_bytes_, 0);
+  PadExtraBitsWithZeroes();
 }
 
 void SelectionVector::Resize(size_t n_rows) {
+  if (PREDICT_FALSE(n_rows == n_rows_)) {
+    return;
+  }
+
   size_t new_bytes = BitmapSize(n_rows);
   CHECK_LE(new_bytes, bytes_capacity_);
   n_rows_ = n_rows;
   n_bytes_ = new_bytes;
-  // Pad with zeroes up to the next byte in order to give CountSelected()
-  // and AnySelected() the assumption that the size is an even byte
-  size_t bits_in_last_byte = n_rows & 7;
-  if (bits_in_last_byte > 0) {
-    BitmapChangeBits(&bitmap_[0], n_rows_, 8 - bits_in_last_byte, 0);
-  }
+  PadExtraBitsWithZeroes();
 }
 
 void SelectionVector::ClearToSelectAtMost(size_t max_rows) {
@@ -64,6 +70,31 @@ void SelectionVector::ClearToSelectAtMost(size_t max_rows) {
     // If the limit is reached, zero out the rest of the selection vector.
     if (n_rows_ > end_idx) {
       BitmapChangeBits(&bitmap_[0], end_idx, n_rows_ - end_idx, false);
+    }
+  }
+}
+
+void SelectionVector::GetSelectedRows(vector<int>* selected) const {
+  int n_selected = CountSelected();
+  selected->resize(n_selected);
+  if (n_selected == 0) {
+    return;
+  }
+  if (n_selected == n_rows_) {
+    std::iota(selected->begin(), selected->end(), 0);
+    return;
+  }
+
+  const uint8_t* bitmap = &bitmap_[0];
+  int* dst = selected->data();
+  // Within each byte, keep flipping the least significant non-zero bit and adding
+  // the bit index to the output until none are set.
+  for (int i = 0; i < n_bytes_; i++) {
+    uint8_t bm = *bitmap++;
+    while (bm != 0) {
+      int bit = Bits::FindLSBSetNonZero(bm);
+      *dst++ = (i * 8) + bit;
+      bm ^= (1 << bit);
     }
   }
 }
@@ -110,12 +141,12 @@ bool operator!=(const SelectionVector& a, const SelectionVector& b) {
 //////////////////////////////
 // RowBlock
 //////////////////////////////
-RowBlock::RowBlock(const Schema &schema,
+RowBlock::RowBlock(const Schema* schema,
                    size_t nrows,
                    Arena *arena)
   : schema_(schema),
-    columns_data_(schema.num_columns()),
-    column_null_bitmaps_(schema.num_columns()),
+    columns_data_(schema->num_columns()),
+    column_null_bitmaps_(schema->num_columns()),
     row_capacity_(nrows),
     nrows_(nrows),
     arena_(arena),
@@ -123,8 +154,8 @@ RowBlock::RowBlock(const Schema &schema,
   CHECK_GT(row_capacity_, 0);
 
   size_t bitmap_size = BitmapSize(row_capacity_);
-  for (size_t i = 0; i < schema.num_columns(); ++i) {
-    const ColumnSchema& col_schema = schema.column(i);
+  for (size_t i = 0; i < schema->num_columns(); ++i) {
+    const ColumnSchema& col_schema = schema->column(i);
     size_t col_size = row_capacity_ * col_schema.type_info()->size();
     columns_data_[i] = new uint8_t[col_size];
 
@@ -135,18 +166,22 @@ RowBlock::RowBlock(const Schema &schema,
 }
 
 RowBlock::~RowBlock() {
-  for (uint8_t *column_data : columns_data_) {
+  for (uint8_t* column_data : columns_data_) {
     delete[] column_data;
   }
-  for (uint8_t *bitmap_data : column_null_bitmaps_) {
+  for (uint8_t* bitmap_data : column_null_bitmaps_) {
     delete[] bitmap_data;
   }
 }
 
-void RowBlock::Resize(size_t new_size) {
-  CHECK_LE(new_size, row_capacity_);
-  nrows_ = new_size;
-  sel_vec_.Resize(new_size);
+void RowBlock::Resize(size_t n_rows) {
+  if (PREDICT_FALSE(n_rows == nrows_)) {
+    return;
+  }
+
+  CHECK_LE(n_rows, row_capacity_);
+  nrows_ = n_rows;
+  sel_vec_.Resize(n_rows);
 }
 
 } // namespace kudu

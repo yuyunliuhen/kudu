@@ -21,6 +21,7 @@
 #include <mutex>
 #include <ostream>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <boost/bind.hpp> // IWYU pragma: keep
@@ -132,10 +133,36 @@ bool VoteCounter::AreAllVotesIn() const {
   return GetTotalVotesCounted() == num_voters_;
 }
 
+string VoteCounter::GetElectionSummary() const {
+  vector<string> yes_voter_uuids;
+  vector<string> no_voter_uuids;
+  for (const auto& entry : votes_) {
+    switch (entry.second) {
+      case VOTE_GRANTED:
+        yes_voter_uuids.push_back(entry.first);
+        break;
+      case VOTE_DENIED:
+        no_voter_uuids.push_back(entry.first);
+        break;
+    }
+  }
+  return Substitute("received $0 responses out of $1 voters: $2 yes votes; "
+                    "$3 no votes. yes voters: $4; no voters: $5",
+                    yes_votes_ + no_votes_,
+                    num_voters_,
+                    yes_votes_,
+                    no_votes_,
+                    JoinStrings(yes_voter_uuids, ", "),
+                    JoinStrings(no_voter_uuids, ", "));
+}
+
 ///////////////////////////////////////////////////
 // ElectionResult
 ///////////////////////////////////////////////////
 
+// Suppress false positive about 'decision' used while uninitialized.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 ElectionResult::ElectionResult(VoteRequestPB vote_request, ElectionVote decision,
                                ConsensusTerm highest_voter_term, const std::string& message)
   : vote_request(std::move(vote_request)),
@@ -144,6 +171,7 @@ ElectionResult::ElectionResult(VoteRequestPB vote_request, ElectionVote decision
     message(message) {
   DCHECK(!message.empty());
 }
+#pragma GCC diagnostic pop
 
 ///////////////////////////////////////////////////
 // LeaderElection::VoterState
@@ -224,6 +252,8 @@ void LeaderElection::Run() {
   CheckForDecision();
 
   // The rest of the code below is for a typical multi-node configuration.
+  vector<string> other_voter_info;
+  other_voter_info.reserve(other_voter_uuids.size());
   for (const auto& voter_uuid : other_voter_uuids) {
     VoterState* state = nullptr;
     {
@@ -232,6 +262,7 @@ void LeaderElection::Run() {
       // Safe to drop the lock because voter_state_ is not mutated outside of
       // the constructor / destructor. We do this to avoid deadlocks below.
     }
+    other_voter_info.push_back(state->PeerInfo());
 
     // If we failed to construct the proxy, just record a 'NO' vote with the status
     // that indicates why it failed.
@@ -248,16 +279,13 @@ void LeaderElection::Run() {
     }
 
     // Send the RPC request.
-    LOG_WITH_PREFIX(INFO) << "Requesting "
-                          << (request_.is_pre_election() ? "pre-" : "")
-                          << "vote from peer " << state->PeerInfo();
     state->rpc.set_timeout(timeout_);
 
     state->request = request_;
     state->request.set_dest_uuid(voter_uuid);
 
     state->proxy->RequestConsensusVoteAsync(
-        &state->request,
+        state->request,
         &state->response,
         &state->rpc,
         // We use gutil Bind() for the refcounting and boost::bind to adapt the
@@ -265,6 +293,9 @@ void LeaderElection::Run() {
         boost::bind(&Closure::Run,
                     Bind(&LeaderElection::VoteResponseRpcCallback, this, voter_uuid)));
   }
+  LOG_WITH_PREFIX(INFO) << Substitute("Requested $0vote from peers $1",
+                                      request_.is_pre_election() ? "pre-" : "",
+                                      JoinStrings(other_voter_info, ", "));
 }
 
 void LeaderElection::CheckForDecision() {
@@ -275,9 +306,12 @@ void LeaderElection::CheckForDecision() {
     if (!result_ && vote_counter_->IsDecided()) {
       ElectionVote decision;
       CHECK_OK(vote_counter_->GetDecision(&decision));
-      LOG_WITH_PREFIX(INFO) << "Election decided. Result: candidate "
-                << ((decision == VOTE_GRANTED) ? "won." : "lost.");
-      string msg = (decision == VOTE_GRANTED) ?
+      const auto election_won = decision == VOTE_GRANTED;
+      LOG_WITH_PREFIX(INFO) << Substitute("Election decided. Result: candidate $0. "
+                                          "Election summary: $1",
+                                          election_won ? "won" : "lost",
+                                          vote_counter_->GetElectionSummary());
+      string msg = election_won ?
           "achieved majority votes" : "could not achieve majority";
       result_.reset(new ElectionResult(request_, decision, highest_voter_term_, msg));
     }
@@ -384,7 +418,7 @@ void LeaderElection::HandleVoteGrantedUnlocked(const VoterState& state) {
   }
   DCHECK(state.response.vote_granted());
 
-  LOG_WITH_PREFIX(INFO) << "Vote granted by peer " << state.PeerInfo();
+  VLOG_WITH_PREFIX(1) << "Vote granted by peer " << state.PeerInfo();
   RecordVoteUnlocked(state, VOTE_GRANTED);
 }
 
@@ -398,8 +432,10 @@ void LeaderElection::HandleVoteDeniedUnlocked(const VoterState& state) {
     return HandleHigherTermUnlocked(state);
   }
 
-  LOG_WITH_PREFIX(INFO) << "Vote denied by peer " << state.PeerInfo() << ". Message: "
-            << StatusFromPB(state.response.consensus_error().status()).ToString();
+  VLOG_WITH_PREFIX(1) << Substitute(
+      "Vote denied by peer $0. Message: $1",
+      state.PeerInfo(),
+      StatusFromPB(state.response.consensus_error().status()).ToString());
   RecordVoteUnlocked(state, VOTE_DENIED);
 }
 

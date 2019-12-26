@@ -18,7 +18,8 @@
 
 == Building and installing Kudu
 
-Follow the steps in the http://getkudu.io/docs/installation.html#_build_from_source[documentation]
+Follow the steps in the
+https://kudu.apache.org/docs/installation.html#build_from_source[documentation]
 to build and install Kudu from source
 
 === Building Kudu out of tree
@@ -121,7 +122,7 @@ $ mkdir -p build/asan
 $ cd build/asan
 $ CC=../../thirdparty/clang-toolchain/bin/clang \
   CXX=../../thirdparty/clang-toolchain/bin/clang++ \
-  ./../thirdparty/installed/common/bin/cmake \
+  ../../thirdparty/installed/common/bin/cmake \
   -DKUDU_USE_ASAN=1 ../..
 $ make -j8
 $ ctest -j8
@@ -141,7 +142,7 @@ $ ctest -R failing-test
 to run just the failed test.
 
 NOTE: For more information on AddressSanitizer, please see the
-http://clang.llvm.org/docs/AddressSanitizer.html[ASAN web page].
+https://clang.llvm.org/docs/AddressSanitizer.html[ASAN web page].
 
 === Running tests with the clang Undefined Behavior Sanitizer (UBSAN) enabled
 
@@ -182,7 +183,7 @@ $ ctest -j8
 
 TSAN may truncate a few lines of the stack trace when reporting where the error
 is. This can be bewildering. It's documented for TSANv1 here:
-http://code.google.com/p/data-race-test/wiki/ThreadSanitizerAlgorithm
+https://code.google.com/p/data-race-test/wiki/ThreadSanitizerAlgorithm
 It is not mentioned in the documentation for TSANv2, but has been observed.
 In order to find out what is _really_ happening, set a breakpoint on the TSAN
 report in GDB using the following incantation:
@@ -294,7 +295,7 @@ This will invoke `docs/support/scripts/make_docs.sh`, which requires
 `asciidoctor` to process the doc sources and produce the HTML documentation,
 emitted to _build/docs_. This script requires `ruby` and `gem` to be installed
 on the system path, and will attempt to install `asciidoctor` and other related
-dependencies into `$HOME/.gems` using http://bundler.io/[bundler].
+dependencies into `$HOME/.gems` using https://bundler.io/[bundler].
 
 === Updating the Kudu web site documentation
 
@@ -428,6 +429,18 @@ With this exclusion, the only false positives (shown as "red squigglies") that
 CDT presents appear to be in atomicops functions (`NoBarrier_CompareAndSwap` for
 example).
 
+Another way to approach enormous source code indexing in Ecplise is to get rid of
+unnecessary source code in "thirdparty/src" directory right after building code
+and before opening project in Eclipse. You can remove all source code except
+hadoop, hive and sentry directories.
+Additionally, if you encounter red squigglies in code editor due to
+Eclipse's poor macro discovery, you may need to provide Eclipse with preprocessor
+macros values, which it could not extract during auto-discovery.
+Go to "Project Explorer" -> "Properties" -> "C/C++ General" ->
+"Preprocessor Include Paths, Macros, etc" -> "Entries" tab -> Language "GNU C++" ->
+Setting Entries "CDT User Setting Entries" -> button "Add"
+-> choose "Preprocessor Macro" [3]
+
 Another Eclipse annoyance stems from the "[Targets]" linked resource that Eclipse
 generates for each unit test. These are probably used for building within Eclipse,
 but one side effect is that nearly every source file appears in the indexer twice:
@@ -436,7 +449,8 @@ once via a target and once via the raw source file. To fix this, simply delete t
 on writing code, though it may affect your ability to build from within Eclipse.
 
 1. https://cmake.org/pipermail/cmake-developers/2011-November/014153.html
-2. http://public.kitware.com/Bug/view.php?id=15102
+2. https://public.kitware.com/Bug/view.php?id=15102
+3. https://www.eclipse.org/community/eclipse_newsletter/2013/october/article4.php
 
 == Export Control Notice
 

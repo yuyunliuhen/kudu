@@ -14,26 +14,31 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_CLIENT_CLIENT_INTERNAL_H
-#define KUDU_CLIENT_CLIENT_INTERNAL_H
+#pragma once
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "kudu/client/authz_token_cache.h"
 #include "kudu/client/client.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/master/master.pb.h"
+#include "kudu/rpc/response_callback.h"
+#include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/user_credentials.h"
+#include "kudu/security/token.pb.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
@@ -58,6 +63,9 @@ class AlterTableResponsePB;
 class ConnectToMasterResponsePB;
 class CreateTableRequestPB;
 class CreateTableResponsePB;
+class GetTableSchemaResponsePB;
+class ListTabletServersRequestPB;
+class ListTabletServersResponsePB;
 class MasterServiceProxy;
 class TableIdentifierPB;
 } // namespace master
@@ -72,6 +80,7 @@ namespace client {
 class KuduSchema;
 
 namespace internal {
+class AuthzTokenCache;
 class ConnectToClusterRpc;
 class MetaCache;
 class RemoteTablet;
@@ -133,13 +142,28 @@ class KuduClient::Data {
                                    master::TableIdentifierPB table,
                                    const MonoTime& deadline);
 
+  // Open the table identified by 'table_identifier'.
+  Status OpenTable(KuduClient* client,
+                   const master::TableIdentifierPB& table_identifier,
+                   client::sp::shared_ptr<KuduTable>* table);
+
+  // Get the table information identified by 'table_identifier'.
+  // The table information (they can be null):
+  //   'schema'           The schema for the table.
+  //   'partition_schema' The partition schema for the table.
+  //   'table_id'         The table unique id.
+  //   'table_name'       The table unique name.
+  //   'num_replicas'     The table replication factor.
+  //   'extra_configs'    The table's extra configuration properties.
   Status GetTableSchema(KuduClient* client,
-                        const std::string& table_name,
                         const MonoTime& deadline,
+                        const master::TableIdentifierPB& table,
                         KuduSchema* schema,
                         PartitionSchema* partition_schema,
                         std::string* table_id,
-                        int* num_replicas);
+                        std::string* table_name,
+                        int* num_replicas,
+                        std::map<std::string, std::string>* extra_configs);
 
   Status InitLocalHostNames();
 
@@ -147,8 +171,13 @@ class KuduClient::Data {
 
   bool IsTabletServerLocal(const internal::RemoteTabletServer& rts) const;
 
-  // Returns a non-failed replica of the specified tablet based on the provided selection criteria
-  // and tablet server blacklist.
+  Status ListTabletServers(KuduClient* client,
+                           const MonoTime& deadline,
+                           const master::ListTabletServersRequestPB& req,
+                           master::ListTabletServersResponsePB* resp) const;
+
+  // Returns a non-failed replica of the specified tablet based on the provided
+  // selection criteria and tablet server blacklist.
   //
   // Returns NULL if there are no valid tablet servers.
   internal::RemoteTabletServer* SelectTServer(
@@ -188,17 +217,26 @@ class KuduClient::Data {
       const MonoTime& deadline,
       rpc::CredentialsPolicy creds_policy = rpc::CredentialsPolicy::ANY_CREDENTIALS);
 
-  // A wrapper around ConnectToCluster() to handle various errors in case
-  // if a call to thought-to-be-leader master fails. First, this method calls
-  // ConnectToCluster() with current client credentials unless
-  // INVALID_AUTHN_TOKEN reason is specified. If the ConnectToCluster() with the
-  // current client credentials fails, call ConnectToCluster() with primary
-  // credentials. The ReconnectionReason is a dedicated enumeration for the
-  // third parameter of the method.
-  enum class ReconnectionReason { INVALID_AUTHN_TOKEN, OTHER };
-  void ReconnectToCluster(KuduClient* client,
-                          const MonoTime& deadline,
-                          ReconnectionReason reason);
+  // Asynchronously fetches an authz token from the master for the given table.
+  //
+  // Invokes 'cb' with the appropriate status when finished.
+  void RetrieveAuthzTokenAsync(const KuduTable* table,
+                               const StatusCallback& cb,
+                               const MonoTime& deadline);
+
+  // Synchronous version of RetrieveAuthzTokenAsync.
+  //
+  // NOTE: since this uses a Synchronizer, this may not be invoked by a method
+  // that's on a reactor thread.
+  Status RetrieveAuthzToken(const KuduTable* table, const MonoTime& deadline);
+
+  // Fetches the cached authz token for the given table ID, returning false if
+  // no such token exists.
+  bool FetchCachedAuthzToken(const std::string& table_id, security::SignedTokenPB* token);
+
+  // Stores the token into the cache, associating it with the given table ID.
+  void StoreAuthzToken(const std::string& table_id,
+                       const security::SignedTokenPB& token);
 
   std::shared_ptr<master::MasterServiceProxy> master_proxy() const;
 
@@ -206,43 +244,18 @@ class KuduClient::Data {
 
   std::vector<HostPort> master_hostports() const;
 
+  std::string location() const;
+
   uint64_t GetLatestObservedTimestamp() const;
 
   void UpdateLatestObservedTimestamp(uint64_t timestamp);
 
-  // Retry 'func' until either:
-  //
-  // 1) Methods succeeds on a leader master.
-  // 2) Method fails for a reason that is not related to network
-  //    errors, timeouts, or leadership issues.
-  // 3) 'deadline' (if initialized) elapses.
-  //
-  // NOTE: 'rpc_timeout' is a per-call timeout, while 'deadline' is a
-  // per operation deadline. If 'deadline' is not initialized, 'func' is
-  // retried forever. If 'deadline' expires, 'func_name' is included in
-  // the resulting Status.
-  template<class ReqClass, class RespClass>
-  Status SyncLeaderMasterRpc(
-      const MonoTime& deadline,
-      KuduClient* client,
-      const ReqClass& req,
-      RespClass* resp,
-      const char* func_name,
-      const boost::function<Status(master::MasterServiceProxy*,
-                                   const ReqClass&, RespClass*,
-                                   rpc::RpcController*)>& func,
-      std::vector<uint32_t> required_feature_flags);
-
-  // Exponential backoff with jitter anchored between 10ms and 20ms, and an
-  // upper bound between 2.5s and 5s.
-  static MonoDelta ComputeExponentialBackoff(int num_attempts) {
-    return MonoDelta::FromMilliseconds(
-        (10 + rand() % 10) * static_cast<int>(
-            std::pow(2.0, std::min(8, num_attempts - 1))));
-  }
-
   // The unique id of this client.
   std::string client_id_;
+
+  // The location of this client. This is an empty string if a location has not
+  // been assigned by the leader master. Protected by 'leader_master_lock_'.
+  std::string location_;
 
   // The user credentials of the client. This field is constant after the client
   // is built.
@@ -251,9 +264,14 @@ class KuduClient::Data {
   // The request tracker for this client.
   scoped_refptr<rpc::RequestTracker> request_tracker_;
 
+  std::unique_ptr<DnsResolver> dns_resolver_;
   std::shared_ptr<rpc::Messenger> messenger_;
-  gscoped_ptr<DnsResolver> dns_resolver_;
   scoped_refptr<internal::MetaCache> meta_cache_;
+
+  // Authorization tokens stored for each table, indexed by table ID. Note that
+  // these may be expired, and it is up to the user of a token to refresh it
+  // upon learning of its expiration.
+  internal::AuthzTokenCache authz_token_cache_;
 
   // Set of hostnames and IPs on the local host.
   // This is initialized at client startup.
@@ -292,7 +310,8 @@ class KuduClient::Data {
   std::vector<StatusCallback> leader_master_callbacks_primary_creds_;
 
   // Protects 'leader_master_rpc_{any,primary}_creds_',
-  // 'leader_master_hostport_', 'master_hostports_', and 'master_proxy_'.
+  // 'leader_master_hostport_', 'master_hostports_', 'master_proxy_', and
+  // 'location_'.
   //
   // See: KuduClient::Data::ConnectToClusterAsync for a more
   // in-depth explanation of why this is needed and how it works.
@@ -321,4 +340,3 @@ extern const char* kVerboseEnvVar;
 } // namespace client
 } // namespace kudu
 
-#endif

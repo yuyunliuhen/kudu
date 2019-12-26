@@ -22,8 +22,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 import com.google.common.base.MoreObjects;
+import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableList;
 import com.google.protobuf.CodedInputStream;
 import com.google.protobuf.CodedOutputStream;
 import com.google.protobuf.UnsafeByteOperations;
@@ -32,6 +32,7 @@ import org.apache.yetus.audience.InterfaceStability;
 
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Common;
+import org.apache.kudu.Schema;
 import org.apache.kudu.client.Client.ScanTokenPB;
 import org.apache.kudu.util.Pair;
 
@@ -125,10 +126,15 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
    */
   public static String stringifySerializedToken(byte[] buf, KuduClient client) throws IOException {
     ScanTokenPB token = ScanTokenPB.parseFrom(CodedInputStream.newInstance(buf));
-    KuduTable table = client.openTable(token.getTableName());
+    KuduTable table = token.hasTableId() ? client.openTableById(token.getTableId()) :
+                                           client.openTable(token.getTableName());
 
     MoreObjects.ToStringHelper helper = MoreObjects.toStringHelper("ScanToken")
-                                                   .add("table", token.getTableName());
+                                                   .add("table-name", token.getTableName());
+
+    if (token.hasTableId()) {
+      helper.add("table-id", token.getTableId());
+    }
 
     if (token.hasLowerBoundPrimaryKey() && !token.getLowerBoundPrimaryKey().isEmpty()) {
       helper.add("lower-bound-primary-key",
@@ -154,34 +160,45 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
     return helper.toString();
   }
 
+  private static List<Integer> computeProjectedColumnIndexesForScanner(ScanTokenPB message,
+                                                                       Schema schema) {
+    List<Integer> columns = new ArrayList<>(message.getProjectedColumnsCount());
+    for (Common.ColumnSchemaPB colSchemaFromPb : message.getProjectedColumnsList()) {
+      int colIdx = colSchemaFromPb.hasId() && schema.hasColumnIds() ?
+          schema.getColumnIndex(colSchemaFromPb.getId()) :
+          schema.getColumnIndex(colSchemaFromPb.getName());
+      ColumnSchema colSchema = schema.getColumnByIndex(colIdx);
+      if (colSchemaFromPb.getType() !=
+          colSchema.getType().getDataType(colSchema.getTypeAttributes())) {
+        throw new IllegalStateException(String.format(
+            "invalid type %s for column '%s' in scan token, expected: %s",
+            colSchemaFromPb.getType().name(), colSchemaFromPb.getName(),
+            colSchema.getType().name()));
+      }
+      if (colSchemaFromPb.getIsNullable() != colSchema.isNullable()) {
+        throw new IllegalStateException(String.format(
+            "invalid nullability for column '%s' in scan token, expected: %s",
+            colSchemaFromPb.getName(), colSchema.isNullable() ? "NULLABLE" : "NOT NULL"));
+      }
+      columns.add(colIdx);
+    }
+    return columns;
+  }
+
+  @SuppressWarnings("deprecation")
   private static KuduScanner pbIntoScanner(ScanTokenPB message,
                                            KuduClient client) throws KuduException {
     Preconditions.checkArgument(
         !message.getFeatureFlagsList().contains(ScanTokenPB.Feature.Unknown),
         "Scan token requires an unsupported feature. This Kudu client must be updated.");
 
-    KuduTable table = client.openTable(message.getTableName());
+    KuduTable table = message.hasTableId() ? client.openTableById(message.getTableId()) :
+                                             client.openTable(message.getTableName());
     KuduScanner.KuduScannerBuilder builder = client.newScannerBuilder(table);
 
-    List<Integer> columns = new ArrayList<>(message.getProjectedColumnsCount());
-    for (Common.ColumnSchemaPB column : message.getProjectedColumnsList()) {
-      int columnIdx = table.getSchema().getColumnIndex(column.getName());
-      ColumnSchema schema = table.getSchema().getColumnByIndex(columnIdx);
-      if (column.getType() != schema.getType().getDataType(schema.getTypeAttributes())) {
-        throw new IllegalStateException(String.format(
-            "invalid type %s for column '%s' in scan token, expected: %s",
-            column.getType().name(), column.getName(), schema.getType().name()));
-      }
-      if (column.getIsNullable() != schema.isNullable()) {
-        throw new IllegalStateException(String.format(
-            "invalid nullability for column '%s' in scan token, expected: %s",
-            column.getName(), column.getIsNullable() ? "NULLABLE" : "NOT NULL"));
 
-      }
-
-      columns.add(columnIdx);
-    }
-    builder.setProjectedColumnIndexes(columns);
+    builder.setProjectedColumnIndexes(
+        computeProjectedColumnIndexesForScanner(message, table.getSchema()));
 
     for (Common.ColumnPredicatePB pred : message.getColumnPredicatesList()) {
       builder.addPredicate(KuduPredicate.fromPB(table.getSchema(), pred));
@@ -211,6 +228,10 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
           builder.readMode(AsyncKuduScanner.ReadMode.READ_AT_SNAPSHOT);
           if (message.hasSnapTimestamp()) {
             builder.snapshotTimestampRaw(message.getSnapTimestamp());
+          }
+          // Set the diff scan timestamps if they are set.
+          if (message.hasSnapStartTimestamp()) {
+            builder.diffScan(message.getSnapStartTimestamp(), message.getSnapTimestamp());
           }
           break;
         }
@@ -261,16 +282,41 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
       builder.scanRequestTimeout(message.getScanRequestTimeoutMs());
     }
 
+    if (message.hasKeepAlivePeriodMs()) {
+      builder.keepAlivePeriodMs(message.getKeepAlivePeriodMs());
+    }
+
     return builder.build();
   }
 
   @Override
   public int compareTo(KuduScanToken other) {
-    if (!message.getTableName().equals(other.message.getTableName())) {
+    if (message.hasTableId() && other.message.hasTableId()) {
+      if (!message.getTableId().equals(other.message.getTableId())) {
+        throw new IllegalArgumentException("Scan tokens from different tables may not be compared");
+      }
+    } else if (!message.getTableName().equals(other.message.getTableName())) {
       throw new IllegalArgumentException("Scan tokens from different tables may not be compared");
     }
 
     return tablet.getPartition().compareTo(other.getTablet().getPartition());
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (!(o instanceof KuduScanToken)) {
+      return false;
+    }
+    KuduScanToken that = (KuduScanToken) o;
+    return compareTo(that) == 0;
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hashCode(tablet, message);
   }
 
   /**
@@ -281,7 +327,12 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
   public static class KuduScanTokenBuilder
       extends AbstractKuduScannerBuilder<KuduScanTokenBuilder, List<KuduScanToken>> {
 
+    private static final int DEFAULT_SPLIT_SIZE_BYTES = -1;
+
     private long timeout;
+
+    // By default, a scan token is created for each tablet to be scanned.
+    private long splitSizeBytes = DEFAULT_SPLIT_SIZE_BYTES;
 
     KuduScanTokenBuilder(AsyncKuduClient client, KuduTable table) {
       super(client, table);
@@ -298,6 +349,18 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
       return this;
     }
 
+    /**
+     * Sets the data size of key range. It is used to split tablet's primary key range
+     * into smaller ranges. The split doesn't change the layout of the tablet. This is a hint:
+     * The tablet server may return the size of key range larger or smaller than this value.
+     * If unset or <= 0, the key range includes all the data of the tablet.
+     * @param splitSizeBytes the data size of key range.
+     */
+    public KuduScanTokenBuilder setSplitSizeBytes(long splitSizeBytes) {
+      this.splitSizeBytes = splitSizeBytes;
+      return this;
+    }
+
     @Override
     public List<KuduScanToken> build() {
       if (lowerBoundPartitionKey.length != 0 ||
@@ -309,31 +372,43 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
       // If the scan is short-circuitable, then return no tokens.
       for (KuduPredicate predicate : predicates.values()) {
         if (predicate.getType() == KuduPredicate.PredicateType.NONE) {
-          return ImmutableList.of();
+          return new ArrayList<>();
         }
       }
 
       Client.ScanTokenPB.Builder proto = Client.ScanTokenPB.newBuilder();
 
+      proto.setTableId(table.getTableId());
       proto.setTableName(table.getName());
 
       // Map the column names or indices to actual columns in the table schema.
       // If the user did not set either projection, then scan all columns.
+      Schema schema = table.getSchema();
       if (projectedColumnNames != null) {
         for (String columnName : projectedColumnNames) {
-          ColumnSchema columnSchema = table.getSchema().getColumn(columnName);
+          ColumnSchema columnSchema = schema.getColumn(columnName);
           Preconditions.checkArgument(columnSchema != null, "unknown column i%s", columnName);
-          ProtobufHelper.columnToPb(proto.addProjectedColumnsBuilder(), columnSchema);
+          ProtobufHelper.columnToPb(proto.addProjectedColumnsBuilder(),
+                                    schema.hasColumnIds() ? schema.getColumnId(columnName) : -1,
+                                    columnSchema);
         }
       } else if (projectedColumnIndexes != null) {
         for (int columnIdx : projectedColumnIndexes) {
-          ColumnSchema columnSchema = table.getSchema().getColumnByIndex(columnIdx);
+          ColumnSchema columnSchema = schema.getColumnByIndex(columnIdx);
           Preconditions.checkArgument(columnSchema != null, "unknown column index %s", columnIdx);
-          ProtobufHelper.columnToPb(proto.addProjectedColumnsBuilder(), columnSchema);
+          ProtobufHelper.columnToPb(proto.addProjectedColumnsBuilder(),
+                                    schema.hasColumnIds() ?
+                                        schema.getColumnId(columnSchema.getName()) :
+                                        -1,
+                                    columnSchema);
         }
       } else {
-        for (ColumnSchema column : table.getSchema().getColumns()) {
-          ProtobufHelper.columnToPb(proto.addProjectedColumnsBuilder(), column);
+        for (ColumnSchema column : schema.getColumns()) {
+          ProtobufHelper.columnToPb(proto.addProjectedColumnsBuilder(),
+                                    schema.hasColumnIds() ?
+                                        schema.getColumnId(column.getName()) :
+                                        -1,
+                                    column);
         }
       }
 
@@ -362,45 +437,62 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
         proto.setPropagatedTimestamp(client.getLastPropagatedTimestamp());
       }
 
-      // If the mode is set to read on snapshot set the snapshot timestamp.
-      if (readMode == AsyncKuduScanner.ReadMode.READ_AT_SNAPSHOT &&
-          htTimestamp != AsyncKuduClient.NO_TIMESTAMP) {
-        proto.setSnapTimestamp(htTimestamp);
+      // If the mode is set to read on snapshot set the snapshot timestamps.
+      if (readMode == AsyncKuduScanner.ReadMode.READ_AT_SNAPSHOT) {
+        if (htTimestamp != AsyncKuduClient.NO_TIMESTAMP) {
+          proto.setSnapTimestamp(htTimestamp);
+        }
+        if (startTimestamp != AsyncKuduClient.NO_TIMESTAMP) {
+          proto.setSnapStartTimestamp(startTimestamp);
+        }
       }
 
       proto.setCacheBlocks(cacheBlocks);
       proto.setFaultTolerant(isFaultTolerant);
       proto.setBatchSizeBytes(batchSizeBytes);
       proto.setScanRequestTimeoutMs(scanRequestTimeout);
+      proto.setKeepAlivePeriodMs(keepAlivePeriodMs);
 
       try {
         PartitionPruner pruner = PartitionPruner.create(this);
-        List<LocatedTablet> tablets = new ArrayList<>();
+        List<KeyRange> keyRanges = new ArrayList<>();
         while (pruner.hasMorePartitionKeyRanges()) {
           Pair<byte[], byte[]> partitionRange = pruner.nextPartitionKeyRange();
-          List<LocatedTablet> newTablets = table.getTabletsLocations(
+          List<KeyRange> newKeyRanges = client.getTableKeyRanges(
+              table,
+              proto.getLowerBoundPrimaryKey().toByteArray(),
+              proto.getUpperBoundPrimaryKey().toByteArray(),
               partitionRange.getFirst().length == 0 ? null : partitionRange.getFirst(),
               partitionRange.getSecond().length == 0 ? null : partitionRange.getSecond(),
-              timeout);
+              AsyncKuduClient.FETCH_TABLETS_PER_RANGE_LOOKUP,
+              splitSizeBytes,
+              timeout).join();
 
-          if (newTablets.isEmpty()) {
+          if (newKeyRanges.isEmpty()) {
             pruner.removePartitionKeyRange(partitionRange.getSecond());
           } else {
-            pruner.removePartitionKeyRange(newTablets.get(newTablets.size() - 1)
-                                                     .getPartition()
-                                                     .getPartitionKeyEnd());
+            pruner.removePartitionKeyRange(newKeyRanges.get(newKeyRanges.size() - 1)
+                                                       .getPartitionKeyEnd());
           }
-          tablets.addAll(newTablets);
+          keyRanges.addAll(newKeyRanges);
         }
 
-        List<KuduScanToken> tokens = new ArrayList<>(tablets.size());
-        for (LocatedTablet tablet : tablets) {
+        List<KuduScanToken> tokens = new ArrayList<>(keyRanges.size());
+        for (KeyRange keyRange : keyRanges) {
           Client.ScanTokenPB.Builder builder = proto.clone();
           builder.setLowerBoundPartitionKey(
-              UnsafeByteOperations.unsafeWrap(tablet.getPartition().getPartitionKeyStart()));
+              UnsafeByteOperations.unsafeWrap(keyRange.getPartitionKeyStart()));
           builder.setUpperBoundPartitionKey(
-              UnsafeByteOperations.unsafeWrap(tablet.getPartition().getPartitionKeyEnd()));
-          tokens.add(new KuduScanToken(tablet, builder.build()));
+              UnsafeByteOperations.unsafeWrap(keyRange.getPartitionKeyEnd()));
+          byte[] primaryKeyStart = keyRange.getPrimaryKeyStart();
+          if (primaryKeyStart != null && primaryKeyStart.length > 0) {
+            builder.setLowerBoundPrimaryKey(UnsafeByteOperations.unsafeWrap(primaryKeyStart));
+          }
+          byte[] primaryKeyEnd = keyRange.getPrimaryKeyEnd();
+          if (primaryKeyEnd != null && primaryKeyEnd.length > 0) {
+            builder.setUpperBoundPrimaryKey(UnsafeByteOperations.unsafeWrap(primaryKeyEnd));
+          }
+          tokens.add(new KuduScanToken(keyRange.getTablet(), builder.build()));
         }
         return tokens;
       } catch (Exception e) {

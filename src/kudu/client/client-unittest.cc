@@ -26,6 +26,7 @@
 #include <boost/bind.hpp>
 #include <boost/function.hpp>
 #include <gtest/gtest.h>
+#include <openssl/opensslv.h>
 
 #include "kudu/client/client-internal.h"
 #include "kudu/client/error_collector.h"
@@ -77,7 +78,7 @@ TEST(ClientUnitTest, TestSchemaBuilder_KeyNotFirstColumn) {
   KuduSchema s;
   KuduSchemaBuilder b;
   b.AddColumn("key")->Type(KuduColumnSchema::INT32);
-  b.AddColumn("x")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();;
+  b.AddColumn("x")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
   b.AddColumn("x")->Type(KuduColumnSchema::INT32);
   ASSERT_EQ("Invalid argument: primary key column must be the first column",
             b.Build(&s).ToString());
@@ -168,10 +169,20 @@ TEST(ClientUnitTest, TestSchemaBuilder_CompoundKey_BadColumnName) {
 }
 
 TEST(ClientUnitTest, TestDisableSslFailsIfNotInitialized) {
-  // If we try to disable SSL initialization without setting up SSL properly,
-  // it should return an error.
-  Status s = DisableOpenSSLInitialization();
+  const auto s = DisableOpenSSLInitialization();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+  // With the pre-1.1.0 OpenSSL library, if we try to disable SSL
+  // initialization without setting up SSL properly, it should return an error.
   ASSERT_STR_MATCHES(s.ToString(), "Locking callback not initialized");
+#else
+  // Starting with OpenSSL 1.1.0, the library can be implicitly initialized
+  // upon calling the relevant methods of the API (e.g. SSL_CTX_new()) and
+  // overall there is no reliable non-intrusive way to determine that the
+  // library has already been initialized. So, the requirement to have
+  // the library initialized before calling DisableOpenSSLInitialization()
+  // is gone since OpenSSL 1.1.0.
+  ASSERT_TRUE(s.ok()) << s.ToString();
+#endif
 }
 
 namespace {
@@ -256,6 +267,7 @@ TEST(ClientUnitTest, TestKuduSchemaToString) {
   b2.AddColumn("k1")->Type(KuduColumnSchema::INT32)->NotNull();
   b2.AddColumn("k2")->Type(KuduColumnSchema::UNIXTIME_MICROS)->NotNull();
   b2.AddColumn("k3")->Type(KuduColumnSchema::INT8)->NotNull();
+  b2.AddColumn("date_val")->Type(KuduColumnSchema::DATE)->NotNull();
   b2.AddColumn("dec_val")->Type(KuduColumnSchema::DECIMAL)->Nullable()->Precision(9)->Scale(2);
   b2.AddColumn("int_val")->Type(KuduColumnSchema::INT32)->NotNull();
   b2.AddColumn("string_val")->Type(KuduColumnSchema::STRING)->Nullable();
@@ -268,6 +280,7 @@ TEST(ClientUnitTest, TestKuduSchemaToString) {
                         "    k1 INT32 NOT NULL,\n"
                         "    k2 UNIXTIME_MICROS NOT NULL,\n"
                         "    k3 INT8 NOT NULL,\n"
+                        "    date_val DATE NOT NULL,\n"
                         "    dec_val DECIMAL(9, 2) NULLABLE,\n"
                         "    int_val INT32 NOT NULL,\n"
                         "    string_val STRING NULLABLE,\n"
@@ -299,6 +312,25 @@ TEST(ClientUnitTest, TestKuduSchemaToStringWithColumnIds) {
             "    PRIMARY KEY (key)\n"
             ")",
             kudu_schema.ToString());
+}
+
+TEST(KuduColumnSchemaTest, TestEquals) {
+  KuduColumnSchema a32("a", KuduColumnSchema::INT32);
+  ASSERT_TRUE(a32.Equals(a32));
+
+  KuduColumnSchema a32_2(a32);
+  ASSERT_TRUE(a32.Equals(a32_2));
+
+  KuduColumnSchema b32("b", KuduColumnSchema::INT32);
+  ASSERT_FALSE(a32.Equals(b32));
+
+  KuduColumnSchema a16("a", KuduColumnSchema::INT16);
+  ASSERT_FALSE(a32.Equals(a16));
+
+  const int kDefaultOf7 = 7;
+  KuduColumnSchema a32_dflt("a", KuduColumnSchema::INT32, /*is_nullable=*/false,
+                              /*default_value=*/&kDefaultOf7);
+  ASSERT_FALSE(a32.Equals(a32_dflt));
 }
 
 } // namespace client

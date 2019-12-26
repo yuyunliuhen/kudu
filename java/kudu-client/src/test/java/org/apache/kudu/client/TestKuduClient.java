@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -24,6 +25,7 @@ import static org.apache.kudu.client.KuduPredicate.ComparisonOp.LESS_EQUAL;
 import static org.apache.kudu.test.ClientTestUtil.countRowsInScan;
 import static org.apache.kudu.test.ClientTestUtil.createBasicSchemaInsert;
 import static org.apache.kudu.test.ClientTestUtil.createManyStringsSchema;
+import static org.apache.kudu.test.ClientTestUtil.createManyVarcharsSchema;
 import static org.apache.kudu.test.ClientTestUtil.createSchemaWithBinaryColumns;
 import static org.apache.kudu.test.ClientTestUtil.createSchemaWithDecimalColumns;
 import static org.apache.kudu.test.ClientTestUtil.createSchemaWithTimestampColumns;
@@ -41,10 +43,15 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.io.Closeable;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -52,22 +59,23 @@ import java.util.concurrent.Future;
 
 import com.google.common.collect.ImmutableList;
 import com.stumbleupon.async.Deferred;
-
-import org.apache.kudu.test.KuduTestHarness;
-import org.apache.kudu.test.KuduTestHarness.TabletServerConfig;
-import org.apache.kudu.test.ClientTestUtil;
-import org.apache.kudu.util.TimestampUtil;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.test.CapturingLogAppender;
+import org.apache.kudu.test.ClientTestUtil;
+import org.apache.kudu.test.KuduTestHarness;
+import org.apache.kudu.test.KuduTestHarness.LocationConfig;
+import org.apache.kudu.test.KuduTestHarness.TabletServerConfig;
+import org.apache.kudu.test.RandomUtils;
 import org.apache.kudu.util.DecimalUtil;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.kudu.util.TimestampUtil;
 
 public class TestKuduClient {
   private static final Logger LOG = LoggerFactory.getLogger(TestKuduClient.class);
@@ -103,23 +111,23 @@ public class TestKuduClient {
     assertTrue(client.hasLastPropagatedTimestamp());
     assertTrue(asyncClient.hasLastPropagatedTimestamp());
 
-    long initial_ts = client.getLastPropagatedTimestamp();
+    long initialTs = client.getLastPropagatedTimestamp();
 
     // Check that the initial timestamp is consistent with the asynchronous client.
-    assertEquals(initial_ts, client.getLastPropagatedTimestamp());
-    assertEquals(initial_ts, asyncClient.getLastPropagatedTimestamp());
+    assertEquals(initialTs, client.getLastPropagatedTimestamp());
+    assertEquals(initialTs, asyncClient.getLastPropagatedTimestamp());
 
     // Attempt to change the timestamp to a lower value. This should not change
     // the internal timestamp, as it must be monotonically increasing.
-    client.updateLastPropagatedTimestamp(initial_ts - 1);
-    assertEquals(initial_ts, client.getLastPropagatedTimestamp());
-    assertEquals(initial_ts, asyncClient.getLastPropagatedTimestamp());
+    client.updateLastPropagatedTimestamp(initialTs - 1);
+    assertEquals(initialTs, client.getLastPropagatedTimestamp());
+    assertEquals(initialTs, asyncClient.getLastPropagatedTimestamp());
 
     // Use the synchronous client to update the last propagated timestamp and
     // check with both clients that the timestamp was updated.
-    client.updateLastPropagatedTimestamp(initial_ts + 1);
-    assertEquals(initial_ts + 1, client.getLastPropagatedTimestamp());
-    assertEquals(initial_ts + 1, asyncClient.getLastPropagatedTimestamp());
+    client.updateLastPropagatedTimestamp(initialTs + 1);
+    assertEquals(initialTs + 1, client.getLastPropagatedTimestamp());
+    assertEquals(initialTs + 1, asyncClient.getLastPropagatedTimestamp());
   }
 
   /**
@@ -177,6 +185,26 @@ public class TestKuduClient {
       assertThat(nre.toString(), containsString(
           "number of columns 1001 is greater than the permitted maximum"));
     }
+  }
+
+  /**
+   * Test creating and deleting a table with extra-configs through a KuduClient.
+   */
+  @Test(timeout = 100000)
+  public void testCreateDeleteTableWitExtraConfigs() throws Exception {
+    // Check that we can create a table.
+    Map<String, String> extraConfigs = new HashMap<>();
+    extraConfigs.put("kudu.table.history_max_age_sec", "7200");
+
+    client.createTable(
+        TABLE_NAME,
+        basicSchema,
+        getBasicCreateTableOptions().setExtraConfigs(extraConfigs));
+
+    KuduTable table = client.openTable(TABLE_NAME);
+    extraConfigs = table.getExtraConfig();
+    assertTrue(extraConfigs.containsKey("kudu.table.history_max_age_sec"));
+    assertEquals("7200", extraConfigs.get("kudu.table.history_max_age_sec"));
   }
 
   /*
@@ -283,8 +311,14 @@ public class TestKuduClient {
     // Wait for longer than the scanner ttl calling keepAlive throughout.
     // Each loop sleeps 25% of the scanner ttl and we loop 10 times to ensure
     // we extend over 2x the scanner ttl.
+    Random random = RandomUtils.getRandom();
     for (int i = 0; i < 10; i++) {
       Thread.sleep(SHORT_SCANNER_TTL_MS / 4);
+      // Force 1/3 of the keepAlive requests to retry up to 3 times.
+      if (i % 3 == 0) {
+        RpcProxy.failNextRpcs(random.nextInt(4),
+            new RecoverableException(Status.ServiceUnavailable("testKeepAlive")));
+      }
       scanner.keepAlive();
     }
 
@@ -349,10 +383,6 @@ public class TestKuduClient {
         // Two rows which should not succeed.
         "fail_1,a,b,c,NULL",
         "fail_2,a,b,NULL,d");
-    List<String> expectedStrings = ImmutableList.of(
-        "STRING key=r1, STRING c1=a, STRING c2=b, STRING c3=c, STRING c4=d",
-        "STRING key=r2, STRING c1=NULL, STRING c2=NULL, STRING c3=c, STRING c4=d",
-        "STRING key=r3, STRING c1=NULL, STRING c2=def, STRING c3=c, STRING c4=def");
     for (String row : rows) {
       try {
         String[] fields = row.split(",", -1);
@@ -378,10 +408,70 @@ public class TestKuduClient {
     session.flush();
 
     // Check that we got the results we expected.
+    List<String> expectedStrings = ImmutableList.of(
+        "STRING key=r1, STRING c1=a, STRING c2=b, STRING c3=c, STRING c4=d",
+        "STRING key=r2, STRING c1=NULL, STRING c2=NULL, STRING c3=c, STRING c4=d",
+        "STRING key=r3, STRING c1=NULL, STRING c2=def, STRING c3=c, STRING c4=def");
     List<String> rowStrings = scanTableToStrings(table);
     Collections.sort(rowStrings);
     assertArrayEquals(rowStrings.toArray(new String[0]),
                       expectedStrings.toArray(new String[0]));
+  }
+
+  /**
+   * Test inserting and retrieving VARCHAR columns.
+   */
+  @Test(timeout = 100000)
+  public void testVarchars() throws Exception {
+    Schema schema = createManyVarcharsSchema();
+    client.createTable(TABLE_NAME, schema, getBasicCreateTableOptions());
+
+    KuduSession session = client.newSession();
+    KuduTable table = client.openTable(TABLE_NAME);
+    for (int i = 0; i < 100; i++) {
+      Insert insert = table.newInsert();
+      PartialRow row = insert.getRow();
+      row.addVarchar("key", String.format("key_%02d", i));
+      row.addVarchar("c2", "c2_" + i);
+      if (i % 2 == 1) {
+        row.addVarchar("c3", "c3_" + i);
+      }
+      row.addVarchar("c4", "c4_" + i);
+      // NOTE: we purposefully add the strings in a non-left-to-right
+      // order to verify that we still place them in the right position in
+      // the row.
+      row.addVarchar("c1", "c1_" + i);
+      session.apply(insert);
+      if (i % 50 == 0) {
+        session.flush();
+      }
+    }
+    session.flush();
+
+    List<String> rowStrings = scanTableToStrings(table);
+    assertEquals(100, rowStrings.size());
+    assertEquals(
+        "VARCHAR key(10)=key_03, VARCHAR c1(10)=c1_3, VARCHAR c2(10)=c2_3," +
+        " VARCHAR c3(10)=c3_3, VARCHAR c4(10)=c4_3", rowStrings.get(3));
+    assertEquals(
+        "VARCHAR key(10)=key_04, VARCHAR c1(10)=c1_4, VARCHAR c2(10)=c2_4," +
+        " VARCHAR c3(10)=NULL, VARCHAR c4(10)=c4_4", rowStrings.get(4));
+
+    KuduScanner scanner = client.newScannerBuilder(table).build();
+
+    assertTrue("Scanner should have returned row", scanner.hasMoreRows());
+
+    RowResultIterator rows = scanner.nextRows();
+    final RowResult next = rows.next();
+
+    // Do negative testing on string type.
+    try {
+      next.getInt("c2");
+      fail("IllegalArgumentException was not thrown when accessing " +
+          "a VARCHAR column with getInt");
+    } catch (IllegalArgumentException ignored) {
+      // ignored
+    }
   }
 
   /**
@@ -434,8 +524,10 @@ public class TestKuduClient {
     try {
       next.getInt("c2");
       fail("IllegalArgumentException was not thrown when accessing " +
-              "a string column with getInt");
-    } catch (IllegalArgumentException ignored) {}
+          "a string column with getInt");
+    } catch (IllegalArgumentException ignored) {
+      // ignored
+    }
   }
 
   /**
@@ -446,7 +538,6 @@ public class TestKuduClient {
     Schema schema = createManyStringsSchema();
     client.createTable(TABLE_NAME, schema, getBasicCreateTableOptions());
 
-    KuduSession session = client.newSession();
     KuduTable table = client.openTable(TABLE_NAME);
     Insert insert = table.newInsert();
     PartialRow row = insert.getRow();
@@ -455,6 +546,7 @@ public class TestKuduClient {
 
     row.addString("c2", "hello"); // some normal chars
     row.addString("c4", "🐱"); // supplemental plane
+    KuduSession session = client.newSession();
     session.apply(insert);
     session.flush();
 
@@ -497,8 +589,8 @@ public class TestKuduClient {
     assertEquals(100, rowStrings.size());
     for (int i = 0; i < rowStrings.size(); i++) {
       StringBuilder expectedRow = new StringBuilder();
-      expectedRow.append(String.format("BINARY key=\"key_%02d\", STRING c1=✁✂✃✄✆, DOUBLE c2=%.1f,"
-          + " BINARY c3=", i, (double) i));
+      expectedRow.append(String.format("BINARY key=\"key_%02d\", STRING c1=✁✂✃✄✆, DOUBLE c2=%.1f," +
+          " BINARY c3=", i, (double) i));
       if (i % 2 == 1) {
         expectedRow.append(Bytes.pretty(testArray));
       } else {
@@ -525,7 +617,7 @@ public class TestKuduClient {
       Insert insert = table.newInsert();
       PartialRow row = insert.getRow();
       long timestamp = System.currentTimeMillis() * 1000;
-      while(timestamp == lastTimestamp) {
+      while (timestamp == lastTimestamp) {
         timestamp = System.currentTimeMillis() * 1000;
       }
       timestamps.add(timestamp);
@@ -586,9 +678,10 @@ public class TestKuduClient {
     assertEquals(9, rowStrings.size());
     for (int i = 0; i < rowStrings.size(); i++) {
       StringBuilder expectedRow = new StringBuilder();
-      expectedRow.append(String.format("DECIMAL key(18, 0)=%s, DECIMAL c1(38, 0)=", String.valueOf(i)));
+      expectedRow.append(String.format("DECIMAL key(18, 0)=%s, DECIMAL c1(38, 0)=",
+          String.valueOf(i)));
       if (i % 2 == 1) {
-        expectedRow.append(String.valueOf(i));
+        expectedRow.append(i);
       } else {
         expectedRow.append("NULL");
       }
@@ -605,18 +698,16 @@ public class TestKuduClient {
     client.createTable(TABLE_NAME, basicSchema, getBasicTableOptionsWithNonCoveredRange());
     KuduTable table = client.openTable(TABLE_NAME);
     KuduSession session = client.newSession();
-    int num_rows = 100;
-    for (int key = 0; key < num_rows; key++) {
+    int numRows = 100;
+    for (int key = 0; key < numRows; key++) {
       session.apply(createBasicSchemaInsert(table, key));
     }
 
     // Test with some non-positive limits, expecting to raise an exception.
-    int non_positives[] = { -1, 0 };
-    for (int limit : non_positives) {
+    int[] nonPositives = { -1, 0 };
+    for (int limit : nonPositives) {
       try {
-        KuduScanner scanner = client.newScannerBuilder(table)
-                                        .limit(limit)
-                                        .build();
+        client.newScannerBuilder(table).limit(limit).build();
         fail();
       } catch (IllegalArgumentException e) {
         assertTrue(e.getMessage().contains("Need a strictly positive number"));
@@ -624,7 +715,7 @@ public class TestKuduClient {
     }
 
     // Test with a limit and ensure we get the expected number of rows.
-    int limits[] = { num_rows - 1, num_rows, num_rows + 1 };
+    int[] limits = { numRows - 1, numRows, numRows + 1 };
     for (int limit : limits) {
       KuduScanner scanner = client.newScannerBuilder(table)
                                       .limit(limit)
@@ -633,8 +724,8 @@ public class TestKuduClient {
       while (scanner.hasMoreRows()) {
         count += scanner.nextRows().getNumRows();
       }
-      assertEquals(String.format("Limit %d returned %d/%d rows", limit, count, num_rows),
-          Math.min(num_rows, limit), count);
+      assertEquals(String.format("Limit %d returned %d/%d rows", limit, count, numRows),
+          Math.min(numRows, limit), count);
     }
 
     // Now test with limits for async scanners.
@@ -642,7 +733,7 @@ public class TestKuduClient {
       AsyncKuduScanner scanner = new AsyncKuduScanner.AsyncKuduScannerBuilder(asyncClient, table)
                                                      .limit(limit)
                                                      .build();
-      assertEquals(Math.min(limit, num_rows), countRowsInScan(scanner));
+      assertEquals(Math.min(limit, numRows), countRowsInScan(scanner));
     }
   }
 
@@ -697,8 +788,8 @@ public class TestKuduClient {
 
     // IS NOT NULL
     assertEquals(100, scanTableToStrings(table,
-       KuduPredicate.newIsNotNullPredicate(schema.getColumn("c1")),
-       KuduPredicate.newIsNotNullPredicate(schema.getColumn("key"))
+        KuduPredicate.newIsNotNullPredicate(schema.getColumn("c1")),
+        KuduPredicate.newIsNotNullPredicate(schema.getColumn("key"))
     ).size());
     assertEquals(50, scanTableToStrings(table,
         KuduPredicate.newIsNotNullPredicate(schema.getColumn("c3"))
@@ -706,28 +797,28 @@ public class TestKuduClient {
 
     // IS NULL
     assertEquals(0, scanTableToStrings(table,
-            KuduPredicate.newIsNullPredicate(schema.getColumn("c2")),
-            KuduPredicate.newIsNullPredicate(schema.getColumn("key"))
+        KuduPredicate.newIsNullPredicate(schema.getColumn("c2")),
+        KuduPredicate.newIsNullPredicate(schema.getColumn("key"))
     ).size());
     assertEquals(50, scanTableToStrings(table,
-            KuduPredicate.newIsNullPredicate(schema.getColumn("c3"))
+        KuduPredicate.newIsNullPredicate(schema.getColumn("c3"))
     ).size());
 
     // IN list
     assertEquals(3, scanTableToStrings(table,
-       KuduPredicate.newInListPredicate(schema.getColumn("key"),
-                                        ImmutableList.of("key_30", "key_01", "invalid", "key_99"))
+        KuduPredicate.newInListPredicate(schema.getColumn("key"),
+                                         ImmutableList.of("key_30", "key_01", "invalid", "key_99"))
     ).size());
     assertEquals(3, scanTableToStrings(table,
-       KuduPredicate.newInListPredicate(schema.getColumn("c2"),
-                                        ImmutableList.of("c2_30", "c2_1", "invalid", "c2_99"))
+        KuduPredicate.newInListPredicate(schema.getColumn("c2"),
+                                         ImmutableList.of("c2_30", "c2_1", "invalid", "c2_99"))
     ).size());
     assertEquals(2, scanTableToStrings(table,
-       KuduPredicate.newInListPredicate(schema.getColumn("c2"),
-                                        ImmutableList.of("c2_30", "c2_1", "invalid", "c2_99")),
-       KuduPredicate.newIsNotNullPredicate(schema.getColumn("c2")),
-       KuduPredicate.newInListPredicate(schema.getColumn("key"),
-                                        ImmutableList.of("key_30", "key_45", "invalid", "key_99"))
+        KuduPredicate.newInListPredicate(schema.getColumn("c2"),
+                                         ImmutableList.of("c2_30", "c2_1", "invalid", "c2_99")),
+        KuduPredicate.newIsNotNullPredicate(schema.getColumn("c2")),
+        KuduPredicate.newInListPredicate(schema.getColumn("key"),
+                                         ImmutableList.of("key_30", "key_45", "invalid", "key_99"))
     ).size());
   }
 
@@ -815,7 +906,8 @@ public class TestKuduClient {
     }
 
     KuduTable table = client.openTable(TABLE_NAME);
-    AsyncKuduScanner scanner = new AsyncKuduScanner.AsyncKuduScannerBuilder(asyncClient, table).build();
+    AsyncKuduScanner scanner =
+        new AsyncKuduScanner.AsyncKuduScannerBuilder(asyncClient, table).build();
     assertEquals(1, countRowsInScan(scanner));
   }
 
@@ -832,11 +924,12 @@ public class TestKuduClient {
         // Force the client to connect to the masters.
         localClient.exportAuthenticationCredentials();
       }
+      // Wait a little for exceptions to come in from threads that don't get
+      // synchronously joined by client.close().
+      Thread.sleep(500);
     }
     // Ensure there is no log spew due to an unexpected lost connection.
-    String exception_text = cla.getAppendedText();
-    assertFalse("Unexpected exception:\n" + exception_text,
-               exception_text.contains("lost connection to peer"));
+    assertFalse(cla.getAppendedText(), cla.getAppendedText().contains("Exception"));
   }
 
   /**
@@ -853,7 +946,7 @@ public class TestKuduClient {
         // Force the client to connect to the masters.
         localClient.exportAuthenticationCredentials();
         fail("Should have failed to connect.");
-      } catch (NoLeaderFoundException e) {
+      } catch (NonRecoverableException e) {
         assertTrue("Bad exception string: " + e.getMessage(),
             e.getMessage().matches(".*Master config .+ has no leader. " +
                 "Exceptions received:.*Connection refused.*Connection refused" +
@@ -873,43 +966,45 @@ public class TestKuduClient {
   @Test(timeout = 100000)
   public void testCustomNioExecutor() throws Exception {
     long startTime = System.nanoTime();
-    final KuduClient localClient = new KuduClient.KuduClientBuilder(harness.getMasterAddressesAsString())
-        .nioExecutors(Executors.newFixedThreadPool(1), Executors.newFixedThreadPool(2))
-        .bossCount(1)
-        .workerCount(2)
-        .build();
-    long buildTime = (System.nanoTime() - startTime) / 1000000000L;
-    assertTrue("Building KuduClient is slow, maybe netty get stuck", buildTime < 3);
-    localClient.createTable(TABLE_NAME, basicSchema, getBasicCreateTableOptions());
-    Thread[] threads = new Thread[4];
-    for (int t = 0; t < 4; t++) {
-      final int id = t;
-      threads[t] = new Thread(new Runnable() {
-        @Override
-        public void run() {
-          try {
-            KuduTable table = localClient.openTable(TABLE_NAME);
-            KuduSession session = localClient.newSession();
-            session.setFlushMode(SessionConfiguration.FlushMode.AUTO_FLUSH_SYNC);
-            for (int i = 0; i < 100; i++) {
-              Insert insert = createBasicSchemaInsert(table, id * 100 + i);
-              session.apply(insert);
+    try (KuduClient localClient =
+             new KuduClient.KuduClientBuilder(harness.getMasterAddressesAsString())
+                 .nioExecutors(Executors.newFixedThreadPool(1),
+                     Executors.newFixedThreadPool(2))
+                 .bossCount(1)
+                 .workerCount(2)
+                 .build()) {
+      long buildTime = (System.nanoTime() - startTime) / 1000000000L;
+      assertTrue("Building KuduClient is slow, maybe netty get stuck", buildTime < 3);
+      localClient.createTable(TABLE_NAME, basicSchema, getBasicCreateTableOptions());
+      Thread[] threads = new Thread[4];
+      for (int t = 0; t < 4; t++) {
+        final int id = t;
+        threads[t] = new Thread(new Runnable() {
+          @Override
+          public void run() {
+            try {
+              KuduTable table = localClient.openTable(TABLE_NAME);
+              KuduSession session = localClient.newSession();
+              session.setFlushMode(SessionConfiguration.FlushMode.AUTO_FLUSH_SYNC);
+              for (int i = 0; i < 100; i++) {
+                Insert insert = createBasicSchemaInsert(table, id * 100 + i);
+                session.apply(insert);
+              }
+              session.close();
+            } catch (Exception e) {
+              fail("insert thread should not throw exception: " + e);
             }
-            session.close();
-          } catch (Exception e) {
-            fail("insert thread should not throw exception: " + e);
           }
-        }
-      });
-      threads[t].start();
+        });
+        threads[t].start();
+      }
+      for (int t = 0; t < 4; t++) {
+        threads[t].join();
+      }
     }
-    for (int t = 0; t< 4;t++) {
-      threads[t].join();
-    }
-    localClient.shutdown();
   }
 
-  @Test(expected=IllegalArgumentException.class)
+  @Test(expected = IllegalArgumentException.class)
   public void testNoDefaultPartitioning() throws Exception {
     client.createTable(TABLE_NAME, basicSchema, new CreateTableOptions());
   }
@@ -933,13 +1028,14 @@ public class TestKuduClient {
 
     // Add a range partition with a separate client. The new client is necessary
     // in order to avoid clearing the meta cache as part of the alter operation.
-    try (KuduClient alterClient = new KuduClient.KuduClientBuilder(harness.getMasterAddressesAsString())
-                                                .defaultAdminOperationTimeoutMs(harness.DEFAULT_SLEEP)
-                                                .build()) {
-      AlterTableOptions alter = new AlterTableOptions();
+    try (KuduClient alterClient =
+             new KuduClient.KuduClientBuilder(harness.getMasterAddressesAsString())
+                 .defaultAdminOperationTimeoutMs(KuduTestHarness.DEFAULT_SLEEP)
+                 .build()) {
       lower = basicSchema.newPartialRow();
       upper = basicSchema.newPartialRow();
       lower.addInt("key", 1);
+      AlterTableOptions alter = new AlterTableOptions();
       alter.addRangePartition(lower, upper);
       alterClient.alterTable(TABLE_NAME, alter);
     }
@@ -1052,49 +1148,54 @@ public class TestKuduClient {
       Callable<Void> callable = new Callable<Void>() {
         @Override
         public Void call() throws Exception {
+          // Create a new client.
+          AsyncKuduClient asyncKuduClient = new AsyncKuduClient
+                  .AsyncKuduClientBuilder(harness.getMasterAddressesAsString())
+                  .defaultAdminOperationTimeoutMs(KuduTestHarness.DEFAULT_SLEEP)
+                  .build();
           // From the same client continuously performs inserts to a tablet
           // in the given flush mode.
-          KuduSession session = client.newSession();
-          session.setFlushMode(flushMode);
-          KuduTable table = client.openTable(TABLE_NAME);
-          for (int i = 0; i < 3; i++) {
-            for (int j = 100 * i; j < 100 * (i + 1); j++) {
-              Insert insert = table.newInsert();
-              PartialRow row = insert.getRow();
-              row.addString("key", String.format("key_%02d", j));
-              row.addString("c1", "c1_" + j);
-              row.addString("c2", "c2_" + j);
-              row.addString("c3", "c3_" + j);
-              session.apply(insert);
-            }
-            session.flush();
-            session.close();
+          try (KuduClient kuduClient = asyncKuduClient.syncClient()) {
+            KuduSession session = kuduClient.newSession();
+            session.setFlushMode(flushMode);
+            KuduTable table = kuduClient.openTable(TABLE_NAME);
+            for (int i = 0; i < 3; i++) {
+              for (int j = 100 * i; j < 100 * (i + 1); j++) {
+                Insert insert = table.newInsert();
+                PartialRow row = insert.getRow();
+                row.addString("key", String.format("key_%02d", j));
+                row.addString("c1", "c1_" + j);
+                row.addString("c2", "c2_" + j);
+                row.addString("c3", "c3_" + j);
+                session.apply(insert);
+              }
+              session.flush();
 
-            // Perform a bunch of READ_YOUR_WRITES scans to all the replicas
-            // that count the rows. And verify that the count of the rows
-            // never go down from what previously observed, to ensure subsequent
-            // reads will not "go back in time" regarding writes that other
-            // clients have done.
-            for (int k = 0; k < 3; k++) {
-              AsyncKuduScanner scanner = asyncClient.newScannerBuilder(table)
-                      .readMode(AsyncKuduScanner.ReadMode.READ_YOUR_WRITES)
-                      .replicaSelection(replicaSelection)
-                      .build();
-              KuduScanner syncScanner = new KuduScanner(scanner);
-              long preTs = asyncClient.getLastPropagatedTimestamp();
-              assertNotEquals(AsyncKuduClient.NO_TIMESTAMP,
-                  asyncClient.getLastPropagatedTimestamp());
+              // Perform a bunch of READ_YOUR_WRITES scans to all the replicas
+              // that count the rows. And verify that the count of the rows
+              // never go down from what previously observed, to ensure subsequent
+              // reads will not "go back in time" regarding writes that other
+              // clients have done.
+              for (int k = 0; k < 3; k++) {
+                AsyncKuduScanner scanner = asyncKuduClient.newScannerBuilder(table)
+                                           .readMode(AsyncKuduScanner.ReadMode.READ_YOUR_WRITES)
+                                           .replicaSelection(replicaSelection)
+                                           .build();
+                KuduScanner syncScanner = new KuduScanner(scanner);
+                long preTs = asyncKuduClient.getLastPropagatedTimestamp();
+                assertNotEquals(AsyncKuduClient.NO_TIMESTAMP, preTs);
 
-              long row_count = countRowsInScan(syncScanner);
-              long expected_count = 100L * (i + 1);
-              assertTrue(expected_count <= row_count);
+                long rowCount = countRowsInScan(syncScanner);
+                long expectedCount = 100L * (i + 1);
+                assertTrue(expectedCount <= rowCount);
 
-              // After the scan, verify that the chosen snapshot timestamp is
-              // returned from the server and it is larger than the previous
-              // propagated timestamp.
-              assertNotEquals(AsyncKuduClient.NO_TIMESTAMP, scanner.getSnapshotTimestamp());
-              assertTrue(preTs < scanner.getSnapshotTimestamp());
-              syncScanner.close();
+                // After the scan, verify that the chosen snapshot timestamp is
+                // returned from the server and it is larger than the previous
+                // propagated timestamp.
+                assertNotEquals(AsyncKuduClient.NO_TIMESTAMP, scanner.getSnapshotTimestamp());
+                assertTrue(preTs < scanner.getSnapshotTimestamp());
+                syncScanner.close();
+              }
             }
           }
           return null;
@@ -1110,5 +1211,90 @@ public class TestKuduClient {
     for (Future<Void> future : futures) {
       future.get();
     }
+  }
+
+  private void runTestCallDuringLeaderElection(String clientMethodName) throws Exception {
+    // This bit of reflection helps us avoid duplicating test code.
+    Method methodToInvoke = KuduClient.class.getMethod(clientMethodName);
+
+    for (int i = 0; i < 5; i++) {
+      try (KuduClient cl = new KuduClient.KuduClientBuilder(
+          harness.getMasterAddressesAsString()).build()) {
+        harness.restartLeaderMaster();
+
+        // There's a good chance that this executes while there's no leader
+        // master. It should retry until the leader election completes and a new
+        // leader master is elected.
+        methodToInvoke.invoke(cl);
+      }
+    }
+
+    // With all masters down, exportAuthenticationCredentials() should time out.
+    harness.killAllMasterServers();
+    try (KuduClient cl = new KuduClient.KuduClientBuilder(
+        harness.getMasterAddressesAsString())
+         .defaultAdminOperationTimeoutMs(5000) // speed up the test
+         .build()) {
+      try {
+        methodToInvoke.invoke(cl);
+        fail();
+      } catch (InvocationTargetException ex) {
+        assertTrue(ex.getTargetException() instanceof KuduException);
+        KuduException realEx = (KuduException) ex.getTargetException();
+        assertTrue(realEx.getStatus().isTimedOut());
+      }
+    }
+  }
+
+  @Test(timeout = 100000)
+  public void testExportAuthenticationCredentialsDuringLeaderElection() throws Exception {
+    runTestCallDuringLeaderElection("exportAuthenticationCredentials");
+  }
+
+  @Test(timeout = 100000)
+  public void testGetHiveMetastoreConfigDuringLeaderElection() throws Exception {
+    runTestCallDuringLeaderElection("getHiveMetastoreConfig");
+  }
+
+  /**
+   * Test assignment of a location to the client.
+   */
+  @Test(timeout = 100000)
+  public void testClientLocationNoLocation() throws Exception {
+    // Do something that will cause the client to connect to the cluster.
+    client.listTabletServers();
+    assertEquals("", client.getLocationString());
+  }
+
+  @Test(timeout = 100000)
+  @LocationConfig(locations = {
+      "/L0:6", // 3 masters, 1 client, 3 tablet servers: 3 * 1 + 3 = 6.
+  })
+  public void testClientLocation() throws Exception {
+    // Do something that will cause the client to connect to the cluster.
+    client.listTabletServers();
+    assertEquals("/L0", client.getLocationString());
+  }
+
+  @Test(timeout = 100000)
+  public void testSessionOnceClosed() throws Exception {
+    client.createTable(TABLE_NAME, basicSchema, getBasicCreateTableOptions());
+    KuduTable table = client.openTable(TABLE_NAME);
+    KuduSession session = client.newSession();
+
+    session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
+    Insert insert = createBasicSchemaInsert(table, 0);
+    session.apply(insert);
+    session.close();
+    assertTrue(session.isClosed());
+
+    insert = createBasicSchemaInsert(table, 1);
+    CapturingLogAppender cla = new CapturingLogAppender();
+    try (Closeable c = cla.attach()) {
+      session.apply(insert);
+    }
+    String loggedText = cla.getAppendedText();
+    assertTrue("Missing warning:\n" + loggedText,
+               loggedText.contains("this is unsafe"));
   }
 }

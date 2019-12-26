@@ -22,6 +22,7 @@ import java.util.List;
 
 import com.google.protobuf.Message;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.jboss.netty.util.Timer;
 
 import org.apache.kudu.tserver.Tserver;
 import org.apache.kudu.util.Pair;
@@ -29,8 +30,8 @@ import org.apache.kudu.util.Pair;
 @InterfaceAudience.Private
 class ListTabletsRequest extends KuduRpc<ListTabletsResponse> {
 
-  ListTabletsRequest() {
-    super(null);
+  ListTabletsRequest(Timer timer, long timeoutMillis) {
+    super(null, timer, timeoutMillis);
   }
 
   @Override
@@ -55,14 +56,14 @@ class ListTabletsRequest extends KuduRpc<ListTabletsResponse> {
         Tserver.ListTabletsResponsePB.newBuilder();
     readProtobuf(callResponse.getPBMessage(), respBuilder);
     int serversCount = respBuilder.getStatusAndSchemaCount();
-    List<String> tablets = new ArrayList<String>(serversCount);
+    List<String> tablets = new ArrayList<>(serversCount);
     for (Tserver.ListTabletsResponsePB.StatusAndSchemaPB info
         : respBuilder.getStatusAndSchemaList()) {
       tablets.add(info.getTabletStatus().getTabletId());
     }
-    ListTabletsResponse response = new ListTabletsResponse(deadlineTracker.getElapsedMillis(),
-                                                         tsUUID, tablets);
-    return new Pair<ListTabletsResponse, Object>(
-        response, respBuilder.hasError() ? respBuilder.getError() : null);
+    ListTabletsResponse response = new ListTabletsResponse(timeoutTracker.getElapsedMillis(),
+                                                           tsUUID,
+                                                           tablets);
+    return new Pair<>(response, respBuilder.hasError() ? respBuilder.getError() : null);
   }
 }

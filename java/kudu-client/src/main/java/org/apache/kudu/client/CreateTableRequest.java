@@ -18,12 +18,15 @@
 package org.apache.kudu.client;
 
 import java.util.Collection;
+import java.util.EnumSet;
 import java.util.List;
 
 import com.google.protobuf.Message;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.jboss.netty.util.Timer;
 
 import org.apache.kudu.Schema;
+import org.apache.kudu.client.ProtobufHelper.SchemaPBConversionFlags;
 import org.apache.kudu.master.Master;
 import org.apache.kudu.util.Pair;
 
@@ -40,9 +43,13 @@ class CreateTableRequest extends KuduRpc<CreateTableResponse> {
   private final Master.CreateTableRequestPB.Builder builder;
   private final List<Integer> featureFlags;
 
-  CreateTableRequest(KuduTable masterTable, String name, Schema schema,
-                     CreateTableOptions builder) {
-    super(masterTable);
+  CreateTableRequest(KuduTable masterTable,
+                     String name,
+                     Schema schema,
+                     CreateTableOptions builder,
+                     Timer timer,
+                     long timeoutMillis) {
+    super(masterTable, timer, timeoutMillis);
     this.schema = schema;
     this.name = name;
     this.builder = builder.getBuilder();
@@ -52,7 +59,9 @@ class CreateTableRequest extends KuduRpc<CreateTableResponse> {
   @Override
   Message createRequestPB() {
     this.builder.setName(this.name);
-    this.builder.setSchema(ProtobufHelper.schemaToPb(this.schema));
+    this.builder.setSchema(
+        ProtobufHelper.schemaToPb(this.schema,
+                                  EnumSet.of(SchemaPBConversionFlags.SCHEMA_PB_WITHOUT_ID)));
     return this.builder.build();
   }
 
@@ -73,7 +82,7 @@ class CreateTableRequest extends KuduRpc<CreateTableResponse> {
     readProtobuf(callResponse.getPBMessage(), builder);
     CreateTableResponse response =
         new CreateTableResponse(
-            deadlineTracker.getElapsedMillis(),
+            timeoutTracker.getElapsedMillis(),
             tsUUID,
             builder.getTableId().toStringUtf8());
     return new Pair<CreateTableResponse, Object>(

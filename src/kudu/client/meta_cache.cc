@@ -17,13 +17,13 @@
 
 #include "kudu/client/meta_cache.h"
 
-#include <algorithm>
+#include <cstdint>
 #include <mutex>
 #include <ostream>
 #include <set>
 #include <string>
-#include <vector>
 #include <utility>
+#include <vector>
 
 #include <boost/bind.hpp> // IWYU pragma: keep
 #include <glog/logging.h>
@@ -31,9 +31,11 @@
 
 #include "kudu/client/client-internal.h"
 #include "kudu/client/client.h"
+#include "kudu/client/master_proxy_rpc.h"
 #include "kudu/client/schema.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/wire_protocol.h"
+#include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/bind.h"
 #include "kudu/gutil/bind_helpers.h"
@@ -45,9 +47,9 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
+#include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
-#include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/net/dns_resolver.h"
@@ -64,22 +66,15 @@ using strings::Substitute;
 
 namespace kudu {
 
-namespace rpc {
-class Messenger;
-}
-
 using consensus::RaftPeerPB;
 using master::ANY_REPLICA;
 using master::GetTableLocationsRequestPB;
 using master::GetTableLocationsResponsePB;
 using master::MasterServiceProxy;
 using master::TabletLocationsPB;
-using master::TabletLocationsPB_ReplicaPB;
 using master::TSInfoPB;
+using rpc::BackoffType;
 using rpc::CredentialsPolicy;
-using rpc::Messenger;
-using rpc::Rpc;
-using rpc::ErrorStatusPB;
 using tserver::TabletServerServiceProxy;
 
 namespace client {
@@ -87,9 +82,7 @@ namespace client {
 namespace internal {
 
 RemoteTabletServer::RemoteTabletServer(const master::TSInfoPB& pb)
-  : uuid_(pb.permanent_uuid()),
-    location_(pb.location()) {
-
+  : uuid_(pb.permanent_uuid()) {
   Update(pb);
 }
 
@@ -142,9 +135,9 @@ void RemoteTabletServer::InitProxy(KuduClient* client, const StatusCallback& cb)
   }
 
   auto addrs = new vector<Sockaddr>();
-  client->data_->dns_resolver_->ResolveAddresses(
-    hp, addrs, Bind(&RemoteTabletServer::DnsResolutionFinished,
-                    Unretained(this), hp, addrs, client, cb));
+  client->data_->dns_resolver_->ResolveAddressesAsync(
+      hp, addrs, Bind(&RemoteTabletServer::DnsResolutionFinished,
+                      Unretained(this), hp, addrs, client, cb));
 }
 
 void RemoteTabletServer::Update(const master::TSInfoPB& pb) {
@@ -156,13 +149,15 @@ void RemoteTabletServer::Update(const master::TSInfoPB& pb) {
   for (const HostPortPB& hostport_pb : pb.rpc_addresses()) {
     rpc_hostports_.emplace_back(hostport_pb.host(), hostport_pb.port());
   }
+  location_ = pb.location();
 }
 
 const string& RemoteTabletServer::permanent_uuid() const {
   return uuid_;
 }
 
-const string& RemoteTabletServer::location() const {
+string RemoteTabletServer::location() const {
+  std::lock_guard<simple_spinlock> l(lock_);
   return location_;
 }
 
@@ -189,20 +184,38 @@ void RemoteTabletServer::GetHostPorts(vector<HostPort>* host_ports) const {
 ////////////////////////////////////////////////////////////
 
 
-void RemoteTablet::Refresh(const TabletServerMap& tservers,
-                           const google::protobuf::RepeatedPtrField
-                             <TabletLocationsPB_ReplicaPB>& replicas) {
+Status RemoteTablet::Refresh(
+    const TabletServerMap& tservers,
+    const TabletLocationsPB& locs_pb,
+    const google::protobuf::RepeatedPtrField<TSInfoPB>& ts_info_dict) {
+
+  vector<RemoteReplica> replicas;
+
+  // Handle "old-style" non-interned replicas. It's used for backward compatibility.
+  for (const auto& r : locs_pb.deprecated_replicas()) {
+    RemoteReplica replica = { FindOrDie(tservers, r.ts_info().permanent_uuid()),
+                              r.role(), /*failed=*/false };
+    replicas.push_back(replica);
+  }
+  // Handle interned replicas.
+  for (const auto& r : locs_pb.interned_replicas()) {
+    if (r.ts_info_idx() >= ts_info_dict.size()) {
+      return Status::Corruption(Substitute(
+          "invalid response from master: referenced tablet idx $0 but only $1 present",
+          r.ts_info_idx(), ts_info_dict.size()));
+    }
+    const TSInfoPB& ts_info = ts_info_dict.Get(r.ts_info_idx());
+    RemoteReplica replica = { FindOrDie(tservers, ts_info.permanent_uuid()),
+                              r.role(), /*failed=*/false };
+    replicas.push_back(replica);
+  }
+
   // Adopt the data from the successful response.
   std::lock_guard<simple_spinlock> l(lock_);
-  replicas_.clear();
-  for (const TabletLocationsPB_ReplicaPB& r : replicas) {
-    RemoteReplica rep;
-    rep.ts = FindOrDie(tservers, r.ts_info().permanent_uuid());
-    rep.role = r.role();
-    rep.failed = false;
-    replicas_.push_back(rep);
-  }
+  replicas_ = std::move(replicas);
+
   stale_ = false;
+  return Status::OK();
 }
 
 void RemoteTablet::MarkStale() {
@@ -529,11 +542,14 @@ void MetaCache::UpdateTabletServer(const TSInfoPB& pb) {
   InsertOrDie(&ts_cache_, pb.permanent_uuid(), new RemoteTabletServer(pb));
 }
 
+
 // A (table, partition_key) --> tablet lookup. May be in-flight to a master, or
 // may be handled locally.
 //
-// Keeps a reference on the owning metacache while alive.
-class LookupRpc : public Rpc {
+// Keeps a reference on the owning meta cache while alive.
+class LookupRpc
+    : public AsyncLeaderMasterRpc<GetTableLocationsRequestPB,
+                                  GetTableLocationsResponsePB> {
  public:
   LookupRpc(scoped_refptr<MetaCache> meta_cache,
             StatusCallback user_cb,
@@ -541,14 +557,26 @@ class LookupRpc : public Rpc {
             string partition_key,
             scoped_refptr<RemoteTablet>* remote_tablet,
             const MonoTime& deadline,
-            shared_ptr<Messenger> messenger,
             MetaCache::LookupType lookup_type,
             ReplicaController::Visibility replica_visibility);
   virtual ~LookupRpc();
-  virtual void SendRpc() OVERRIDE;
-  // Send the next RPC without consulting the metacache.
+
+  // Looks up the tablet location in the meta cache, and if it isn't there,
+  // sends an RPC to perform the lookup.
+  //
+  // The abstraction is a bit muddied since this may not actually send an RPC
+  // if the location exists in the meta cache. It's written in this way to
+  // avoid extraneous RPC calls and to leverage common retry logic.
+  //
+  // Upon completion, either the user callback will be called and this object
+  // should delete itself, or a retry has been rescheduled and the object
+  // should remain alive.
+  void SendRpc() override;
+
+  // Send an RPC to perform the lookup without consulting the meta cache.
   void SendRpcSlowPath();
-  virtual string ToString() const OVERRIDE;
+
+  string ToString() const override;
 
   const GetTableLocationsRequestPB& req() const { return req_; }
   const GetTableLocationsResponsePB& resp() const { return resp_; }
@@ -569,16 +597,17 @@ class LookupRpc : public Rpc {
   }
   const KuduTable* table() const { return table_; }
 
+ protected:
+  void ResetMasterLeaderAndRetry(CredentialsPolicy creds_policy) override;
+
  private:
-  virtual void SendRpcCb(const Status& status) OVERRIDE;
+  // Handles retry logic and processes the response, sticking locations into
+  // the meta cache.
+  void SendRpcCb(const Status& status) override;
 
   std::shared_ptr<MasterServiceProxy> master_proxy() const {
     return table_->client()->data_->master_proxy();
   }
-
-  void ResetMasterLeaderAndRetry(CredentialsPolicy creds_policy);
-
-  void NewLeaderMasterDeterminedCb(const Status& status);
 
   // Pointer back to the tablet cache. Populated with location information
   // if the lookup finishes successfully.
@@ -593,19 +622,14 @@ class LookupRpc : public Rpc {
   // Response body.
   GetTableLocationsResponsePB resp_;
 
-  // User-specified callback to invoke when the lookup finishes.
-  //
-  // Always invoked, regardless of success or failure.
-  StatusCallback user_cb_;
-
   // Table to lookup.
   const KuduTable* table_;
 
   // Encoded partition key to lookup.
   string partition_key_;
 
-  // When lookup finishes successfully, the selected tablet is
-  // written here prior to invoking 'user_cb_'.
+  // When lookup finishes successfully, the selected tablet is written here
+  // prior to invoking the user-provided callback.
   scoped_refptr<RemoteTablet>* remote_tablet_;
 
   // Whether this lookup has acquired a master lookup permit.
@@ -625,12 +649,12 @@ LookupRpc::LookupRpc(scoped_refptr<MetaCache> meta_cache,
                      string partition_key,
                      scoped_refptr<RemoteTablet>* remote_tablet,
                      const MonoTime& deadline,
-                     shared_ptr<Messenger> messenger,
                      MetaCache::LookupType lookup_type,
                      ReplicaController::Visibility replica_visibility)
-    : Rpc(deadline, std::move(messenger)),
+    : AsyncLeaderMasterRpc(deadline, table->client(), BackoffType::LINEAR, req_, &resp_,
+          &MasterServiceProxy::GetTableLocationsAsync,
+          "LookupRpc", std::move(user_cb), {}),
       meta_cache_(std::move(meta_cache)),
-      user_cb_(std::move(user_cb)),
       table_(table),
       partition_key_(std::move(partition_key)),
       remote_tablet_(remote_tablet),
@@ -672,34 +696,23 @@ void LookupRpc::SendRpcSlowPath() {
     return;
   }
 
-  // Fill out the request.
+  // The end partition key is left unset intentionally so that we'll prefetch
+  // some additional tablets.
   req_.mutable_table()->set_table_id(table_->id());
   req_.set_partition_key_start(partition_key_);
   req_.set_max_returned_locations(locations_to_fetch());
+  req_.set_intern_ts_infos_in_response(true);
   if (replica_visibility_ == ReplicaController::Visibility::ALL) {
     req_.set_replica_type_filter(master::ANY_REPLICA);
   }
 
-  // The end partition key is left unset intentionally so that we'll prefetch
-  // some additional tablets.
-
-  // See KuduClient::Data::SyncLeaderMasterRpc().
-  MonoTime now = MonoTime::Now();
-  if (retrier().deadline() < now) {
-    SendRpcCb(Status::TimedOut("timed out after deadline expired"));
-    return;
-  }
-  MonoTime rpc_deadline = now + meta_cache_->client_->default_rpc_timeout();
-  mutable_retrier()->mutable_controller()->set_deadline(
-      std::min(rpc_deadline, retrier().deadline()));
-
-  master_proxy()->GetTableLocationsAsync(req_, &resp_,
-                                         mutable_retrier()->mutable_controller(),
-                                         boost::bind(&LookupRpc::SendRpcCb, this, Status::OK()));
+  // Actually send the request.
+  AsyncLeaderMasterRpc::SendRpc();
 }
 
 string LookupRpc::ToString() const {
-  return Substitute("GetTableLocations { table: '$0', partition-key: ($1), attempt: $2 }",
+  return Substitute("$0 { table: '$1', partition-key: ($2), attempt: $3 }",
+                    rpc_name_,
                     table_->name(),
                     MetaCache::DebugLowerBoundPartitionKey(table_, partition_key_),
                     num_attempts());
@@ -709,95 +722,36 @@ void LookupRpc::ResetMasterLeaderAndRetry(CredentialsPolicy creds_policy) {
   table_->client()->data_->ConnectToClusterAsync(
       table_->client(),
       retrier().deadline(),
-      Bind(&LookupRpc::NewLeaderMasterDeterminedCb, Unretained(this)),
+      Bind(&LookupRpc::NewLeaderMasterDeterminedCb, Unretained(this), creds_policy),
       creds_policy);
 }
 
-void LookupRpc::NewLeaderMasterDeterminedCb(const Status& status) {
-  if (status.ok()) {
-    mutable_retrier()->mutable_controller()->Reset();
-    SendRpc();
-  } else {
-    KLOG_EVERY_N_SECS(WARNING, 1) << "Failed to determine new Master: " << status.ToString();
-    mutable_retrier()->DelayedRetry(this, status);
-  }
-}
-
 void LookupRpc::SendRpcCb(const Status& status) {
-  gscoped_ptr<LookupRpc> delete_me(this); // delete on scope exit
+  // If we exit and haven't scheduled a retry, this object should delete
+  // itself.
+  gscoped_ptr<LookupRpc> delete_me(this);
 
-  if (!status.ok()) {
-    // Non-RPC failure. We only support TimedOut for LookupRpc.
-    CHECK(status.IsTimedOut()) << status.ToString();
-  }
-
+  // Check for generic errors.
   Status new_status = status;
-  // Check for generic RPC errors.
-  if (new_status.ok() && mutable_retrier()->HandleResponse(this, &new_status)) {
+  if (RetryOrReconnectIfNecessary(&new_status)) {
     ignore_result(delete_me.release());
     return;
   }
 
-  // Check for specific application response errors.
+  // Check for more application errors.
+  // Note: RetryOrReconnectIfNecessary only checked for generic application
+  // errors. This check is specific to LookupRpc.
   if (new_status.ok() && resp_.has_error()) {
-    if (resp_.error().code() == master::MasterErrorPB::NOT_THE_LEADER ||
-        resp_.error().code() == master::MasterErrorPB::CATALOG_MANAGER_NOT_INITIALIZED) {
-      if (meta_cache_->client_->IsMultiMaster()) {
-        KLOG_EVERY_N_SECS(WARNING, 1) << "Leader Master has changed, re-trying...";
-        ResetMasterLeaderAndRetry(CredentialsPolicy::ANY_CREDENTIALS);
-        ignore_result(delete_me.release());
-        return;
-      }
-    }
     new_status = StatusFromPB(resp_.error().status());
-  }
-
-  // Check for more generic errors (TimedOut can come from multiple places).
-  if (new_status.IsTimedOut()) {
-    if (MonoTime::Now() < retrier().deadline()) {
-      if (meta_cache_->client_->IsMultiMaster()) {
-        KLOG_EVERY_N_SECS(WARNING, 1) << "Leader Master timed out, re-trying...";
-        ResetMasterLeaderAndRetry(CredentialsPolicy::ANY_CREDENTIALS);
-        ignore_result(delete_me.release());
-        return;
-      }
-    } else {
-      // Operation deadline expired during this latest RPC.
-      new_status = new_status.CloneAndPrepend(
-          "timed out after deadline expired");
-    }
-  }
-
-  if (new_status.IsNetworkError()) {
-    if (meta_cache_->client_->IsMultiMaster()) {
-      KLOG_EVERY_N_SECS(WARNING, 1) << "Encountered a network error from the Master: "
-                                    << new_status.ToString() << ", retrying...";
-      ResetMasterLeaderAndRetry(CredentialsPolicy::ANY_CREDENTIALS);
+    if (new_status.IsServiceUnavailable()) {
+      // One or more of the tablets is not running. Retry after some time.
+      mutable_retrier()->DelayedRetry(this, new_status);
       ignore_result(delete_me.release());
       return;
     }
   }
 
-  if (new_status.IsNotAuthorized()) {
-    const rpc::RpcController& controller(retrier().controller());
-    const ErrorStatusPB* err = controller.error_response();
-    if (err && err->has_code() &&
-        err->code() == ErrorStatusPB::FATAL_INVALID_AUTHENTICATION_TOKEN) {
-      KLOG_EVERY_N_SECS(INFO, 1)
-          << "Re-connecting to cluster in attempt to get new authn token";
-      ResetMasterLeaderAndRetry(CredentialsPolicy::PRIMARY_CREDENTIALS);
-      ignore_result(delete_me.release());
-      return;
-    }
-  }
-
-  if (new_status.IsServiceUnavailable()) {
-    // One or more of the tablets is not running; retry after a backoff period.
-    mutable_retrier()->DelayedRetry(this, new_status);
-    ignore_result(delete_me.release());
-    return;
-  }
-
+  // If there were no errors, process the response.
   if (new_status.ok()) {
     MetaCacheEntry entry;
     new_status = meta_cache_->ProcessLookupResponse(*this, &entry, locations_to_fetch());
@@ -808,6 +762,7 @@ void LookupRpc::SendRpcCb(const Status& status) {
       *remote_tablet_ = entry.tablet();
     }
   } else {
+    // Otherwise, prep the final error.
     new_status = new_status.CloneAndPrepend(Substitute("$0 failed", ToString()));
     KLOG_EVERY_N_SECS(WARNING, 1) << new_status.ToString();
   }
@@ -842,6 +797,19 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
     VLOG(3) << "Caching '" << rpc.table_name() << "' entry " << entry.DebugString(rpc.table());
     InsertOrDie(&tablets_by_key, "", entry);
   } else {
+    // First, update the tserver cache, needed for the Refresh calls below.
+    // It's used for backward compatibility.
+    for (const TabletLocationsPB& tablet : tablet_locations) {
+      for (const auto& replicas : tablet.deprecated_replicas()) {
+        UpdateTabletServer(replicas.ts_info());
+      }
+    }
+    // In the case of "interned" replicas, the above 'deprecated_replicas' lists will be empty
+    // and instead we'll need to update from the top-level list of tservers.
+    const auto& ts_infos = rpc.resp().ts_infos();
+    for (const TSInfoPB& ts_info : ts_infos) {
+      UpdateTabletServer(ts_info);
+    }
 
     // The comments below will reference the following diagram:
     //
@@ -896,11 +864,6 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
       // and the entry TTL. If the tablet is unknown, then we need to create a
       // new RemoteTablet for it.
 
-      // First, update the tserver cache, needed for the Refresh calls below.
-      for (const TabletLocationsPB_ReplicaPB& replicas : tablet.replicas()) {
-        UpdateTabletServer(replicas.ts_info());
-      }
-
       const string& tablet_id = tablet.tablet_id();
       scoped_refptr<RemoteTablet> remote = FindPtrOrNull(tablets_by_id_, tablet_id);
       if (remote.get() != nullptr) {
@@ -910,8 +873,9 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
 
         VLOG(3) << "Refreshing tablet " << tablet_id << ": "
                 << pb_util::SecureShortDebugString(tablet);
-        remote->Refresh(ts_cache_, tablet.replicas());
-
+        RETURN_NOT_OK_PREPEND(remote->Refresh(ts_cache_, tablet, ts_infos),
+                              Substitute("failed to refresh locations for tablet $0",
+                                         tablet_id));
         // Update the entry TTL.
         auto& entry = FindOrDie(tablets_by_key, tablet_lower_bound);
         DCHECK(!entry.is_non_covered_range() &&
@@ -928,7 +892,9 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
       Partition partition;
       Partition::FromPB(tablet.partition(), &partition);
       remote = new RemoteTablet(tablet_id, partition);
-      remote->Refresh(ts_cache_, tablet.replicas());
+      RETURN_NOT_OK_PREPEND(remote->Refresh(ts_cache_, tablet, ts_infos),
+                            Substitute("failed to refresh locations for tablet $0",
+                                       tablet_id));
 
       MetaCacheEntry entry(expiration_time, remote);
       VLOG(3) << "Caching '" << rpc.table_name() << "' entry " << entry.DebugString(rpc.table());
@@ -1062,7 +1028,6 @@ void MetaCache::LookupTabletByKey(const KuduTable* table,
                                  std::move(partition_key),
                                  remote_tablet,
                                  deadline,
-                                 client_->data_->messenger_,
                                  lookup_type,
                                  replica_visibility_);
   rpc->SendRpcSlowPath();

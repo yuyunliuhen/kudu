@@ -191,7 +191,7 @@ double WidthByDataSize(const Slice& prev, const Slice& next,
 
   for (const auto& rs_rsi : active) {
     double fraction = StringFractionInRange(rs_rsi.second, prev, next);
-    weight += rs_rsi.second->size_bytes() * fraction;
+    weight += rs_rsi.second->base_and_redos_size_bytes() * fraction;
   }
 
   return weight;
@@ -232,8 +232,12 @@ double ComputeRowsetValue(double width, uint64_t size_bytes) {
 
   // This is an approximation to the expected reduction in rowset count per
   // input rowset. See the compaction policy design doc for more details.
+  // The score is floored at 0 to prevent rowsets that are bigger than the
+  // target size from adding a negative score that discourages height-based
+  // compactions. In extreme circumstances, the overall value could be negative,
+  // which violates a knapsack problem invariant.
   const auto size_score =
-      1 - static_cast<double>(size_bytes) / target_size_bytes;
+      std::max(0.0, 1 - static_cast<double>(size_bytes) / target_size_bytes);
   return width + gamma * size_score;
 }
 
@@ -249,7 +253,8 @@ void RowSetInfo::Collect(const RowSetTree& tree, vector<RowSetInfo>* rsvec) {
 }
 
 void RowSetInfo::ComputeCdfAndCollectOrdered(const RowSetTree& tree,
-                                             double* average_height,
+                                             double* rowset_total_height,
+                                             double* rowset_total_width,
                                              vector<RowSetInfo>* info_by_min_key,
                                              vector<RowSetInfo>* info_by_max_key) {
   DCHECK((info_by_min_key && info_by_max_key) ||
@@ -348,9 +353,9 @@ void RowSetInfo::ComputeCdfAndCollectOrdered(const RowSetTree& tree,
   FinalizeCDFVector(total_width, &info_by_min_key_tmp);
   FinalizeCDFVector(total_width, &info_by_max_key_tmp);
 
-  if (average_height) {
-    *average_height = total_width > 0 ? weighted_height_sum / total_width
-                                      : 0.0;
+  if (rowset_total_height && rowset_total_width) {
+    *rowset_total_height = weighted_height_sum;
+    *rowset_total_width = total_width;
   }
 
   if (info_by_min_key && info_by_max_key) {
@@ -449,9 +454,12 @@ RowSetInfo::RowSetInfo(RowSet* rs, double init_cdf)
       cdf_max_key_(init_cdf),
       extra_(new ExtraData()) {
   extra_->rowset = rs;
-  extra_->size_bytes = rs->OnDiskBaseDataSizeWithRedos();
+  extra_->base_and_redos_size_bytes = rs->OnDiskBaseDataSizeWithRedos();
+  extra_->size_bytes = rs->OnDiskSize();
   extra_->has_bounds = rs->GetBounds(&extra_->min_key, &extra_->max_key).ok();
-  size_mb_ = std::max(implicit_cast<int>(extra_->size_bytes / 1024 / 1024), kMinSizeMb);
+  base_and_redos_size_mb_ =
+      std::max(implicit_cast<int>(extra_->base_and_redos_size_bytes / 1024 / 1024),
+                                  kMinSizeMb);
 }
 
 uint64_t RowSetInfo::size_bytes(const ColumnId& col_id) const {
@@ -461,21 +469,22 @@ uint64_t RowSetInfo::size_bytes(const ColumnId& col_id) const {
 void RowSetInfo::FinalizeCDFVector(double quot, vector<RowSetInfo>* vec) {
   if (quot == 0) return;
   for (RowSetInfo& cdf_rs : *vec) {
-    CHECK_GT(cdf_rs.size_mb_, 0) << "Expected file size to be at least 1MB "
-                                 << "for RowSet " << cdf_rs.rowset()->ToString()
-                                 << ", was " << cdf_rs.size_bytes()
-                                 << " bytes.";
+    CHECK_GT(cdf_rs.base_and_redos_size_mb_, 0)
+        << "Expected file size to be at least 1MB "
+        << "for RowSet " << cdf_rs.rowset()->ToString()
+        << ", was " << cdf_rs.base_and_redos_size_bytes()
+        << " bytes.";
     cdf_rs.cdf_min_key_ /= quot;
     cdf_rs.cdf_max_key_ /= quot;
     cdf_rs.value_ = ComputeRowsetValue(cdf_rs.width(), cdf_rs.extra_->size_bytes);
-    cdf_rs.density_ = cdf_rs.value_ / cdf_rs.size_mb_;
+    cdf_rs.density_ = cdf_rs.value_ / cdf_rs.base_and_redos_size_mb_;
   }
 }
 
 string RowSetInfo::ToString() const {
   string ret;
   ret.append(rowset()->ToString());
-  StringAppendF(&ret, "(% 3dM) [%.04f, %.04f]", size_mb_,
+  StringAppendF(&ret, "(% 3dM) [%.04f, %.04f]", base_and_redos_size_mb_,
                 cdf_min_key_, cdf_max_key_);
   if (extra_->has_bounds) {
     ret.append(" [").append(KUDU_REDACT(Slice(extra_->min_key).ToDebugString()));

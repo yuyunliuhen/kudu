@@ -14,11 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
-import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
 import static org.apache.kudu.test.ClientTestUtil.createFourTabletsTableWithNineRows;
 import static org.apache.kudu.test.ClientTestUtil.getBasicCreateTableOptions;
+import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -33,16 +34,16 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import com.google.common.base.Stopwatch;
 import com.google.common.base.Supplier;
-
-import org.apache.kudu.Schema;
-import org.apache.kudu.test.KuduTestHarness;
-import org.apache.kudu.test.ClientTestUtil;
 import org.junit.Rule;
 import org.junit.Test;
-import org.apache.kudu.client.SessionConfiguration.FlushMode;
-import org.apache.kudu.test.CapturingLogAppender;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.apache.kudu.Schema;
+import org.apache.kudu.client.SessionConfiguration.FlushMode;
+import org.apache.kudu.test.CapturingLogAppender;
+import org.apache.kudu.test.ClientTestUtil;
+import org.apache.kudu.test.KuduTestHarness;
 
 public class ITClientStress {
   private static final Logger LOG = LoggerFactory.getLogger(ITClientStress.class);
@@ -66,7 +67,7 @@ public class ITClientStress {
 
     // Capture logs so we can check that no exceptions are logged.
     CapturingLogAppender cla = new CapturingLogAppender();
-    try (Closeable c = cla.attach()){
+    try (Closeable c = cla.attach()) {
       Stopwatch s = Stopwatch.createStarted();
       while (s.elapsed(TimeUnit.SECONDS) < secondsToRun &&
           thrown.get() == null) {
@@ -105,7 +106,7 @@ public class ITClientStress {
    * Impala 2.8 front-end under a high-concurrency workload. Each query
    * starts a new client, fetches scan tokens, and closes the client.
    */
-  @Test(timeout=60000)
+  @Test(timeout = 300000)
   public void testManyShortClientsGeneratingScanTokens() throws Exception {
     final String TABLE_NAME = "testManyClients";
     final int SECONDS_TO_RUN = 10;
@@ -136,7 +137,7 @@ public class ITClientStress {
    * Stress test which performs upserts from many sessions on different threads
    * sharing the same KuduClient and KuduTable instance.
    */
-  @Test(timeout=60000)
+  @Test(timeout = 300000)
   public void testMultipleSessions() throws Exception {
     final String TABLE_NAME = "testMultipleSessions";
     final int SECONDS_TO_RUN = 10;

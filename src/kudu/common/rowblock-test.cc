@@ -17,7 +17,12 @@
 
 #include "kudu/common/rowblock.h"
 
+#include <cstddef>
+#include <vector>
+
 #include <gtest/gtest.h>
+
+using std::vector;
 
 namespace kudu {
 
@@ -41,6 +46,42 @@ TEST(TestSelectionVector, TestEquals) {
   SelectionVector sv3(5);
   sv3.SetAllTrue();
   ASSERT_NE(sv1, sv3);
+}
+
+// Test that SelectionVector functions that operate on bytes rather
+// than bits work correctly even if we haven't set or unset all bytes en masse.
+TEST(TestSelectionVector, TestNonByteAligned) {
+  SelectionVector sv(3);
+
+  for (size_t i = 0; i < sv.nrows(); i++) {
+    sv.SetRowSelected(i);
+  }
+  ASSERT_EQ(sv.nrows(), sv.CountSelected());
+  ASSERT_TRUE(sv.AnySelected());
+
+  vector<int> sel;
+  sv.GetSelectedRows(&sel);
+  ASSERT_EQ(sv.nrows(), sel.size());
+
+  for (size_t i = 0; i < sv.nrows(); i++) {
+    sv.SetRowUnselected(i);
+  }
+  ASSERT_EQ(0, sv.CountSelected());
+  ASSERT_FALSE(sv.AnySelected());
+  sv.GetSelectedRows(&sel);
+  ASSERT_EQ(0, sel.size());
+}
+
+TEST(TestSelectionVector, TestGetSelectedRows) {
+  vector<int> expected = {1, 4, 9, 10, 18};
+  SelectionVector sv(20);
+  sv.SetAllFalse();
+  for (int i : expected) {
+    sv.SetRowSelected(i);
+  }
+  vector<int> selected;
+  sv.GetSelectedRows(&selected);
+  ASSERT_EQ(expected, selected);
 }
 
 } // namespace kudu

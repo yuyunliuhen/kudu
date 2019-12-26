@@ -14,12 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
+
+import java.net.InetSocketAddress;
 
 import com.google.common.base.Objects;
 import org.apache.yetus.audience.InterfaceAudience;
-
-import java.net.InetSocketAddress;
 
 /**
  * A simple wrapper around InetSocketAddress to prevent
@@ -56,8 +57,12 @@ public class HostAndPort {
 
   @Override
   public boolean equals(Object o) {
-    if (this == o) return true;
-    if (o == null || getClass() != o.getClass()) return false;
+    if (this == o) {
+      return true;
+    }
+    if (!(o instanceof HostAndPort)) {
+      return false;
+    }
     HostAndPort that = (HostAndPort) o;
     return Objects.equal(address, that.address);
   }

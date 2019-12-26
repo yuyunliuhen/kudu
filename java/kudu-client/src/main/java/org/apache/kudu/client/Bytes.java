@@ -29,12 +29,15 @@ package org.apache.kudu.client;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.io.Serializable;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Comparator;
@@ -660,7 +663,7 @@ public final class Bytes {
    */
   private static void reverseBytes(final byte[] b) {
     // Swaps the items until the mid-point is reached.
-    for(int i = 0; i < b.length / 2; i++) {
+    for (int i = 0; i < b.length / 2; i++) {
       byte temp = b[i];
       b[i] = b[b.length - i - 1];
       b[b.length - i - 1] = temp;
@@ -802,7 +805,7 @@ public final class Bytes {
         long longVal = getLong(b, offset);
         return BigDecimal.valueOf(longVal, scale);
       case DecimalUtil.DECIMAL128_SIZE:
-         BigInteger int128Val = getBigInteger(b, offset);
+        BigInteger int128Val = getBigInteger(b, offset);
         return new BigDecimal(int128Val, scale);
       default:
         throw new IllegalArgumentException("Unsupported decimal type size: " + size);
@@ -829,7 +832,8 @@ public final class Bytes {
    * @param offset The offset in the array to start writing at.
    * @throws IndexOutOfBoundsException if the byte array is too small.
    */
-  public static void setBigDecimal(final byte[] b, final BigDecimal n, int precision, final int offset) {
+  public static void setBigDecimal(final byte[] b, final BigDecimal n, int precision,
+                                   final int offset) {
     int size = DecimalUtil.precisionToSize(precision);
     BigInteger bigInt = n.unscaledValue();
     switch (size) {
@@ -997,9 +1001,7 @@ public final class Bytes {
     } catch (UnsupportedOperationException e) {
       return "(failed to extract content of buffer of type " +
           buf.getClass().getName() + ')';
-    } catch (IllegalAccessException e) {
-      throw new AssertionError("Should not happen: " + e);
-    } catch (InvocationTargetException e) {
+    } catch (IllegalAccessException | InvocationTargetException e) {
       throw new AssertionError("Should not happen: " + e);
     }
     return pretty(array);
@@ -1045,21 +1047,37 @@ public final class Bytes {
     try {
       ReplayingDecoderBuffer = Class.forName("org.jboss.netty.handler.codec." +
           "replay.ReplayingDecoderBuffer");
-      Field field = null;
-      try {
-        field = ReplayingDecoderBuffer.getDeclaredField("buffer");
-        field.setAccessible(true);
-      } catch (NoSuchFieldException e) {
-        // Ignore.  Field has been removed in Netty 3.5.1.
-      }
+      Field field = AccessController.doPrivileged(new PrivilegedAction<Field>() {
+        @Override
+        public Field run() {
+          try {
+            Field bufferField = ReplayingDecoderBuffer.getDeclaredField("buffer");
+            bufferField.setAccessible(true);
+            return bufferField;
+          } catch (NoSuchFieldException e) {
+            // Ignore.  Field has been removed in Netty 3.5.1.
+            return null;
+          }
+        }
+      });
       RDB_buffer = field;
       if (field != null) {  // Netty 3.5.0 or before.
         RDB_buf = null;
       } else {
-        RDB_buf = ReplayingDecoderBuffer.getDeclaredMethod("buf");
-        RDB_buf.setAccessible(true);
+        RDB_buf = AccessController.doPrivileged(new PrivilegedAction<Method>() {
+          @Override
+          public Method run() {
+            try {
+              Method bufMethod = ReplayingDecoderBuffer.getDeclaredMethod("buf");
+              bufMethod.setAccessible(true);
+              return bufMethod;
+            } catch (NoSuchMethodException e) {
+              throw new RuntimeException(e);
+            }
+          }
+        });
       }
-    } catch (Exception e) {
+    } catch (ReflectiveOperationException | RuntimeException e) {
       throw new RuntimeException("static initializer failed", e);
     }
   }
@@ -1076,7 +1094,9 @@ public final class Bytes {
   public static final MemCmp MEMCMP = new MemCmp();
 
   /** {@link Comparator} for non-{@code null} byte arrays.  */
-  private static final class MemCmp implements Comparator<byte[]> {
+  private static final class MemCmp implements Comparator<byte[]>, Serializable {
+
+    private static final long serialVersionUID = 914981342853419168L;
 
     private MemCmp() {  // Can't instantiate outside of this class.
     }

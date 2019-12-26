@@ -22,6 +22,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.security.KeyStore;
 import java.security.cert.Certificate;
@@ -42,6 +43,7 @@ import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.handler.codec.embedder.DecoderEmbedder;
 import org.jboss.netty.handler.ssl.SslHandler;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -55,6 +57,7 @@ import org.apache.kudu.rpc.RpcHeader.NegotiatePB.SaslMechanism;
 import org.apache.kudu.rpc.RpcHeader.ResponseHeader;
 import org.apache.kudu.rpc.RpcHeader.RpcFeatureFlag;
 import org.apache.kudu.security.Token.SignedTokenPB;
+import org.apache.kudu.test.junit.RetryRule;
 import org.apache.kudu.util.SecurityUtil;
 
 public class TestNegotiator {
@@ -91,8 +94,11 @@ public class TestNegotiator {
       "nrjox4GmC3JJaA==\n" +
       "-----END CERTIFICATE-----";
 
+  @Rule
+  public RetryRule retryRule = new RetryRule();
+
   @Before
-  public void setup() {
+  public void setUp() {
     serverEngine = createServerEngine();
     serverEngine.setUseClientMode(false);
     secContext = new SecurityContext();
@@ -101,7 +107,7 @@ public class TestNegotiator {
   private void startNegotiation(boolean fakeLoopback) {
     Negotiator negotiator = new Negotiator("127.0.0.1", secContext, false);
     negotiator.overrideLoopbackForTests = fakeLoopback;
-    embedder = new DecoderEmbedder<Object>(negotiator);
+    embedder = new DecoderEmbedder<>(negotiator);
     negotiator.sendHello(embedder.getPipeline().getChannel());
   }
 
@@ -113,8 +119,9 @@ public class TestNegotiator {
 
   KeyStore loadTestKeystore() throws Exception {
     KeyStore ks = KeyStore.getInstance("JKS");
-    ks.load(TestNegotiator.class.getResourceAsStream("/test-key-and-cert.jks"),
-        KEYSTORE_PASSWORD);
+    try (InputStream stream = TestNegotiator.class.getResourceAsStream("/test-key-and-cert.jks")) {
+      ks.load(stream, KEYSTORE_PASSWORD);
+    }
     return ks;
   }
 

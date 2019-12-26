@@ -63,7 +63,7 @@
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/result_tracker.h"
 #include "kudu/tablet/metadata.pb.h"
-#include "kudu/tablet/mvcc.h"
+#include "kudu/tablet/rowset.h"
 #include "kudu/tablet/rowset_metadata.h"
 #include "kudu/tablet/tablet-harness.h"
 #include "kudu/tablet/tablet-test-util.h"
@@ -127,6 +127,8 @@ class BootstrapTest : public LogTestBase {
                                                partition.second,
                                                TABLET_DATA_READY,
                                                /*tombstone_last_logged_opid=*/ boost::none,
+                                               /*extra_config=*/ boost::none,
+                                               /*dimension_label=*/ boost::none,
                                                meta));
     (*meta)->SetLastDurableMrsIdForTests(mrs_id);
     if ((*meta)->GetRowSetForTests(0) != nullptr) {
@@ -198,13 +200,10 @@ class BootstrapTest : public LogTestBase {
 
   void IterateTabletRows(const Tablet* tablet,
                          vector<string>* results) {
-    gscoped_ptr<RowwiseIterator> iter;
-    // TODO: there seems to be something funny with timestamps in this test.
-    // Unless we explicitly scan at a snapshot including all timestamps, we don't
-    // see the bootstrapped operation. This is likely due to KUDU-138 -- perhaps
-    // we aren't properly setting up the clock after bootstrap.
-    MvccSnapshot snap = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
-    ASSERT_OK(tablet->NewRowIterator(schema_, snap, UNORDERED, &iter));
+    unique_ptr<RowwiseIterator> iter;
+    RowIteratorOptions opts;
+    opts.projection = &schema_;
+    ASSERT_OK(tablet->NewRowIterator(std::move(opts), &iter));
     ASSERT_OK(iter->Init(nullptr));
     ASSERT_OK(IterateToStringList(iter.get(), results));
     for (const string& result : *results) {
@@ -325,7 +324,7 @@ TEST_F(BootstrapTest, TestOrphanCommit) {
     // commits.
     ASSERT_OK(AppendCommit(opid));
     log::SegmentSequence segments;
-    ASSERT_OK(log_->reader()->GetSegmentsSnapshot(&segments));
+    log_->reader()->GetSegmentsSnapshot(&segments);
     fs_manager_->env()->DeleteFile(segments[0]->path());
 
     // Untrack the tablet in the data dir manager so upon the next call to
@@ -393,7 +392,7 @@ TEST_F(BootstrapTest, TestNonOrphansAfterOrphanCommit) {
   ASSERT_OK(AppendCommit(opid));
 
   log::SegmentSequence segments;
-  ASSERT_OK(log_->reader()->GetSegmentsSnapshot(&segments));
+  log_->reader()->GetSegmentsSnapshot(&segments);
   fs_manager_->env()->DeleteFile(segments[0]->path());
 
   current_index_ += 2;

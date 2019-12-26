@@ -40,6 +40,27 @@ under the License.
     </tbody>
   </table>
   <h3>Registrations</h3>
+  {{^has_no_ts_states}}
+  <h4>Tablet Server States</h4>
+  <table class='table table-striped'>
+    <thead><tr>
+      <th>UUID</th>
+      <th>State</th>
+      <th>Time entered state</th>
+      <th>Status</th>
+    </tr></thead>
+    <tbody>
+    {{#tserver_states}}
+    <tr>
+      <td>{{#target}}<a href="{{.}}">{{/target}}{{uuid}}{{#target}}</a>{{/target}}</td>
+      <td>{{state}}</td>
+      <td>{{time_entered_state}}</td>
+      <td>{{status}}</td>
+    </tr>
+    {{/tserver_states}}
+    </tbody>
+  </table>
+  {{/has_no_ts_states}}
   {{^has_no_live_ts}}
   <h4>Live Tablet Servers</h4>
   <table class='table table-striped'>
@@ -47,6 +68,7 @@ under the License.
       <th>UUID</th>
       <th>Location</th>
       <th>Time since heartbeat</th>
+      <th>Start time</th>
       <th>Registration</th>
     </tr></thead>
     <tbody>
@@ -55,6 +77,7 @@ under the License.
         <td>{{#target}}<a href="{{.}}">{{/target}}{{uuid}}{{#target}}</a>{{/target}}</td>
         <td>{{location}}</td>
         <td>{{time_since_hb}}</td>
+        <td>{{start_time}}</td>
         <td><pre><code>{{registration}}</code></pre></td>
       </tr>
     {{/live_tservers}}
@@ -72,7 +95,7 @@ under the License.
     <tbody>
     {{#dead_tservers}}
       <tr>
-        <td>{{#target}}<a href="{{.}}">{{/target}}{{uuid}}{{#target}}</a>{{/target}}</td>
+        <td>{{#target}}<a href="{{.}}{{base_url}}">{{/target}}{{uuid}}{{#target}}</a>{{/target}}</td>
         <td>{{time_since_hb}}</td>
         <td><pre><code>{{registration}}</code></pre></td>
       </tr>

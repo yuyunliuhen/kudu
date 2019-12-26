@@ -36,7 +36,6 @@ dependencies {
   optional libs.yetusAnnotations
 
   testCompile project(":kudu-test-utils")
-  testCompile libs.hamcrestCore
   testCompile libs.hiveMetastore
   // The HMS client relies on the MR client-core artifact for JobConf, but only
   // specifies it as an optional dependency. Gradle doesn't pull in optional
@@ -44,8 +43,8 @@ dependencies {
   testCompile libs.hadoopMRClientCore
   testCompile libs.junit
   testCompile libs.log4j
+  testCompile libs.log4jSlf4jImpl
   testCompile libs.mockitoCore
-  testCompile libs.slf4jLog4j12
 }
 
 // Add protobuf files to the proto source set.

@@ -21,6 +21,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
@@ -28,8 +30,10 @@
 #include <gtest/gtest_prod.h>
 
 #include "kudu/common/wire_protocol.pb.h"
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/map-util.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/make_shared.h"
 #include "kudu/util/monotime.h"
@@ -37,6 +41,7 @@
 
 namespace kudu {
 
+class DnsResolver;
 class Sockaddr;
 
 namespace consensus {
@@ -53,6 +58,9 @@ class TabletServerAdminServiceProxy;
 
 namespace master {
 
+// Map of dimension -> tablets number.
+typedef std::unordered_map<std::string, int32_t> TabletNumByDimensionMap;
+
 // Master-side view of a single tablet server.
 //
 // Tracks the last heartbeat, status, instance identifier, location, etc.
@@ -61,12 +69,20 @@ class TSDescriptor : public enable_make_shared<TSDescriptor> {
  public:
   static Status RegisterNew(const NodeInstancePB& instance,
                             const ServerRegistrationPB& registration,
+                            const boost::optional<std::string>& location,
+                            DnsResolver* dns_resolver,
                             std::shared_ptr<TSDescriptor>* desc);
 
   virtual ~TSDescriptor() = default;
 
   // Set the last-heartbeat time to now.
   void UpdateHeartbeatTime();
+
+  // Set whether a full tablet report is needed.
+  void UpdateNeedsFullTabletReport(bool needs_report);
+
+  // Whether a full tablet report is needed from this tablet server.
+  bool needs_full_report() const;
 
   // Return the amount of time since the last heartbeat received
   // from this TS.
@@ -77,7 +93,9 @@ class TSDescriptor : public enable_make_shared<TSDescriptor> {
 
   // Register this tablet server.
   Status Register(const NodeInstancePB& instance,
-                  const ServerRegistrationPB& registration);
+                  const ServerRegistrationPB& registration,
+                  const boost::optional<std::string>& location,
+                  DnsResolver* dns_resolver);
 
   const std::string &permanent_uuid() const { return permanent_uuid_; }
   int64_t latest_seqno() const;
@@ -110,13 +128,28 @@ class TSDescriptor : public enable_make_shared<TSDescriptor> {
   // Set the number of live replicas (i.e. running or bootstrapping).
   void set_num_live_replicas(int n) {
     DCHECK_GE(n, 0);
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard<rw_spinlock> l(lock_);
     num_live_replicas_ = n;
   }
 
+  // Set the number of live replicas in each dimension.
+  void set_num_live_replicas_by_dimension(TabletNumByDimensionMap num_live_tablets_by_dimension) {
+    std::lock_guard<rw_spinlock> l(lock_);
+    num_live_tablets_by_dimension_ = std::move(num_live_tablets_by_dimension);
+  }
+
   // Return the number of live replicas (i.e running or bootstrapping).
-  int num_live_replicas() const {
-    std::lock_guard<simple_spinlock> l(lock_);
+  // If dimension is none, return the total number of replicas in the tablet server.
+  // Otherwise, return the number of replicas in the dimension.
+  int num_live_replicas(const boost::optional<std::string>& dimension = boost::none) const {
+    shared_lock<rw_spinlock> l(lock_);
+    if (dimension) {
+      int32_t num_live_tablets = 0;
+      if (num_live_tablets_by_dimension_) {
+        ignore_result(FindCopy(*num_live_tablets_by_dimension_, *dimension, &num_live_tablets));
+      }
+      return num_live_tablets;
+    }
     return num_live_replicas_;
   }
 
@@ -124,7 +157,7 @@ class TSDescriptor : public enable_make_shared<TSDescriptor> {
   // since the location could change at any time if the tablet server
   // re-registers.
   boost::optional<std::string> location() const {
-    std::lock_guard<simple_spinlock> l(lock_);
+    shared_lock<rw_spinlock> l(lock_);
     return location_;
   }
 
@@ -139,9 +172,6 @@ class TSDescriptor : public enable_make_shared<TSDescriptor> {
   FRIEND_TEST(TestTSDescriptor, TestReplicaCreationsDecay);
   friend class PlacementPolicyTest;
 
-  Status RegisterUnlocked(const NodeInstancePB& instance,
-                          const ServerRegistrationPB& registration);
-
   // Uses DNS to resolve registered hosts to a single Sockaddr.
   // Returns the resolved address as well as the hostname associated with it
   // in 'addr' and 'host'.
@@ -149,13 +179,16 @@ class TSDescriptor : public enable_make_shared<TSDescriptor> {
 
   void DecayRecentReplicaCreationsUnlocked();
 
-  mutable simple_spinlock lock_;
+  mutable rw_spinlock lock_;
 
   const std::string permanent_uuid_;
   int64_t latest_seqno_;
 
   // The last time a heartbeat was received for this node.
   MonoTime last_heartbeat_;
+
+  // Whether the tablet server needs to send a full report.
+  bool needs_full_report_;
 
   // The number of times this tablet server has recently been selected to create a
   // tablet replica. This value decays back to 0 over time.
@@ -165,6 +198,9 @@ class TSDescriptor : public enable_make_shared<TSDescriptor> {
   // The number of live replicas on this host, from the last heartbeat.
   int num_live_replicas_;
 
+  // The number of live replicas in each dimension, from the last heartbeat.
+  boost::optional<TabletNumByDimensionMap> num_live_tablets_by_dimension_;
+
   // The tablet server's location, as determined by the master at registration.
   boost::optional<std::string> location_;
 
@@ -172,6 +208,7 @@ class TSDescriptor : public enable_make_shared<TSDescriptor> {
 
   std::shared_ptr<tserver::TabletServerAdminServiceProxy> ts_admin_proxy_;
   std::shared_ptr<consensus::ConsensusServiceProxy> consensus_proxy_;
+  DnsResolver* dns_resolver_;
 
   DISALLOW_COPY_AND_ASSIGN(TSDescriptor);
 };

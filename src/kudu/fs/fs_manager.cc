@@ -17,8 +17,10 @@
 
 #include "kudu/fs/fs_manager.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <ctime>
+#include <initializer_list>
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,7 +40,6 @@
 #include "kudu/fs/log_block_manager.h"
 #include "kudu/gutil/bind.h"
 #include "kudu/gutil/bind_helpers.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stringprintf.h"
@@ -100,7 +101,6 @@ DEFINE_string(fs_metadata_dir, "",
 TAG_FLAG(fs_metadata_dir, stable);
 
 using kudu::fs::BlockManagerOptions;
-using kudu::fs::ConsistencyCheckBehavior;
 using kudu::fs::CreateBlockOptions;
 using kudu::fs::DataDirManager;
 using kudu::fs::DataDirManagerOptions;
@@ -111,6 +111,7 @@ using kudu::fs::FileBlockManager;
 using kudu::fs::FsReport;
 using kudu::fs::LogBlockManager;
 using kudu::fs::ReadableBlock;
+using kudu::fs::UpdateInstanceBehavior;
 using kudu::fs::WritableBlock;
 using kudu::pb_util::SecureDebugString;
 using std::ostream;
@@ -131,7 +132,6 @@ const char *FsManager::kWalFileNamePrefix = "wal";
 const char *FsManager::kWalsRecoveryDirSuffix = ".recovery";
 const char *FsManager::kTabletMetadataDirName = "tablet-meta";
 const char *FsManager::kDataDirName = "data";
-const char *FsManager::kCorruptedSuffix = ".corrupted";
 const char *FsManager::kInstanceMetadataFileName = "instance";
 const char *FsManager::kConsensusMetadataDirName = "consensus-meta";
 
@@ -140,7 +140,7 @@ FsManagerOpts::FsManagerOpts()
     metadata_root(FLAGS_fs_metadata_dir),
     block_manager_type(FLAGS_block_manager),
     read_only(false),
-    consistency_check(ConsistencyCheckBehavior::ENFORCE_CONSISTENCY) {
+    update_instances(UpdateInstanceBehavior::UPDATE_AND_IGNORE_FAILURES) {
   data_roots = strings::Split(FLAGS_fs_data_dirs, ",", strings::SkipEmpty());
 }
 
@@ -149,7 +149,7 @@ FsManagerOpts::FsManagerOpts(const string& root)
     data_roots({ root }),
     block_manager_type(FLAGS_block_manager),
     read_only(false),
-    consistency_check(ConsistencyCheckBehavior::ENFORCE_CONSISTENCY) {}
+    update_instances(UpdateInstanceBehavior::UPDATE_AND_IGNORE_FAILURES) {}
 
 FsManager::FsManager(Env* env, const string& root_path)
   : env_(DCHECK_NOTNULL(env)),
@@ -162,8 +162,8 @@ FsManager::FsManager(Env* env, FsManagerOpts opts)
     opts_(std::move(opts)),
     error_manager_(new FsErrorManager()),
     initted_(false) {
-  DCHECK(opts_.consistency_check != ConsistencyCheckBehavior::UPDATE_ON_DISK ||
-         !opts_.read_only);
+DCHECK(opts_.update_instances == UpdateInstanceBehavior::DONT_UPDATE ||
+       !opts_.read_only) << "FsManager can only be for updated if not in read-only mode";
 }
 
 FsManager::~FsManager() {}
@@ -312,24 +312,21 @@ void FsManager::InitBlockManager() {
   }
 }
 
-Status FsManager::Open(FsReport* report) {
+Status FsManager::PartialOpen(CanonicalizedRootsList* missing_roots) {
   RETURN_NOT_OK(Init());
 
-  // Load and verify the instance metadata files.
-  //
-  // Done first to minimize side effects in the case that the configured roots
-  // are not yet initialized on disk.
-  CanonicalizedRootsList missing_roots;
   for (auto& root : canonicalized_all_fs_roots_) {
     if (!root.status.ok()) {
       continue;
     }
-    gscoped_ptr<InstanceMetadataPB> pb(new InstanceMetadataPB);
+    unique_ptr<InstanceMetadataPB> pb(new InstanceMetadataPB);
     Status s = pb_util::ReadPBContainerFromPath(env_, GetInstanceMetadataPath(root.path),
                                                 pb.get());
     if (PREDICT_FALSE(!s.ok())) {
       if (s.IsNotFound()) {
-        missing_roots.emplace_back(root);
+        if (missing_roots) {
+          missing_roots->emplace_back(root);
+        }
         continue;
       }
       if (s.IsDiskFailure()) {
@@ -352,6 +349,16 @@ Status FsManager::Open(FsReport* report) {
   if (!metadata_) {
     return Status::NotFound("could not find a healthy instance file");
   }
+  return Status::OK();
+}
+
+Status FsManager::Open(FsReport* report) {
+  // Load and verify the instance metadata files.
+  //
+  // Done first to minimize side effects in the case that the configured roots
+  // are not yet initialized on disk.
+  CanonicalizedRootsList missing_roots;
+  RETURN_NOT_OK(PartialOpen(&missing_roots));
 
   // Ensure all of the ancillary directories exist.
   vector<string> ancillary_dirs = { GetWalsRootDir(),
@@ -383,22 +390,30 @@ Status FsManager::Open(FsReport* report) {
   });
 
   // Create any missing roots, if desired.
-  if (opts_.consistency_check == ConsistencyCheckBehavior::UPDATE_ON_DISK) {
-    RETURN_NOT_OK_PREPEND(CreateFileSystemRoots(
-        missing_roots, *metadata_, &created_dirs, &created_files),
-                          "unable to create missing filesystem roots");
+  if (!opts_.read_only &&
+      opts_.update_instances != UpdateInstanceBehavior::DONT_UPDATE) {
+    Status s = CreateFileSystemRoots(
+        missing_roots, *metadata_, &created_dirs, &created_files);
+    static const string kUnableToCreateMsg = "unable to create missing filesystem roots";
+    if (opts_.update_instances == UpdateInstanceBehavior::UPDATE_AND_IGNORE_FAILURES) {
+      // We only warn on error here -- regardless of errors, we might be in
+      // good enough shape to open the DataDirManager.
+      WARN_NOT_OK(s, kUnableToCreateMsg);
+    } else if (opts_.update_instances == UpdateInstanceBehavior::UPDATE_AND_ERROR_ON_FAILURE) {
+      RETURN_NOT_OK_PREPEND(s, kUnableToCreateMsg);
+    }
   }
 
   // Open the directory manager if it has not been opened already.
   if (!dd_manager_) {
     DataDirManagerOptions dm_opts;
     dm_opts.metric_entity = opts_.metric_entity;
-    dm_opts.block_manager_type = opts_.block_manager_type;
     dm_opts.read_only = opts_.read_only;
-    dm_opts.consistency_check = opts_.consistency_check;
+    dm_opts.dir_type = opts_.block_manager_type;
+    dm_opts.update_instances = opts_.update_instances;
     LOG_TIMING(INFO, "opening directory manager") {
       RETURN_NOT_OK(DataDirManager::OpenExisting(env_,
-          canonicalized_data_fs_roots_, std::move(dm_opts), &dd_manager_));
+          canonicalized_data_fs_roots_, dm_opts, &dd_manager_));
     }
   }
 
@@ -412,7 +427,7 @@ Status FsManager::Open(FsReport* report) {
 
   // Set an initial error handler to mark data directories as failed.
   error_manager_->SetErrorNotificationCb(ErrorHandlerType::DISK_ERROR,
-      Bind(&DataDirManager::MarkDataDirFailedByUuid, Unretained(dd_manager_.get())));
+      Bind(&DataDirManager::MarkDirFailedByUuid, Unretained(dd_manager_.get())));
 
   // Finally, initialize and open the block manager.
   InitBlockManager();
@@ -429,7 +444,7 @@ Status FsManager::Open(FsReport* report) {
   if (FLAGS_enable_data_block_fsync) {
     // Files/directories created by the directory manager in the fs roots have
     // been synchronized, so now is a good time to sync the roots themselves.
-    WARN_NOT_OK(env_util::SyncAllParentDirs(env_, created_dirs, created_dirs),
+    WARN_NOT_OK(env_util::SyncAllParentDirs(env_, created_dirs, created_files),
                 "could not sync newly created fs roots");
   }
 
@@ -502,7 +517,7 @@ Status FsManager::CreateInitialFileSystemLayout(boost::optional<string> uuid) {
   dm_opts.read_only = opts_.read_only;
   LOG_TIMING(INFO, "creating directory manager") {
     RETURN_NOT_OK_PREPEND(DataDirManager::CreateNew(
-        env_, canonicalized_data_fs_roots_, std::move(dm_opts), &dd_manager_),
+        env_, canonicalized_data_fs_roots_, dm_opts, &dd_manager_),
                           "Unable to create directory manager");
   }
 
@@ -610,7 +625,7 @@ const string& FsManager::uuid() const {
 
 vector<string> FsManager::GetDataRootDirs() const {
   // Get the data subdirectory for each data root.
-  return dd_manager_->GetDataDirs();
+  return dd_manager_->GetDirs();
 }
 
 string FsManager::GetTabletMetadataDir() const {

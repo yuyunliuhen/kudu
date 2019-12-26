@@ -20,6 +20,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -33,9 +34,13 @@
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/replica_management.pb.h"
+#include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/hms/hms_catalog.h"
+#include "kudu/master/authz_provider.h"
 #include "kudu/master/catalog_manager.h"
+#include "kudu/master/location_cache.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master_cert_authority.h"
@@ -47,11 +52,13 @@
 #include "kudu/security/token_signer.h"
 #include "kudu/security/token_verifier.h"
 #include "kudu/server/server_base.h"
+#include "kudu/util/debug/trace_event.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 
 DECLARE_bool(hive_metastore_sasl_enabled);
@@ -76,11 +83,26 @@ DEFINE_bool(master_non_leader_masters_propagate_tsk, false,
             "tests scenarios only and should not be used elsewhere.");
 TAG_FLAG(master_non_leader_masters_propagate_tsk, hidden);
 
+DEFINE_bool(master_client_location_assignment_enabled, true,
+            "Whether masters assign locations to connecting clients. "
+            "By default they do if the location assignment command is set, "
+            "but setting this flag to 'false' makes masters assign "
+            "locations only to tablet servers, not clients.");
+TAG_FLAG(master_client_location_assignment_enabled, advanced);
+TAG_FLAG(master_client_location_assignment_enabled, runtime);
+
+DEFINE_bool(master_support_authz_tokens, true,
+            "Whether the master supports generating authz tokens. Used for "
+            "testing version compatibility in the client.");
+TAG_FLAG(master_support_authz_tokens, hidden);
+
+using boost::make_optional;
 using google::protobuf::Message;
 using kudu::consensus::ReplicaManagementInfoPB;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
 using kudu::security::SignedTokenPB;
+using kudu::security::TablePrivilegePB;
 using kudu::server::ServerBase;
 using std::shared_ptr;
 using std::string;
@@ -100,6 +122,22 @@ void CheckRespErrorOrSetUnknown(const Status& s, RespClass* resp) {
   if (PREDICT_FALSE(!s.ok() && !resp->has_error())) {
     StatusToPB(s, resp->mutable_error()->mutable_status());
     resp->mutable_error()->set_code(MasterErrorPB::UNKNOWN_ERROR);
+  }
+}
+
+// Sets 'to_state' to the end state of the given 'change' and returns true.
+// Returns false if the 'change' isn't supported.
+bool StateChangeToTServerState(const TServerStateChangePB::StateChange& change,
+                               TServerStatePB* to_state) {
+  switch (change) {
+    case TServerStateChangePB::ENTER_MAINTENANCE_MODE:
+      *to_state = TServerStatePB::MAINTENANCE_MODE;
+      return true;
+    case TServerStateChangePB::EXIT_MAINTENANCE_MODE:
+      *to_state = TServerStatePB::NONE;
+      return true;
+    default:
+      return false;
   }
 }
 
@@ -141,6 +179,55 @@ bool MasterServiceImpl::AuthorizeSuperUser(const Message* /*req*/,
 void MasterServiceImpl::Ping(const PingRequestPB* /*req*/,
                              PingResponsePB* /*resp*/,
                              rpc::RpcContext* rpc) {
+  rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::ChangeTServerState(const ChangeTServerStateRequestPB* req,
+                                           ChangeTServerStateResponsePB* resp,
+                                           rpc::RpcContext* rpc) {
+  // Do some basic checking on the contents of the request.
+  Status s;
+  auto respond_error = MakeScopedCleanup([&] {
+    if (PREDICT_FALSE(!s.ok())) {
+      rpc->RespondFailure(s);
+    }
+  });
+  if (!req->has_change()) {
+    s = Status::InvalidArgument("request must contain tserver state change");
+    return;
+  }
+  const auto& ts_state_change = req->change();
+  if (!ts_state_change.has_uuid()) {
+    s = Status::InvalidArgument("uuid not provided");
+    return;
+  }
+  const auto& ts_uuid = ts_state_change.uuid();
+  if (!ts_state_change.has_change()) {
+    s = Status::InvalidArgument(Substitute("state change not provided for $0", ts_uuid));
+    return;
+  }
+  const auto& change = ts_state_change.change();
+  TServerStatePB to_state;
+  if (!StateChangeToTServerState(change, &to_state)) {
+    s = Status::InvalidArgument(Substitute("invalid state change: $0", change));
+    return;
+  }
+  respond_error.cancel();
+
+  // Make sure we're the leader.
+  CatalogManager* catalog_manager = server_->catalog_manager();
+  CatalogManager::ScopedLeaderSharedLock l(catalog_manager);
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+
+  // Set the appropriate state for the given tserver.
+  s = server_->ts_manager()->SetTServerState(ts_uuid, to_state,
+      req->handle_missing_tserver(), server_->catalog_manager()->sys_catalog());
+  if (PREDICT_FALSE(!s.ok())) {
+    rpc->RespondFailure(s);
+    return;
+  }
   rpc->RespondSuccess();
 }
 
@@ -195,6 +282,7 @@ void MasterServiceImpl::TSHeartbeat(const TSHeartbeatRequestPB* req,
     }
     Status s = server_->ts_manager()->RegisterTS(req->common().ts_instance(),
                                                  req->registration(),
+                                                 server_->dns_resolver(),
                                                  &ts_desc);
     if (!s.ok()) {
       LOG(WARNING) << Substitute("Unable to register tserver ($0): $1",
@@ -230,6 +318,9 @@ void MasterServiceImpl::TSHeartbeat(const TSHeartbeatRequestPB* req,
   // 4. Update tserver soft state based on the heartbeat contents.
   ts_desc->UpdateHeartbeatTime();
   ts_desc->set_num_live_replicas(req->num_live_tablets());
+  ts_desc->set_num_live_replicas_by_dimension(
+      TabletNumByDimensionMap(req->num_live_tablets_by_dimension().begin(),
+                              req->num_live_tablets_by_dimension().end()));
 
   // 5. Only leaders handle tablet reports.
   if (is_leader_master && req->has_tablet_report()) {
@@ -238,6 +329,13 @@ void MasterServiceImpl::TSHeartbeat(const TSHeartbeatRequestPB* req,
     if (!s.ok()) {
       rpc->RespondFailure(s.CloneAndPrepend("Failed to process tablet report"));
       return;
+    }
+    // If we previously needed a full tablet report for the tserver (e.g.
+    // because we need to recheck replica states after exiting from maintenance
+    // mode) and have just received a full report, mark that we no longer need
+    // a full tablet report.
+    if (!req->tablet_report().is_incremental()) {
+      ts_desc->UpdateNeedsFullTabletReport(false);
     }
   }
 
@@ -268,6 +366,13 @@ void MasterServiceImpl::TSHeartbeat(const TSHeartbeatRequestPB* req,
     }
   }
 
+  // 8. Check if we need a full tablet report (e.g. the tablet server just
+  //    exited maintenance mode and needs to check whether any replicas need to
+  //    be moved).
+  if (is_leader_master && ts_desc->needs_full_report()) {
+    resp->set_needs_full_tablet_report(true);
+  }
+
   rpc->RespondSuccess();
 }
 
@@ -283,13 +388,15 @@ void MasterServiceImpl::GetTabletLocations(const GetTabletLocationsRequestPB* re
     SleepFor(MonoDelta::FromMilliseconds(FLAGS_master_inject_latency_on_tablet_lookups_ms));
   }
 
-  ServerRegistrationPB reg;
-  vector<TSDescriptor*> locs;
+  CatalogManager::TSInfosDict infos_dict;
   for (const string& tablet_id : req->tablet_ids()) {
     // TODO(todd): once we have catalog data. ACL checks would also go here, probably.
     TabletLocationsPB* locs_pb = resp->add_tablet_locations();
     Status s = server_->catalog_manager()->GetTabletLocations(
-        tablet_id, req->replica_type_filter(), locs_pb);
+        tablet_id, req->replica_type_filter(),
+        locs_pb,
+        req->intern_ts_infos_in_response() ? &infos_dict : nullptr,
+        make_optional<const string&>(rpc->remote_user().username()));
     if (!s.ok()) {
       resp->mutable_tablet_locations()->RemoveLast();
 
@@ -297,6 +404,9 @@ void MasterServiceImpl::GetTabletLocations(const GetTabletLocationsRequestPB* re
       err->set_tablet_id(tablet_id);
       StatusToPB(s, err->mutable_status());
     }
+  }
+  for (auto& pb : infos_dict.ts_info_pbs) {
+    resp->mutable_ts_infos()->AddAllocated(pb.release());
   }
 
   rpc->RespondSuccess();
@@ -323,7 +433,8 @@ void MasterServiceImpl::IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
     return;
   }
 
-  Status s = server_->catalog_manager()->IsCreateTableDone(req, resp);
+  Status s = server_->catalog_manager()->IsCreateTableDone(
+      req, resp, make_optional<const string&>(rpc->remote_user().username()));
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -362,7 +473,8 @@ void MasterServiceImpl::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
     return;
   }
 
-  Status s = server_->catalog_manager()->IsAlterTableDone(req, resp, rpc);
+  Status s = server_->catalog_manager()->IsAlterTableDone(
+      req, resp, make_optional<const string&>(rpc->remote_user().username()));
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -375,7 +487,21 @@ void MasterServiceImpl::ListTables(const ListTablesRequestPB* req,
     return;
   }
 
-  Status s = server_->catalog_manager()->ListTables(req, resp);
+  Status s = server_->catalog_manager()->ListTables(
+      req, resp, make_optional<const string&>(rpc->remote_user().username()));
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::GetTableStatistics(const GetTableStatisticsRequestPB* req,
+                                           GetTableStatisticsResponsePB* resp,
+                                           rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+  Status s = server_->catalog_manager()->GetTableStatistics(
+      req, resp, make_optional<const string&>(rpc->remote_user().username()));
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -383,6 +509,9 @@ void MasterServiceImpl::ListTables(const ListTablesRequestPB* req,
 void MasterServiceImpl::GetTableLocations(const GetTableLocationsRequestPB* req,
                                           GetTableLocationsResponsePB* resp,
                                           rpc::RpcContext* rpc) {
+  TRACE_EVENT1("master", "GetTableLocations",
+               "requestor", rpc->requestor_string());
+
   CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
   if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
     return;
@@ -391,7 +520,8 @@ void MasterServiceImpl::GetTableLocations(const GetTableLocationsRequestPB* req,
   if (PREDICT_FALSE(FLAGS_master_inject_latency_on_tablet_lookups_ms > 0)) {
     SleepFor(MonoDelta::FromMilliseconds(FLAGS_master_inject_latency_on_tablet_lookups_ms));
   }
-  Status s = server_->catalog_manager()->GetTableLocations(req, resp);
+  Status s = server_->catalog_manager()->GetTableLocations(
+      req, resp, make_optional<const string&>(rpc->remote_user().username()));
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -404,15 +534,25 @@ void MasterServiceImpl::GetTableSchema(const GetTableSchemaRequestPB* req,
     return;
   }
 
-  Status s = server_->catalog_manager()->GetTableSchema(req, resp);
+  Status s = server_->catalog_manager()->GetTableSchema(
+      req, resp, make_optional<const string&>(rpc->remote_user().username()),
+      FLAGS_master_support_authz_tokens ? server_->token_signer() : nullptr);
   CheckRespErrorOrSetUnknown(s, resp);
+  if (resp->has_error()) {
+    // If there was an application error, respond to the RPC.
+    rpc->RespondSuccess();
+    return;
+  }
   rpc->RespondSuccess();
 }
 
 void MasterServiceImpl::ListTabletServers(const ListTabletServersRequestPB* req,
                                           ListTabletServersResponsePB* resp,
                                           rpc::RpcContext* rpc) {
-  vector<std::shared_ptr<TSDescriptor> > descs;
+  TSManager* ts_manager = server_->ts_manager();
+  TServerStateMap states = req->include_states() ?
+      ts_manager->GetTServerStates() : TServerStateMap();
+  vector<std::shared_ptr<TSDescriptor>> descs;
   server_->ts_manager()->GetAllDescriptors(&descs);
   for (const std::shared_ptr<TSDescriptor>& desc : descs) {
     ListTabletServersResponsePB::Entry* entry = resp->add_servers();
@@ -420,6 +560,26 @@ void MasterServiceImpl::ListTabletServers(const ListTabletServersRequestPB* req,
     desc->GetRegistration(entry->mutable_registration());
     entry->set_millis_since_heartbeat(desc->TimeSinceHeartbeat().ToMilliseconds());
     if (desc->location()) entry->set_location(desc->location().get());
+
+    // If we need to return states, do so.
+    const auto& uuid = desc->permanent_uuid();
+    entry->set_state(FindWithDefault(states, uuid, { TServerStatePB::NONE, -1 }).first);
+    states.erase(uuid);
+  }
+  // If there are any states left (e.g. they don't correspond to a registered
+  // server), report them. Set a bogus seqno, since the servers have not
+  // registered.
+  for (const auto& ts_and_state_timestamp : states) {
+    const auto& ts = ts_and_state_timestamp.first;
+    const auto& state_and_timestamp = ts_and_state_timestamp.second;
+    ListTabletServersResponsePB::Entry* entry = resp->add_servers();
+    NodeInstancePB* instance = entry->mutable_instance_id();
+    instance->set_permanent_uuid(ts);
+    instance->set_instance_seqno(-1);
+    entry->set_millis_since_heartbeat(-1);
+    // Note: The state map should only track non-NONE states.
+    DCHECK_NE(TServerStatePB::NONE, state_and_timestamp.first);
+    entry->set_state(state_and_timestamp.first);
   }
   rpc->RespondSuccess();
 }
@@ -519,7 +679,27 @@ void MasterServiceImpl::ConnectToMaster(const ConnectToMasterRequestPB* /*req*/,
     auto* metastore_config = resp->mutable_hms_config();
     metastore_config->set_hms_uris(FLAGS_hive_metastore_uris);
     metastore_config->set_hms_sasl_enabled(FLAGS_hive_metastore_sasl_enabled);
-    // TODO(dan): set the hms_uuid field.
+    string uuid;
+    if (server_->catalog_manager()->HmsCatalog()->GetUuid(&uuid).ok()) {
+      metastore_config->set_hms_uuid(std::move(uuid));
+    }
+  }
+
+  // Assign a location to the client if needed.
+  auto* location_cache = server_->location_cache();
+  if (location_cache != nullptr &&
+      FLAGS_master_client_location_assignment_enabled) {
+    string location;
+    const auto s = location_cache->GetLocation(
+        rpc->remote_address().host(), &location);
+    if (s.ok()) {
+      resp->set_client_location(location);
+    } else {
+      LOG(WARNING) << Substitute("unable to assign location to client $0@$1: $2",
+                                 rpc->remote_user().ToString(),
+                                 rpc->remote_address().ToString(),
+                                 s.ToString());
+    }
   }
 
   // Rather than consulting the current consensus role, instead base it
@@ -546,12 +726,25 @@ void MasterServiceImpl::ReplaceTablet(const ReplaceTabletRequestPB* req,
   rpc->RespondSuccess();
 }
 
+void MasterServiceImpl::ResetAuthzCache(
+    const ResetAuthzCacheRequestPB* /* req */,
+    ResetAuthzCacheResponsePB* resp,
+    rpc::RpcContext* rpc) {
+  LOG(INFO) << Substitute("request to reset authz privileges cache from $0",
+                          rpc->requestor_string());
+  CheckRespErrorOrSetUnknown(
+      server_->catalog_manager()->authz_provider()->ResetCache(), resp);
+  rpc->RespondSuccess();
+}
+
 bool MasterServiceImpl::SupportsFeature(uint32_t feature) const {
   switch (feature) {
     case MasterFeatures::RANGE_PARTITION_BOUNDS:    FALLTHROUGH_INTENDED;
     case MasterFeatures::ADD_DROP_RANGE_PARTITIONS: FALLTHROUGH_INTENDED;
     case MasterFeatures::REPLICA_MANAGEMENT:
       return true;
+    case MasterFeatures::GENERATE_AUTHZ_TOKEN:
+      return FLAGS_master_support_authz_tokens;
     case MasterFeatures::CONNECT_TO_MASTER:
       return FLAGS_master_support_connect_to_master_rpc;
     default:

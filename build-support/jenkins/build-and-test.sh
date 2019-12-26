@@ -22,7 +22,7 @@
 #
 # Environment variables may be used to customize operation:
 #   BUILD_TYPE: Default: DEBUG
-#     Maybe be one of ASAN|TSAN|DEBUG|RELEASE|COVERAGE|LINT|IWYU
+#     Maybe be one of ASAN|TSAN|DEBUG|RELEASE|COVERAGE|LINT|IWYU|TIDY
 #
 #   KUDU_ALLOW_SLOW_TESTS   Default: 1
 #     Runs the "slow" version of the unit tests. Set to 0 to
@@ -65,15 +65,23 @@
 #     option is not mutually exclusive from BUILD_PYTHON. If both options
 #     are set (default), then both will be run.
 #
+#   PIP_FLAGS  Default: ""
+#     Extra flags which are passed to 'pip' when setting up the build
+#     environment for the Python wrapper.
+#
 #   PIP_INSTALL_FLAGS  Default: ""
 #     Extra flags which are passed to 'pip install' when setting up the build
-#     environment for the Python wrapper.
+#     environment for the Python wrapper. Python arguments are
+#     context-dependent so sadly we can't reuse PIP_FLAGS here.
 #
 #   GRADLE_FLAGS       Default: ""
 #     Extra flags which are passed to 'gradle' when running Gradle commands.
 #
 #   ERROR_ON_TEST_FAILURE    Default: 1
 #     Whether test failures will cause this script to return an error.
+#
+#   KUDU_REPORT_TEST_RESULTS Default: 0
+#     If non-zero, tests are reported to the central test server.
 
 # If a commit messages contains a line that says 'DONT_BUILD', exit
 # immediately.
@@ -154,26 +162,10 @@ if [ -n "$BUILD_ID" ]; then
   trap cleanup EXIT
 fi
 
-THIRDPARTY_TYPE=
-if [ "$BUILD_TYPE" = "TSAN" ]; then
-  THIRDPARTY_TYPE=tsan
-fi
-$SOURCE_ROOT/build-support/enable_devtoolset.sh thirdparty/build-if-necessary.sh $THIRDPARTY_TYPE
-
-THIRDPARTY_BIN=$(pwd)/thirdparty/installed/common/bin
-export PPROF_PATH=$THIRDPARTY_BIN/pprof
-
-if which ccache >/dev/null ; then
-  CLANG=$(pwd)/build-support/ccache-clang/clang
-else
-  CLANG=$(pwd)/thirdparty/clang-toolchain/bin/clang
-fi
-
 # Configure the build
 #
 # ASAN/TSAN can't build the Python bindings because the exported Kudu client
 # library (which the bindings depend on) is missing ASAN/TSAN symbols.
-cd $BUILD_ROOT
 if [ "$BUILD_TYPE" = "ASAN" ]; then
   USE_CLANG=1
   CMAKE_BUILD=fastdebug
@@ -202,9 +194,86 @@ elif [ "$BUILD_TYPE" = "LINT" ]; then
 elif [ "$BUILD_TYPE" = "IWYU" ]; then
   USE_CLANG=1
   CMAKE_BUILD=debug
+elif [ "$BUILD_TYPE" = "TIDY" ]; then
+  USE_CLANG=1
+  CMAKE_BUILD=debug
+  BUILD_JAVA=0
+  BUILD_PYTHON=0
+  BUILD_PYTHON3=0
+  BUILD_GRADLE=0
 else
   # Must be DEBUG or RELEASE
   CMAKE_BUILD=$BUILD_TYPE
+fi
+
+# If we are supposed to be resistant to flaky tests or run just flaky tests,
+# we need to fetch the list.
+if [ "$RUN_FLAKY_ONLY" == "1" -o "$KUDU_FLAKY_TEST_ATTEMPTS" -gt 1 ]; then
+  export KUDU_FLAKY_TEST_LIST=$BUILD_ROOT/flaky-tests.txt
+  mkdir -p $(dirname $KUDU_FLAKY_TEST_LIST)
+  if list_flaky_tests > $KUDU_FLAKY_TEST_LIST; then
+    echo The list of flaky tests:
+    echo ------------------------------------------------------------
+    cat $KUDU_FLAKY_TEST_LIST
+    echo
+    echo ------------------------------------------------------------
+  else
+    echo "Could not fetch flaky tests list."
+    if [ "$RUN_FLAKY_ONLY" == "1" ]; then
+      exit 1
+    fi
+
+    echo No list of flaky tests, disabling the flaky test resistance.
+    export KUDU_FLAKY_TEST_ATTEMPTS=1
+  fi
+
+  if [ "$RUN_FLAKY_ONLY" == "1" ]; then
+    test_regex=$(perl -e '
+      chomp(my @lines = <>);
+      print join("|", map { "^" . quotemeta($_) } @lines);
+     ' $KUDU_FLAKY_TEST_LIST)
+    if [ -z "$test_regex" ]; then
+      echo No tests are flaky.
+      exit 0
+    fi
+
+    # Set up ctest/gradle to run only those tests found in the flaky test list.
+    #
+    # Note: the flaky test list contains both C++ and Java tests and we pass it
+    # in its entirety to both ctest and gradle. This is safe because:
+    # 1. There are no test name collisions between C++ and Java tests.
+    # 2. Both ctest and gradle will happily ignore tests they can't find.
+    #
+    # If either of these assumptions changes, we'll need to explicitly split the
+    # test list into two lists, either here or in the test result server.
+    EXTRA_TEST_FLAGS="$EXTRA_TEST_FLAGS -R $test_regex"
+    while IFS="" read t || [ -n "$t" ]
+    do
+      EXTRA_GRADLE_TEST_FLAGS="--tests $t $EXTRA_GRADLE_TEST_FLAGS"
+    done < $KUDU_FLAKY_TEST_LIST
+
+    # We don't support detecting python flaky tests at the moment.
+    echo "RUN_FLAKY_ONLY=1: running flaky tests only, disabling python build."
+    BUILD_PYTHON=0
+    BUILD_PYTHON3=0
+  elif [ "$KUDU_FLAKY_TEST_ATTEMPTS" -gt 1 ]; then
+    echo Will retry the flaky tests up to $KUDU_FLAKY_TEST_ATTEMPTS times.
+  fi
+fi
+
+THIRDPARTY_TYPE=
+if [ "$BUILD_TYPE" = "TSAN" ]; then
+  THIRDPARTY_TYPE=tsan
+fi
+$SOURCE_ROOT/build-support/enable_devtoolset.sh thirdparty/build-if-necessary.sh $THIRDPARTY_TYPE
+
+THIRDPARTY_BIN=$(pwd)/thirdparty/installed/common/bin
+export PPROF_PATH=$THIRDPARTY_BIN/pprof
+
+if which ccache >/dev/null ; then
+  CLANG=$(pwd)/build-support/ccache-clang/clang
+else
+  CLANG=$(pwd)/thirdparty/clang-toolchain/bin/clang
 fi
 
 # Assemble the cmake command line, starting with environment variables.
@@ -234,12 +303,44 @@ if [ -n "$EXTRA_BUILD_FLAGS" ]; then
   CMAKE="$CMAKE $EXTRA_BUILD_FLAGS"
 fi
 CMAKE="$CMAKE $SOURCE_ROOT"
+cd $BUILD_ROOT
 $CMAKE
 
 # Create empty test logs or else Jenkins fails to archive artifacts, which
 # results in the build failing.
 mkdir -p Testing/Temporary
 mkdir -p $TEST_LOGDIR
+
+if [ -n "$KUDU_REPORT_TEST_RESULTS" ] && [ "$KUDU_REPORT_TEST_RESULTS" -ne 0 ]; then
+  # Export environment variables needed for flaky test reporting.
+  #
+  # The actual reporting happens in the test runners themselves.
+
+  # On Jenkins, we'll have this variable set. Otherwise,
+  # report the build tag as non-jenkins.
+  export BUILD_TAG=${BUILD_TAG:-non-jenkins}
+
+  # Figure out the current git revision, and append a "-dirty" tag if it's
+  # not a pristine checkout.
+  GIT_REVISION=$(cd $SOURCE_ROOT && git rev-parse HEAD)
+  if ! ( cd $SOURCE_ROOT && git diff --quiet .  && git diff --cached --quiet . ) ; then
+    GIT_REVISION="${GIT_REVISION}-dirty"
+  fi
+  export GIT_REVISION
+
+  # Parse out our "build config" - a space-separated list of tags
+  # which include the cmake build type as well as the list of configured
+  # sanitizers.
+
+  # Define BUILD_CONFIG for flaky test reporting.
+  BUILD_CONFIG="$CMAKE_BUILD"
+  if [ "$BUILD_TYPE" = "ASAN" ]; then
+    BUILD_CONFIG="$BUILD_CONFIG asan ubsan"
+  elif [ "$BUILD_TYPE" = "TSAN" ]; then
+    BUILD_CONFIG="$BUILD_CONFIG tsan"
+  fi
+  export BUILD_CONFIG
+fi
 
 # Short circuit for LINT builds.
 if [ "$BUILD_TYPE" = "LINT" ]; then
@@ -254,27 +355,18 @@ if [ "$BUILD_TYPE" = "IWYU" ]; then
   exit $?
 fi
 
+# Short circuit for TIDY builds: run the clang-tidy tool on the C++ source
+# files in the HEAD revision for the gerrit branch.
+if [ "$BUILD_TYPE" = "TIDY" ]; then
+  make -j$NUM_PROCS generated-headers 2>&1 | tee $TEST_LOGDIR/tidy.log
+  $SOURCE_ROOT/build-support/clang_tidy_gerrit.py HEAD 2>&1 | \
+      tee -a $TEST_LOGDIR/tidy.log
+  exit $?
+fi
+
 # Only enable test core dumps for certain build types.
 if [ "$BUILD_TYPE" != "ASAN" ]; then
   export KUDU_TEST_ULIMIT_CORE=unlimited
-fi
-
-# If we are supposed to be resistant to flaky tests, we need to fetch the
-# list of tests to ignore
-if [ "$KUDU_FLAKY_TEST_ATTEMPTS" -gt 1 ]; then
-  echo Fetching flaky test list...
-  export KUDU_FLAKY_TEST_LIST=$BUILD_ROOT/flaky-tests.txt
-  mkdir -p $(dirname $KUDU_FLAKY_TEST_LIST)
-  echo -n > $KUDU_FLAKY_TEST_LIST
-    if [ -n "$TEST_RESULT_SERVER" ] && \
-        list_flaky_tests > $KUDU_FLAKY_TEST_LIST ; then
-    echo Will retry flaky tests up to $KUDU_FLAKY_TEST_ATTEMPTS times:
-    cat $KUDU_FLAKY_TEST_LIST
-    echo ----------
-  else
-    echo Unable to fetch flaky test list. Disabling flaky test resistance.
-    export KUDU_FLAKY_TEST_ATTEMPTS=1
-  fi
 fi
 
 # our tests leave lots of data lying around, clean up before we run
@@ -292,43 +384,12 @@ make -j$NUM_PROCS 2>&1 | tee build.log
 # If compilation succeeds, try to run all remaining steps despite any failures.
 set +e
 
-# Run tests
-if [ "$RUN_FLAKY_ONLY" == "1" ] ; then
-  if [ -z "$TEST_RESULT_SERVER" ]; then
-    echo Must set TEST_RESULT_SERVER to use RUN_FLAKY_ONLY
-    exit 1
-  fi
-  echo
-  echo Running flaky tests only:
-  echo ------------------------------------------------------------
-  if ! ( set -o pipefail ;
-         list_flaky_tests | tee $BUILD_ROOT/flaky-tests.txt) ; then
-    echo Could not fetch flaky tests list.
-    exit 1
-  fi
-  test_regex=$(perl -e '
-    chomp(my @lines = <>);
-    print join("|", map { "^" . quotemeta($_) } @lines);
-   ' $BUILD_ROOT/flaky-tests.txt)
-  if [ -z "$test_regex" ]; then
-    echo No tests are flaky.
-    exit 0
-  fi
-  EXTRA_TEST_FLAGS="$EXTRA_TEST_FLAGS -R $test_regex"
-
-  # We don't support detecting java and python flaky tests at the moment.
-  echo Disabling Java and python build since RUN_FLAKY_ONLY=1
-  BUILD_PYTHON=0
-  BUILD_PYTHON3=0
-  BUILD_JAVA=0
-fi
-
 TESTS_FAILED=0
 EXIT_STATUS=0
 FAILURES=""
 
 # If we're running distributed C++ tests, submit them asynchronously while
-# we run the Java and Python tests.
+# we run any local tests.
 if [ "$ENABLE_DIST_TEST" == "1" ]; then
   echo
   echo Submitting C++ distributed-test job.
@@ -379,7 +440,6 @@ if [ "$BUILD_JAVA" == "1" ]; then
   export EXTRA_GRADLE_FLAGS="--console=plain"
   EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --no-daemon"
   EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --continue"
-  EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -DrerunFailingTestsCount=3"
   # KUDU-2524: temporarily disable scalafmt until we can work out its JDK
   # incompatibility issue.
   EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -DskipFormat"
@@ -398,7 +458,7 @@ if [ "$BUILD_JAVA" == "1" ]; then
     fi
   else
     # TODO: Run `gradle check` in BUILD_TYPE DEBUG when static code analysis is fixed
-    if ! ./gradlew $EXTRA_GRADLE_FLAGS clean test ; then
+    if ! ./gradlew $EXTRA_GRADLE_FLAGS clean test $EXTRA_GRADLE_TEST_FLAGS; then
       TESTS_FAILED=1
       FAILURES="$FAILURES"$'Java Gradle build/test failed\n'
     fi
@@ -441,42 +501,47 @@ if [ "$BUILD_PYTHON" == "1" ]; then
   # Beginning with pip 10, Python 2.6 is no longer supported. Attempting to
   # upgrade to pip 10 on Python 2.6 yields syntax errors. We don't need any new
   # pip features, so let's pin to the last pip version to support Python 2.6.
-  pip install -i https://pypi.python.org/simple $PIP_INSTALL_FLAGS --upgrade 'pip < 10.0.0b1'
+  #
+  # The absence of $PIP_FLAGS is intentional: older versions of pip may not
+  # support the flags that we want to use.
+  pip install -i https://pypi.python.org/simple $PIP_INSTALL_FLAGS --upgrade 'pip <10.0.0b1'
 
   # New versions of pip raise an exception when upgrading old versions of
   # setuptools (such as the one found in el6). The workaround is to upgrade
   # setuptools on its own, outside of requirements.txt, and with the pip version
   # check disabled.
-  pip install --disable-pip-version-check $PIP_INSTALL_FLAGS --upgrade 'setuptools >= 0.8'
+  #
+  # Setuptools 42.0.0 changes something that causes build_ext to fail with a
+  # missing wheel package. Let's pin to an older version known to work.
+  pip $PIP_FLAGS install --disable-pip-version-check $PIP_INSTALL_FLAGS --upgrade 'setuptools >=0.8,<42.0.0'
 
-  # One of our dependencies is pandas, installed via requirements.txt below. It
-  # depends on numpy, and if we don't install numpy directly, the pandas
-  # installation will install the latest numpy which is incompatible with Python 2.6.
+  # One of our dependencies is pandas, installed below. It depends on numpy, and
+  # if we don't install numpy directly, the pandas installation will install the
+  # latest numpy which is incompatible with Python 2.6.
   #
   # To work around this, we need to install a 2.6-compatible version of numpy
-  # before installing pandas. Listing such a numpy version in requirements.txt
-  # doesn't work; it needs to be explicitly installed here.
-  #
-  # Installing numpy may involve some compiler work, so we must pass in the
-  # current values of CC and CXX.
+  # before installing pandas. Installing numpy may involve some compiler work,
+  # so we must pass in the current values of CC and CXX.
   #
   # See https://github.com/numpy/numpy/releases/tag/v1.12.0 for more details.
-  CC=$CLANG CXX=$CLANG++ pip install $PIP_INSTALL_FLAGS 'numpy <1.12.0'
+  CC=$CLANG CXX=$CLANG++ pip $PIP_FLAGS install $PIP_INSTALL_FLAGS 'numpy <1.12.0'
 
   # We've got a new pip and new setuptools. We can now install the rest of the
   # Python client's requirements.
   #
   # Installing the Cython dependency may involve some compiler work, so we must
   # pass in the current values of CC and CXX.
-  CC=$CLANG CXX=$CLANG++ pip install $PIP_INSTALL_FLAGS -r requirements.txt
+  CC=$CLANG CXX=$CLANG++ pip $PIP_FLAGS install $PIP_INSTALL_FLAGS -r requirements.txt
 
-  # We need to install Pandas manually since its not a required package but is needed
-  # to run all of the tests.
-  # pandas 0.18 dropped support for python 2.6.
+  # We need to install Pandas manually because although it's not a required
+  # package, it is needed to run all of the tests.
   #
-  # See https://pandas.pydata.org/pandas-docs/version/0.23.0/whatsnew.html#v0-18-0-march-13-2016
+  # Installing pandas may involve some compiler work, so we must pass in the
+  # current values of CC and CXX.
+  #
+  # pandas 0.18 dropped support for python 2.6. See https://pandas.pydata.org/pandas-docs/version/0.23.0/whatsnew.html#v0-18-0-march-13-2016
   # for more details.
-  pip install $PIP_INSTALL_FLAGS "pandas<0.18"
+  CC=$CLANG CXX=$CLANG++ pip $PIP_FLAGS install $PIP_INSTALL_FLAGS 'pandas <0.18'
 
   # Delete old Cython extensions to force them to be rebuilt.
   rm -Rf build kudu_python.egg-info kudu/*.so
@@ -485,8 +550,8 @@ if [ "$BUILD_PYTHON" == "1" ]; then
   CC=$CLANG CXX=$CLANG++ python setup.py build_ext
   set +e
 
-  # Run the Python tests.
-  if ! python setup.py test \
+  # Run the Python tests. This may also involve some compiler work.
+  if ! CC=$CLANG CXX=$CLANG++ python setup.py test \
       --addopts="kudu --junit-xml=$TEST_LOGDIR/python_client.xml" \
       2> $TEST_LOGDIR/python_client.log ; then
     TESTS_FAILED=1
@@ -521,24 +586,49 @@ if [ "$BUILD_PYTHON3" == "1" ]; then
   # recursively to transitive dependencies installed via a direct dependency's
   # "python setup.py" command. Therefore we have no choice but to upgrade to a
   # new version of pip to proceed.
-  pip install -i https://pypi.python.org/simple $PIP_INSTALL_FLAGS --upgrade pip
+  #
+  # pip 19.1 doesn't support Python 3.4, which is the version of Python 3
+  # shipped with Ubuntu 14.04. However, there appears to be a bug[1] in pip 19.0
+  # preventing it from working properly with Python 3.4 as well. Therefore we
+  # must pin to a pip version from before 19.0.
+  #
+  # The absence of $PIP_FLAGS is intentional: older versions of pip may not
+  # support the flags that we want to use.
+  #
+  # 1. https://github.com/pypa/pip/issues/6175
+  pip install -i https://pypi.python.org/simple $PIP_INSTALL_FLAGS --upgrade 'pip <19.0'
 
   # New versions of pip raise an exception when upgrading old versions of
   # setuptools (such as the one found in el6). The workaround is to upgrade
   # setuptools on its own, outside of requirements.txt, and with the pip version
   # check disabled.
-  pip install --disable-pip-version-check $PIP_INSTALL_FLAGS --upgrade 'setuptools >= 0.8'
+  pip $PIP_FLAGS install --disable-pip-version-check $PIP_INSTALL_FLAGS --upgrade 'setuptools >=0.8'
+
+  # One of our dependencies is pandas, installed below. It depends on numpy, and
+  # if we don't install numpy directly, the pandas installation will install the
+  # latest numpy which is incompatible with Python 3.4 (the version of Python 3
+  # shipped with Ubuntu 14.04).
+  #
+  # To work around this, we need to install a 3.4-compatible version of numpy
+  # before installing pandas. Installing numpy may involve some compiler work,
+  # so we must pass in the current values of CC and CXX.
+  #
+  # See https://github.com/numpy/numpy/releases/tag/v1.16.0rc1 for more details.
+  CC=$CLANG CXX=$CLANG++ pip $PIP_FLAGS install $PIP_INSTALL_FLAGS 'numpy <1.16.0'
 
   # We've got a new pip and new setuptools. We can now install the rest of the
   # Python client's requirements.
   #
   # Installing the Cython dependency may involve some compiler work, so we must
   # pass in the current values of CC and CXX.
-  CC=$CLANG CXX=$CLANG++ pip install $PIP_INSTALL_FLAGS -r requirements.txt
+  CC=$CLANG CXX=$CLANG++ pip $PIP_FLAGS install $PIP_INSTALL_FLAGS -r requirements.txt
 
-  # We need to install Pandas manually since its not a required package but is needed
-  # to run all of the tests.
-  pip install $PIP_INSTALL_FLAGS pandas
+  # We need to install Pandas manually because although it's not a required
+  # package, it is needed to run all of the tests.
+  #
+  # Installing pandas may involve some compiler work, so we must pass in the
+  # current values of CC and CXX.
+  CC=$CLANG CXX=$CLANG++ pip $PIP_FLAGS install $PIP_INSTALL_FLAGS pandas
 
   # Delete old Cython extensions to force them to be rebuilt.
   rm -Rf build kudu_python.egg-info kudu/*.so
@@ -547,8 +637,8 @@ if [ "$BUILD_PYTHON3" == "1" ]; then
   CC=$CLANG CXX=$CLANG++ python setup.py build_ext
   set +e
 
-  # Run the Python tests.
-  if ! python setup.py test \
+  # Run the Python tests. This may also involve some compiler work.
+  if ! CC=$CLANG CXX=$CLANG++ python setup.py test \
       --addopts="kudu --junit-xml=$TEST_LOGDIR/python3_client.xml" \
       2> $TEST_LOGDIR/python3_client.log ; then
     TESTS_FAILED=1

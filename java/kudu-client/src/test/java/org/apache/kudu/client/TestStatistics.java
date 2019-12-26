@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
 import static org.apache.kudu.test.ClientTestUtil.createBasicSchemaInsert;
@@ -21,21 +22,21 @@ import static org.apache.kudu.test.ClientTestUtil.getBasicCreateTableOptions;
 import static org.apache.kudu.test.ClientTestUtil.getBasicSchema;
 import static org.junit.Assert.assertEquals;
 
-import org.apache.kudu.test.KuduTestHarness;
+import java.util.ArrayList;
+import java.util.List;
+
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 
 import org.apache.kudu.client.Statistics.Statistic;
-
-import java.util.ArrayList;
-import java.util.List;
+import org.apache.kudu.test.KuduTestHarness;
 
 public class TestStatistics {
 
-  private static final String TABLE_NAME = TestStatistics.class.getName() + "-"
-      + System.currentTimeMillis();
-  private static KuduTable table;
+  private static final String TABLE_NAME = TestStatistics.class.getName() + "-" +
+      System.currentTimeMillis();
+  private KuduTable table;
 
   @Rule
   public KuduTestHarness harness = new KuduTestHarness();

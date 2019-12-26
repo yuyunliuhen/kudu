@@ -21,6 +21,7 @@
 #include <iosfwd>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
@@ -28,7 +29,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest_prod.h>
 
-#include "kudu/fs/data_dirs.h"
+#include "kudu/fs/dir_manager.h"
 #include "kudu/fs/error_manager.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
@@ -49,6 +50,13 @@ class MemTracker;
 namespace fs {
 
 class BlockManager;
+class DataDirManager;
+class FsManagerTestBase_TestDuplicatePaths_Test;
+class FsManagerTestBase_TestEIOWhileRunningUpdateDirsTool_Test;
+class FsManagerTestBase_TestIsolatedMetadataDir_Test;
+class FsManagerTestBase_TestMetadataDirInDataRoot_Test;
+class FsManagerTestBase_TestMetadataDirInWALRoot_Test;
+class FsManagerTestBase_TestOpenWithDuplicateInstanceFiles_Test;
 class ReadableBlock;
 class WritableBlock;
 struct CreateBlockOptions;
@@ -109,10 +117,11 @@ struct FsManagerOpts {
   // Defaults to false.
   bool read_only;
 
-  // The behavior to use when comparing 'data_roots' to the on-disk path sets.
+  // Whether to update the on-disk instances when opening directories if
+  // inconsistencies are detected.
   //
-  // Defaults to ENFORCE_CONSISTENCY.
-  fs::ConsistencyCheckBehavior consistency_check;
+  // Defaults to UPDATE_AND_IGNORE_FAILURES.
+  fs::UpdateInstanceBehavior update_instances;
 };
 
 // FsManager provides helpers to read data and metadata files,
@@ -136,7 +145,21 @@ class FsManager {
   FsManager(Env* env, FsManagerOpts opts);
   ~FsManager();
 
-  // Initialize and load the basic filesystem metadata, checking it for
+  // ==========================================================================
+  //  Initialization
+  // ==========================================================================
+
+  // Initializes and loads the instance metadata files, and verifies that they
+  // are all matching, returning any root paths that do not have metadata
+  // files. Sets 'metadata_' on success, and returns NotFound if none of the
+  // metadata files could be read. This must be called before calling uuid().
+  //
+  // This only partially initialize the FsManager to expose the file
+  // system's UUID. To do anything more than that, call Open() or
+  // CreateInitialFileSystemLayout().
+  Status PartialOpen(CanonicalizedRootsList* missing_roots = nullptr);
+
+  // Initializes and loads the basic filesystem metadata, checking it for
   // inconsistencies. If found, and if the FsManager was not constructed in
   // read-only mode, an attempt will be made to repair them.
   //
@@ -150,6 +173,17 @@ class FsManager {
   // on-disk and in-memory structures.
   Status Open(fs::FsReport* report = nullptr);
 
+  // Create the initial filesystem layout. If 'uuid' is provided, uses it as
+  // uuid of the filesystem. Otherwise generates one at random.
+  //
+  // Returns an error if the file system is already initialized.
+  Status CreateInitialFileSystemLayout(
+      boost::optional<std::string> uuid = boost::none);
+
+  // ==========================================================================
+  //  Error handling helpers
+  // ==========================================================================
+
   // Registers an error-handling callback with the FsErrorManager.
   //
   // If a disk failure is detected, this callback will be invoked with the
@@ -161,19 +195,6 @@ class FsManager {
   // This must be called before the callback's callee is destroyed. Calls to
   // this are idempotent and are safe even if a callback has not been set.
   void UnsetErrorNotificationCb(fs::ErrorHandlerType e);
-
-  // Create the initial filesystem layout. If 'uuid' is provided, uses it as
-  // uuid of the filesystem. Otherwise generates one at random.
-  //
-  // Returns an error if the file system is already initialized.
-  Status CreateInitialFileSystemLayout(
-      boost::optional<std::string> uuid = boost::none);
-
-  void DumpFileSystemTree(std::ostream& out);
-
-  // Return the UUID persisted in the local filesystem. If Open()
-  // has not been called, this will crash.
-  const std::string& uuid() const;
 
   // ==========================================================================
   //  Data read/write interfaces
@@ -240,6 +261,10 @@ class FsManager {
     return opts_.read_only;
   }
 
+  // Return the UUID persisted in the local filesystem. If PartialOpen() or
+  // Open() have not been called, this will crash.
+  const std::string& uuid() const;
+
   // ==========================================================================
   //  file-system helpers
   // ==========================================================================
@@ -259,11 +284,16 @@ class FsManager {
     return block_manager_.get();
   }
 
+  // Prints the file system trees under the file system roots.
+  void DumpFileSystemTree(std::ostream& out);
+
  private:
-  FRIEND_TEST(FsManagerTestBase, TestDuplicatePaths);
-  FRIEND_TEST(FsManagerTestBase, TestMetadataDirInWALRoot);
-  FRIEND_TEST(FsManagerTestBase, TestMetadataDirInDataRoot);
-  FRIEND_TEST(FsManagerTestBase, TestIsolatedMetadataDir);
+  FRIEND_TEST(fs::FsManagerTestBase, TestDuplicatePaths);
+  FRIEND_TEST(fs::FsManagerTestBase, TestEIOWhileRunningUpdateDirsTool);
+  FRIEND_TEST(fs::FsManagerTestBase, TestIsolatedMetadataDir);
+  FRIEND_TEST(fs::FsManagerTestBase, TestMetadataDirInWALRoot);
+  FRIEND_TEST(fs::FsManagerTestBase, TestMetadataDirInDataRoot);
+  FRIEND_TEST(fs::FsManagerTestBase, TestOpenWithDuplicateInstanceFiles);
   FRIEND_TEST(tserver::MiniTabletServerTest, TestFsLayoutEndToEnd);
   friend class itest::MiniClusterFsInspector; // for access to directory names
 
@@ -300,6 +330,9 @@ class FsManager {
   // ==========================================================================
   //  file-system helpers
   // ==========================================================================
+
+  // Prints the file system tree for the objects in 'objects' under the given
+  // 'path'. Prints lines with the given 'prefix'.
   void DumpFileSystemTree(std::ostream& out,
                           const std::string& prefix,
                           const std::string& path,
@@ -321,7 +354,6 @@ class FsManager {
   static const char *kDataDirName;
   static const char *kTabletMetadataDirName;
   static const char *kWalDirName;
-  static const char *kCorruptedSuffix;
   static const char *kInstanceMetadataFileName;
   static const char *kInstanceMetadataMagicNumber;
   static const char *kTabletSuperBlockMagicNumber;

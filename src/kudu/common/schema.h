@@ -92,12 +92,20 @@ struct ColumnTypeAttributes {
  public:
   ColumnTypeAttributes()
       : precision(0),
-        scale(0) {
+        scale(0),
+        length(0) {
   }
 
   ColumnTypeAttributes(int8_t precision, int8_t scale)
       : precision(precision),
-        scale(scale) {
+        scale(scale),
+        length(0) {
+  }
+
+  explicit ColumnTypeAttributes(uint16_t length)
+      : precision(0),
+        scale(0),
+        length(length) {
   }
 
   // Does `other` represent equivalent attributes for `type`?
@@ -112,6 +120,12 @@ struct ColumnTypeAttributes {
 
   int8_t precision;
   int8_t scale;
+
+  // Maximum value of the length is 65,535 for compatibility reasons as it's
+  // used by VARCHAR type which can be set to a maximum of 65,535 in case of
+  // MySQL and less for other major RDBMS implementations. The length refers to
+  // the number of characters/symbols (not bytes).
+  uint16_t length;
 };
 
 // Class for storing column attributes such as compression and
@@ -174,6 +188,8 @@ public:
   boost::optional<EncodingType> encoding;
   boost::optional<CompressionType> compression;
   boost::optional<int32_t> cfile_block_size;
+
+  boost::optional<std::string> new_comment;
 };
 
 // The schema for a given column.
@@ -190,6 +206,7 @@ class ColumnSchema {
   // write_default: default value added to the row if the column value was
   //    not specified on insert.
   //    The value will be copied and released on ColumnSchema destruction.
+  // comment: the comment for the column.
   //
   // Example:
   //   ColumnSchema col_a("a", UINT32)
@@ -202,13 +219,15 @@ class ColumnSchema {
                const void* read_default = nullptr,
                const void* write_default = nullptr,
                ColumnStorageAttributes attributes = ColumnStorageAttributes(),
-               ColumnTypeAttributes type_attributes = ColumnTypeAttributes())
+               ColumnTypeAttributes type_attributes = ColumnTypeAttributes(),
+               std::string comment = "")
       : name_(std::move(name)),
         type_info_(GetTypeInfo(type)),
         is_nullable_(is_nullable),
         read_default_(read_default ? new Variant(type, read_default) : nullptr),
         attributes_(attributes),
-        type_attributes_(type_attributes) {
+        type_attributes_(type_attributes),
+        comment_(std::move(comment)) {
     if (write_default == read_default) {
       write_default_ = read_default_;
     } else if (write_default != nullptr) {
@@ -228,13 +247,29 @@ class ColumnSchema {
     return name_;
   }
 
+  // Enum to configure how a ColumnSchema is stringified.
+  enum class ToStringMode {
+    // Include encoding type, compression type, and default read/write value.
+    WITH_ATTRIBUTES,
+    // Do not include above attributes.
+    WITHOUT_ATTRIBUTES,
+  };
+
   // Return a string identifying this column, including its
   // name.
-  std::string ToString() const;
+  std::string ToString(ToStringMode mode = ToStringMode::WITHOUT_ATTRIBUTES) const;
 
   // Same as above, but only including the type information.
   // For example, "STRING NOT NULL".
   std::string TypeToString() const;
+
+  // Same as above, but only including the attributes information.
+  // For example, "AUTO_ENCODING ZLIB 123 123".
+  std::string AttrToString() const;
+
+  const std::string& comment() const {
+    return comment_;
+  }
 
   // Returns true if the column has a read default value
   bool has_read_default() const {
@@ -288,16 +323,17 @@ class ColumnSchema {
   }
 
   // compare types in Equals function
-  enum {
+  enum CompareFlags {
     COMPARE_NAME = 1 << 0,
     COMPARE_TYPE = 1 << 1,
-    COMPARE_DEFAULTS = 1 << 2,
+    COMPARE_OTHER = 1 << 2,
 
-    COMPARE_ALL = COMPARE_NAME | COMPARE_TYPE | COMPARE_DEFAULTS
+    COMPARE_NAME_AND_TYPE = COMPARE_NAME | COMPARE_TYPE,
+    COMPARE_ALL = COMPARE_NAME | COMPARE_TYPE | COMPARE_OTHER
   };
 
   bool Equals(const ColumnSchema &other,
-              int flags = COMPARE_ALL) const {
+              CompareFlags flags = COMPARE_ALL) const {
     if (this == &other) return true;
 
     if ((flags & COMPARE_NAME) && this->name_ != other.name_)
@@ -309,7 +345,7 @@ class ColumnSchema {
     // For Key comparison checking the defaults doesn't make sense,
     // since we don't support them, for server vs user schema this comparison
     // will always fail, since the user does not specify the defaults.
-    if (flags & COMPARE_DEFAULTS) {
+    if (flags & COMPARE_OTHER) {
       if (read_default_ == nullptr && other.read_default_ != nullptr)
         return false;
 
@@ -321,6 +357,10 @@ class ColumnSchema {
 
       if (write_default_ != nullptr && !write_default_->Equals(other.write_default_.get()))
         return false;
+
+      if (comment_ != other.comment_) {
+        return false;
+      }
     }
     return true;
   }
@@ -392,6 +432,7 @@ class ColumnSchema {
   std::shared_ptr<Variant> write_default_;
   ColumnStorageAttributes attributes_;
   ColumnTypeAttributes type_attributes_;
+  std::string comment_;
 };
 
 // The schema for a set of rows.
@@ -407,7 +448,7 @@ class ColumnSchema {
 class Schema {
  public:
 
-  static const int kColumnNotFound = -1;
+  static const int kColumnNotFound;
 
   Schema()
     : num_key_columns_(0),
@@ -419,6 +460,7 @@ class Schema {
                      NameToIndexMap::hasher(),
                      NameToIndexMap::key_equal(),
                      NameToIndexMapAllocator(&name_to_index_bytes_)),
+      first_is_deleted_virtual_column_idx_(kColumnNotFound),
       has_nullables_(false) {
   }
 
@@ -478,6 +520,10 @@ class Schema {
                const std::vector<ColumnId>& ids,
                int key_columns);
 
+  // Find the column index corresponding to the given column name,
+  // return a bad Status if not found.
+  Status FindColumn(Slice col_name, int* idx) const;
+
   // Return the number of bytes needed to represent a single row of this schema, without
   // accounting for the null bitmap if the Schema contains nullable values.
   //
@@ -516,23 +562,28 @@ class Schema {
   }
 
   // Return the ColumnSchema corresponding to the given column index.
-  inline const ColumnSchema &column(size_t idx) const {
+  const ColumnSchema &column(size_t idx) const {
     DCHECK_LT(idx, cols_.size());
     return cols_[idx];
   }
 
   // Return the ColumnSchema corresponding to the given column ID.
-  inline const ColumnSchema& column_by_id(ColumnId id) const {
+  const ColumnSchema& column_by_id(ColumnId id) const {
     int idx = find_column_by_id(id);
     DCHECK_GE(idx, 0);
     return cols_[idx];
   }
 
-  // Return the column ID corresponding to the given column index
+  // Return the column ID corresponding to the given column index.
   ColumnId column_id(size_t idx) const {
     DCHECK(has_column_ids());
     DCHECK_LT(idx, cols_.size());
     return col_ids_[idx];
+  }
+
+  // Return the column IDs, ordered by column index.
+  const std::vector<ColumnId>& column_ids() const {
+    return col_ids_;
   }
 
   // Return true if the schema contains an ID mapping for its columns.
@@ -569,6 +620,12 @@ class Schema {
   // Returns true if the specified column (by index) is a key
   bool is_key_column(size_t idx) const {
     return idx < num_key_columns_;
+  }
+
+  // Returns the list of primary key column IDs.
+  std::vector<ColumnId> get_key_column_ids() const {
+    return std::vector<ColumnId>(
+        col_ids_.begin(), col_ids_.begin() + num_key_columns_);
   }
 
   // Return true if this Schema is initialized and valid.
@@ -624,12 +681,13 @@ class Schema {
     return DebugRowColumns(row, num_key_columns());
   }
 
-  // Decode the specified encoded key into the given 'buffer', which
+  // Decode the specified encoded key into the given 'row', which
   // must be at least as large as this->key_byte_size().
   //
   // 'arena' is used for allocating indirect strings, but is unused
   // for other datatypes.
-  Status DecodeRowKey(Slice encoded_key, uint8_t* buffer,
+  template<class RowType>
+  Status DecodeRowKey(Slice encoded_key, RowType* row,
                       Arena* arena) const WARN_UNUSED_RESULT;
 
   // Decode and stringify the given contiguous encoded row key in
@@ -683,8 +741,6 @@ class Schema {
 
   // Return a new Schema which is the same as this one, but without any column
   // IDs assigned.
-  //
-  // Requires that this schema has column IDs.
   Schema CopyWithoutColumnIds() const;
 
   // Create a new schema containing only the selected columns.
@@ -724,25 +780,44 @@ class Schema {
   }
 
   // Enum to configure how a Schema is stringified.
-  enum class ToStringMode {
+  enum ToStringMode {
+    BASE_INFO = 0,
     // Include column ids if this instance has them.
-    WITH_COLUMN_IDS,
-    // Do not include column ids.
-    WITHOUT_COLUMN_IDS,
+    WITH_COLUMN_IDS = 1 << 0,
+    // Include column attributes.
+    WITH_COLUMN_ATTRIBUTES = 1 << 1,
   };
   // Stringify this Schema. This is not particularly efficient,
   // so should only be used when necessary for output.
   std::string ToString(ToStringMode mode = ToStringMode::WITH_COLUMN_IDS) const;
 
+  // Compare column ids in Equals() method.
+  enum SchemaComparisonType {
+    COMPARE_COLUMNS = 1 << 0,
+    COMPARE_COLUMN_IDS = 1 << 1,
+
+    COMPARE_ALL = COMPARE_COLUMNS | COMPARE_COLUMN_IDS
+  };
+
   // Return true if the schemas have exactly the same set of columns
   // and respective types.
-  bool Equals(const Schema &other) const {
+  bool Equals(const Schema& other, SchemaComparisonType flags = COMPARE_COLUMNS) const {
     if (this == &other) return true;
-    if (this->num_key_columns_ != other.num_key_columns_) return false;
-    if (this->num_columns() != other.num_columns()) return false;
 
-    for (size_t i = 0; i < other.num_columns(); i++) {
-      if (!this->cols_[i].Equals(other.cols_[i])) return false;
+    if (flags & COMPARE_COLUMNS) {
+      if (this->num_key_columns_ != other.num_key_columns_) return false;
+      if (this->num_columns() != other.num_columns()) return false;
+      for (size_t i = 0; i < other.num_columns(); i++) {
+        if (!this->cols_[i].Equals(other.cols_[i])) return false;
+      }
+    }
+
+    if (flags & COMPARE_COLUMN_IDS) {
+      if (this->has_column_ids() != other.has_column_ids()) return false;
+      if (this->has_column_ids()) {
+        if (this->col_ids_ != other.col_ids_) return false;
+        if (this->max_col_id() != other.max_col_id()) return false;
+      }
     }
 
     return true;
@@ -751,8 +826,7 @@ class Schema {
   // Return true if the key projection schemas have exactly the same set of
   // columns and respective types.
   bool KeyEquals(const Schema& other,
-                 int flags
-                    = ColumnSchema::COMPARE_NAME | ColumnSchema::COMPARE_TYPE) const {
+                 ColumnSchema::CompareFlags flags = ColumnSchema::COMPARE_NAME_AND_TYPE) const {
     if (this == &other) return true;
     if (this->num_key_columns_ != other.num_key_columns_) return false;
     for (size_t i = 0; i < this->num_key_columns_; i++) {
@@ -820,7 +894,7 @@ class Schema {
       if (base_idx >= 0) {
         const ColumnSchema& base_col_schema = base_schema.column(base_idx);
         // Column present in the Base Schema...
-        if (!col_schema.EqualsType(base_col_schema)) {
+        if (PREDICT_FALSE(!col_schema.EqualsType(base_col_schema))) {
           // ...but with a different type, (TODO: try with an adaptor)
           return Status::InvalidArgument("The column '" + col_schema.name() +
                                          "' must have type " +
@@ -864,22 +938,8 @@ class Schema {
 
   // Returns the column index for the first IS_DELETED virtual column in the
   // schema, or kColumnNotFound if one cannot be found.
-  //
-  // The virtual column must not be nullable and must have a read default value.
-  // The process will crash if these constraints are not met.
-  int find_first_is_deleted_virtual_column() const {
-    for (int idx = 0; idx < num_columns(); idx++) {
-      const auto& col = column(idx);
-      if (col.type_info()->type() == IS_DELETED) {
-        // Enforce some properties on the virtual column that simplify our
-        // implementation.
-        DCHECK(!col.is_nullable());
-        DCHECK(col.has_read_default());
-
-        return idx;
-      }
-    }
-    return kColumnNotFound;
+  int first_is_deleted_virtual_column_idx() const {
+    return first_is_deleted_virtual_column_idx_;
   }
 
  private:
@@ -905,8 +965,8 @@ class Schema {
 
   std::vector<ColumnSchema> cols_;
   size_t num_key_columns_;
-  ColumnId max_col_id_;
   std::vector<ColumnId> col_ids_;
+  ColumnId max_col_id_;
   std::vector<size_t> col_offsets_;
 
   // The keys of this map are StringPiece references to the actual name members of the
@@ -927,6 +987,10 @@ class Schema {
   NameToIndexMap name_to_index_;
 
   IdMapping id_to_index_;
+
+  // Cached index of the first IS_DELETED virtual column, or kColumnNotFound if
+  // no such virtual column exists in the schema.
+  int first_is_deleted_virtual_column_idx_;
 
   // Cached indicator whether any columns are nullable.
   bool has_nullables_;

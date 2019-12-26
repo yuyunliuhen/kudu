@@ -21,6 +21,7 @@
 #define KUDU_COMMON_ROW_CHANGELIST_H
 
 #include <cstddef>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -135,6 +136,8 @@ class RowChangeList {
     kReinsert = 3,
     ChangeType_max = 3
   };
+
+  static const char* ChangeType_Name(ChangeType t);
 
   Slice encoded_data_;
 };
@@ -290,24 +293,32 @@ class RowChangeListDecoder {
 #endif
   }
 
+  bool IsInitialized() const {
+    return type_ != RowChangeList::kUninitialized;
+  }
+
   bool HasNext() const {
     DCHECK(!is_delete());
     return !remaining_.empty();
   }
 
   bool is_update() const {
+    DCHECK_NE(type_, RowChangeList::kUninitialized) << "Must call Init()";
     return type_ == RowChangeList::kUpdate;
   }
 
   bool is_delete() const {
+    DCHECK_NE(type_, RowChangeList::kUninitialized) << "Must call Init()";
     return type_ == RowChangeList::kDelete;
   }
 
   bool is_reinsert() const {
+    DCHECK_NE(type_, RowChangeList::kUninitialized) << "Must call Init()";
     return type_ == RowChangeList::kReinsert;
   }
 
   const RowChangeList::ChangeType get_type() const {
+    DCHECK_NE(type_, RowChangeList::kUninitialized) << "Must call Init()";
     return type_;
   }
 
@@ -380,7 +391,7 @@ class RowChangeListDecoder {
     ColumnId col_id;
 
     // If true, this update sets the given column to NULL.
-    bool null;
+    bool null = false;
 
     // The "raw" value of the updated column.
     //   - in the case of a fixed length type such as an integer,
@@ -428,7 +439,6 @@ class RowChangeListDecoder {
 
   RowChangeList::ChangeType type_;
 };
-
 
 } // namespace kudu
 

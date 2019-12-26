@@ -74,6 +74,7 @@
 #include "kudu/util/env_util.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
@@ -219,7 +220,7 @@ class RaftConsensusITest : public RaftConsensusITestBase {
   void AssertMajorityRequiredForElectionsAndWrites(const TabletServerMap& tablet_servers,
                                                    const string& leader_uuid);
 
-  void CreateClusterForCrashyNodesTests();
+  void CreateClusterForCrashyNodesTests(vector<string> extra_ts_flags = {});
   void DoTestCrashyNodes(TestWorkload* workload, int max_rows_to_insert);
 
   // Prepare for a test where a single replica of a 3-server cluster is left
@@ -527,7 +528,7 @@ void RaftConsensusITest::AssertMajorityRequiredForElectionsAndWrites(
                                MonoDelta::FromSeconds(10)));
 }
 
-void RaftConsensusITest::CreateClusterForCrashyNodesTests() {
+void RaftConsensusITest::CreateClusterForCrashyNodesTests(vector<string> extra_ts_flags) {
   if (AllowSlowTests()) {
     FLAGS_num_tablet_servers = 7;
     FLAGS_num_replicas = 7;
@@ -553,6 +554,8 @@ void RaftConsensusITest::CreateClusterForCrashyNodesTests() {
   // faster if it doesn't have to scan forward through the preallocated
   // log area.
   ts_flags.emplace_back("--log_preallocate_segments=false");
+
+  ts_flags.insert(ts_flags.end(), extra_ts_flags.begin(), extra_ts_flags.end());
 
   NO_FATALS(CreateCluster("raft_consensus-itest-crashy-nodes-cluster",
                           std::move(ts_flags)));
@@ -607,7 +610,7 @@ void RaftConsensusITest::DoTestCrashyNodes(TestWorkload* workload, int max_rows_
   NO_FATALS(v.CheckCluster());
   NO_FATALS(v.CheckRowCount(workload->table_name(),
                             ClusterVerifier::EXACTLY,
-                            workload->rows_inserted()));
+                            workload->rows_inserted() - workload->rows_deleted()));
 }
 
 void RaftConsensusITest::SetupSingleReplicaTest(TServerDetails** replica_ts) {
@@ -654,7 +657,9 @@ TEST_F(RaftConsensusITest, TestGetPermanentUuid) {
   std::shared_ptr<rpc::Messenger> messenger;
   ASSERT_OK(builder.Build(&messenger));
 
-  ASSERT_OK(consensus::SetPermanentUuidForRemotePeer(messenger, &peer));
+  auto resolver = std::make_shared<DnsResolver>();
+  ASSERT_OK(consensus::SetPermanentUuidForRemotePeer(
+      messenger, resolver.get(), &peer));
   ASSERT_EQ(expected_uuid, peer.permanent_uuid());
 }
 
@@ -949,6 +954,34 @@ TEST_F(RaftConsensusITest, InsertDuplicateKeysWithCrashyNodes) {
   NO_FATALS(DoTestCrashyNodes(&workload, 300));
 }
 
+// The same crashy nodes test as above but the keys will be deleted after insertion.
+TEST_F(RaftConsensusITest, InsertAndDeleteWithCrashyNodes) {
+  vector<string> extra_ts_flags = {
+      "--flush_threshold_mb=0",
+      "--flush_threshold_secs=1",
+      "--maintenance_manager_polling_interval_ms=10",
+      "--heartbeat_interval_ms=10",
+      "--update_tablet_stats_interval_ms=10",
+  };
+  NO_FATALS(CreateClusterForCrashyNodesTests(std::move(extra_ts_flags)));
+
+  // If the AllowSlowTests is true, test the scenario that deleting data on DRS.
+  // Otherwise, test deleting data on MRS.
+  int32_t write_interval_millis = 0;
+  int32_t write_batch_size = 5;
+  if (AllowSlowTests()) {
+    // Wait for MRS to be flushed.
+    write_interval_millis = 1000;
+    // Decrease the number of rows per batch to generate more DRSs.
+    write_batch_size = 1;
+  }
+
+  TestWorkload workload(cluster_.get());
+  workload.set_write_pattern(TestWorkload::INSERT_RANDOM_ROWS_WITH_DELETE);
+  workload.set_write_interval_millis(write_interval_millis);
+  workload.set_write_batch_size(write_batch_size);
+  NO_FATALS(DoTestCrashyNodes(&workload, 100));
+}
 
 TEST_F(RaftConsensusITest, MultiThreadedInsertWithFailovers) {
   int kNumElections = FLAGS_num_replicas;
@@ -1765,7 +1798,7 @@ TEST_F(RaftConsensusITest, TestMasterNotifiedOnConfigChange) {
 
   // Get a baseline config reported to the master.
   LOG(INFO) << "Waiting for Master to see the current replicas...";
-  master::TabletLocationsPB tablet_locations;
+  master::GetTabletLocationsResponsePB tablet_locations;
   bool has_leader;
   ASSERT_OK(WaitForReplicasReportedToMaster(cluster_->master_proxy(),
                                             2, tablet_id, timeout,

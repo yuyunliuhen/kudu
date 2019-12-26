@@ -14,9 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-#ifndef KUDU_CONSENSUS_LOG_UTIL_H_
-#define KUDU_CONSENSUS_LOG_UTIL_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -102,7 +100,7 @@ class LogEntryReader {
 
   // Construct a LogEntryReader to read from the provided segment.
   // 'seg' must outlive the LogEntryReader.
-  explicit LogEntryReader(ReadableLogSegment* seg);
+  explicit LogEntryReader(const ReadableLogSegment* seg);
 
   ~LogEntryReader();
 
@@ -131,7 +129,7 @@ class LogEntryReader {
   Status MakeCorruptionStatus(const Status& status) const;
 
   // The segment being read.
-  ReadableLogSegment* seg_;
+  const ReadableLogSegment* seg_;
 
   // The last several entries which were successfully read.
   struct RecentEntry {
@@ -171,6 +169,10 @@ class LogEntryReader {
 // segments are rolled over and the Log continues in a new segment.
 
 // A readable log segment for recovery and follower catch-up.
+//
+// Const methods are thread-safe; non-const methods are not. Care must be taken
+// not to invoke non-thread-safe methods after the segment has been incorporated
+// into the LogReader, as there may be concurrent threads accessing the reader.
 class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
  public:
   // Factory method to construct a ReadableLogSegment from a file on the FS.
@@ -179,8 +181,7 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
                      scoped_refptr<ReadableLogSegment>* segment);
 
   // Build a readable segment to read entries from the provided path.
-  ReadableLogSegment(std::string path,
-                     std::shared_ptr<RandomAccessFile> readable_file);
+  ReadableLogSegment(std::string path, std::shared_ptr<RWFile> file);
 
   // Initialize the ReadableLogSegment.
   // This initializer provides methods for avoiding disk IO when creating a
@@ -207,12 +208,15 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   // If the log is corrupted (i.e. the returned 'Status' is 'Corruption') all
   // the log entries read up to the corrupted one are returned in the 'entries'
   // vector.
-  Status ReadEntries(LogEntries* entries);
+  Status ReadEntries(LogEntries* entries) const;
 
   // Rebuilds this segment's footer by scanning its entries.
   // This is an expensive operation as it reads and parses the whole segment
   // so it should be only used in the case of a crash, where the footer is
   // missing because we didn't have the time to write it out.
+  //
+  // This function is not thread-safe and should only be called when there's no
+  // danger of another thread accessing the segment.
   Status RebuildFooterByScanning();
 
   bool IsInitialized() const {
@@ -220,7 +224,7 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   }
 
   // Returns the parent directory where log segments are stored.
-  const std::string &path() const {
+  const std::string& path() const {
     return path_;
   }
 
@@ -248,22 +252,22 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
     return footer_;
   }
 
-  const std::shared_ptr<RandomAccessFile> readable_file() const {
-    return readable_file_;
+  std::shared_ptr<RWFile> file() const {
+    return file_;
   }
 
-  const int64_t file_size() const {
+  int64_t file_size() const {
     return file_size_.Load();
   }
 
-  const int64_t first_entry_offset() const {
+  int64_t first_entry_offset() const {
     return first_entry_offset_;
   }
 
   // Returns the full size of the file, if the segment is closed and has
   // a footer, or the offset where the last written, non corrupt entry
   // ends.
-  const int64_t readable_up_to() const;
+  int64_t readable_up_to() const;
 
   // Return the expected length of entry headers in this log segment.
   // Versions of Kudu older than 1.3 used a different log entry header format.
@@ -311,25 +315,25 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   //
   // Returns Uninitialized() if the file appears to be preallocated but never
   // written.
-  Status ReadHeaderMagicAndHeaderLength(uint32_t *len);
+  Status ReadHeaderMagicAndHeaderLength(uint32_t *len) const;
 
   // Parse the magic and the PB-header length prefix from 'data'.
   // In the case that 'data' is all '\0' bytes, indicating a preallocated
   // but never-written segment, returns Status::Uninitialized().
-  Status ParseHeaderMagicAndHeaderLength(const Slice &data, uint32_t *parsed_len);
+  Status ParseHeaderMagicAndHeaderLength(const Slice &data, uint32_t *parsed_len) const;
 
   Status ReadFooter();
 
-  Status ReadFooterMagicAndFooterLength(uint32_t *len);
+  Status ReadFooterMagicAndFooterLength(uint32_t *len) const;
 
-  Status ParseFooterMagicAndFooterLength(const Slice &data, uint32_t *parsed_len);
+  static Status ParseFooterMagicAndFooterLength(const Slice &data, uint32_t *parsed_len);
 
   // Starting at 'offset', read the rest of the log file, looking for any
   // valid log entry headers. If any are found, sets *has_valid_entries to true.
   //
   // Returns a bad Status only in the case that some IO error occurred reading the
   // file.
-  Status ScanForValidEntryHeaders(int64_t offset, bool* has_valid_entries);
+  Status ScanForValidEntryHeaders(int64_t offset, bool* has_valid_entries) const;
 
   // Read an entry header and its associated batch at the given offset.
   // If successful, updates '*offset' to point to the next batch
@@ -339,14 +343,14 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   // to indicate the cause of the error.
   Status ReadEntryHeaderAndBatch(int64_t* offset, faststring* tmp_buf,
                                  std::unique_ptr<LogEntryBatchPB>* batch,
-                                 EntryHeaderStatus* status_detail);
+                                 EntryHeaderStatus* status_detail) const;
 
   // Reads a log entry header from the segment.
   //
   // Also increments the passed offset* by the length of the entry on successful
   // read.
   Status ReadEntryHeader(int64_t *offset, EntryHeader* header,
-                         EntryHeaderStatus* status_detail);
+                         EntryHeaderStatus* status_detail) const;
 
   // Decode a log entry header from the given slice. The header length is
   // determined by 'entry_header_size()'.
@@ -354,20 +358,20 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   //
   // NOTE: this is performance-critical since it is used by ScanForValidEntryHeaders
   // and thus returns an enum instead of Status.
-  EntryHeaderStatus DecodeEntryHeader(const Slice& data, EntryHeader* header);
+  EntryHeaderStatus DecodeEntryHeader(const Slice& data, EntryHeader* header) const;
 
   // Reads a log entry batch from the provided readable segment, which gets decoded
   // into 'entry_batch' and increments 'offset' by the batch's length.
   Status ReadEntryBatch(int64_t* offset,
                         const EntryHeader& header,
                         faststring* tmp_buf,
-                        std::unique_ptr<LogEntryBatchPB>* entry_batch);
+                        std::unique_ptr<LogEntryBatchPB>* entry_batch) const;
 
   void UpdateReadableToOffset(int64_t readable_to_offset);
 
   const std::string path_;
 
-  // The size of the readable file.
+  // The size of the file.
   // This is set by Init(). In the case of a log being written to,
   // this may be increased by UpdateReadableToOffset()
   AtomicInt<int64_t> file_size_;
@@ -378,11 +382,12 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   // we can read without the fear of reading garbage/zeros.
   // This is atomic because the Log thread might be updating the segment's readable
   // offset while an async reader is reading the segment's entries.
-  // is reading it.
   AtomicInt<int64_t> readable_to_offset_;
 
-  // a readable file for a log segment (used on replay)
-  const std::shared_ptr<RandomAccessFile> readable_file_;
+  // File handle for a log segment (used on replay).
+  //
+  // Despite being read-write, we only ever use its read methods.
+  const std::shared_ptr<RWFile> file_;
 
   // Compression codec used to decompress entries in this file.
   const CompressionCodec* codec_;
@@ -403,25 +408,18 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
 };
 
 // A writable log segment where state data is stored.
+//
+// This class is not thread-safe.
 class WritableLogSegment {
  public:
   WritableLogSegment(std::string path,
-                     std::shared_ptr<WritableFile> writable_file);
+                     std::shared_ptr<RWFile> file);
 
   // Opens the segment by writing the header.
-  Status WriteHeaderAndOpen(const LogSegmentHeaderPB& new_header);
+  Status WriteHeader(const LogSegmentHeaderPB& new_header);
 
-  // Closes the segment by writing the footer and then actually closing the
-  // underlying WritableFile.
-  Status WriteFooterAndClose(const LogSegmentFooterPB& footer);
-
-  bool IsClosed() {
-    return IsHeaderWritten() && IsFooterWritten();
-  }
-
-  int64_t Size() const {
-    return writable_file_->Size();
-  }
+  // Finishes the segment by writing the footer.
+  Status WriteFooter(const LogSegmentFooterPB& footer);
 
   // Appends the provided batch of data, including a header
   // and checksum. If 'codec' is not NULL, compresses the batch.
@@ -429,10 +427,14 @@ class WritableLogSegment {
   // Write a compressed entry to the log.
   Status WriteEntryBatch(const Slice& data, const CompressionCodec* codec);
 
-  // Makes sure the I/O buffers in the underlying writable file are flushed.
+  // Makes sure the I/O buffers belonging to the underlying file handle are flushed.
   Status Sync() {
-    return writable_file_->Sync();
+    return file_->Sync();
   }
+
+  // Indicate that the segment has not been written for some period of time.
+  // In this case, temporary buffers should be freed up.
+  void GoIdle();
 
   // Returns true if the segment header has already been written to disk.
   bool IsHeaderWritten() const {
@@ -454,29 +456,30 @@ class WritableLogSegment {
   }
 
   // Returns the parent directory where log segments are stored.
-  const std::string &path() const {
+  const std::string& path() const {
     return path_;
   }
 
-  const int64_t first_entry_offset() const {
+  std::shared_ptr<RWFile> file() const {
+    return file_;
+  }
+
+  int64_t first_entry_offset() const {
     return first_entry_offset_;
   }
 
-  const int64_t written_offset() const {
+  int64_t written_offset() const {
     return written_offset_;
   }
 
  private:
+  FRIEND_TEST(LogTest, TestAutoStopIdleAppendThread);
 
-  const std::shared_ptr<WritableFile>& writable_file() const {
-    return writable_file_;
-  }
-
-  // The path to the log file.
+  // The path to the log segment.
   const std::string path_;
 
-  // The writable file to which this LogSegment will be written.
-  const std::shared_ptr<WritableFile> writable_file_;
+  // The file handle belonging to the log segment.
+  const std::shared_ptr<RWFile> file_;
 
   bool is_header_written_;
 
@@ -513,5 +516,3 @@ void UpdateFooterForReplicateEntry(
 
 }  // namespace log
 }  // namespace kudu
-
-#endif /* KUDU_CONSENSUS_LOG_UTIL_H_ */

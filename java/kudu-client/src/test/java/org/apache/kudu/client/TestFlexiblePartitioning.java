@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
 import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
@@ -31,7 +32,6 @@ import com.google.common.base.Predicates;
 import com.google.common.collect.ComparisonChain;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Sets;
-import org.apache.kudu.test.KuduTestHarness;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -41,6 +41,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
+import org.apache.kudu.test.KuduTestHarness;
 
 public class TestFlexiblePartitioning {
   private static final Logger LOG = LoggerFactory.getLogger(TestKuduClient.class);
@@ -95,10 +96,8 @@ public class TestFlexiblePartitioning {
 
   private Set<Row> collectRows(KuduScanner scanner) throws KuduException {
     Set<Row> rows = new HashSet<>();
-    while (scanner.hasMoreRows()) {
-      for (RowResult result : scanner.nextRows()) {
-        rows.add(Row.fromResult(result));
-      }
+    for (RowResult result : scanner) {
+      rows.add(Row.fromResult(result));
     }
     return rows;
   }
@@ -123,6 +122,7 @@ public class TestFlexiblePartitioning {
     return rows;
   }
 
+  @SuppressWarnings("deprecation")
   private void testPartitionSchema(CreateTableOptions tableBuilder) throws Exception {
     Schema schema = createSchema();
 
@@ -141,7 +141,7 @@ public class TestFlexiblePartitioning {
       PartialRow lowerBound = schema.newPartialRow();
       minRow.fillPartialRow(lowerBound);
 
-      Set<Row> expected = Sets.filter(rows, minRow.gtePred());
+      Set<Row> expected = Sets.filter(rows, minRow.gtePred()::apply);
 
       KuduScanner scanner = client.newScannerBuilder(table).lowerBound(lowerBound).build();
       Set<Row> results = collectRows(scanner);
@@ -180,7 +180,8 @@ public class TestFlexiblePartitioning {
       PartialRow upperBound = schema.newPartialRow();
       maxRow.fillPartialRow(upperBound);
 
-      Set<Row> expected = Sets.filter(rows, Predicates.and(minRow.gtePred(), maxRow.ltPred()));
+      Set<Row> expected =
+          Sets.filter(rows, Predicates.and(minRow.gtePred()::apply, maxRow.ltPred()));
 
       KuduScanner scanner = client.newScannerBuilder(table)
                                       .lowerBound(lowerBound)
@@ -204,9 +205,9 @@ public class TestFlexiblePartitioning {
 
       for (LocatedTablet tablet : tablets) {
         KuduScanner scanner = client.newScannerBuilder(table)
-                                        .lowerBoundPartitionKeyRaw(tablet.getPartition().getPartitionKeyStart())
-                                        .exclusiveUpperBoundPartitionKeyRaw(tablet.getPartition().getPartitionKeyEnd())
-                                        .build();
+            .lowerBoundPartitionKeyRaw(tablet.getPartition().getPartitionKeyStart())
+            .exclusiveUpperBoundPartitionKeyRaw(tablet.getPartition().getPartitionKeyEnd())
+            .build();
         Set<Row> tabletResults = collectRows(scanner);
         Set<Row> intersection = Sets.intersection(results, tabletResults);
         assertEquals(new HashSet<>(), intersection);
@@ -224,16 +225,17 @@ public class TestFlexiblePartitioning {
       PartialRow upperBound = schema.newPartialRow();
       maxRow.fillPartialRow(upperBound);
 
-      Set<Row> expected = Sets.filter(rows, Predicates.and(minRow.gtePred(), maxRow.ltPred()));
+      Set<Row> expected = Sets.filter(rows,
+          Predicates.and(minRow.gtePred()::apply, maxRow.ltPred()));
       Set<Row> results = new HashSet<>();
 
       for (LocatedTablet tablet : tablets) {
         KuduScanner scanner = client.newScannerBuilder(table)
-                                        .lowerBound(lowerBound)
-                                        .exclusiveUpperBound(upperBound)
-                                        .lowerBoundPartitionKeyRaw(tablet.getPartition().getPartitionKeyStart())
-                                        .exclusiveUpperBoundPartitionKeyRaw(tablet.getPartition().getPartitionKeyEnd())
-                                        .build();
+            .lowerBound(lowerBound)
+            .exclusiveUpperBound(upperBound)
+            .lowerBoundPartitionKeyRaw(tablet.getPartition().getPartitionKeyStart())
+            .exclusiveUpperBoundPartitionKeyRaw(tablet.getPartition().getPartitionKeyEnd())
+            .build();
         Set<Row> tabletResults = collectRows(scanner);
         Set<Row> intersection = Sets.intersection(results, tabletResults);
         assertEquals(new HashSet<>(), intersection);
@@ -249,7 +251,7 @@ public class TestFlexiblePartitioning {
     CreateTableOptions tableBuilder = new CreateTableOptions();
     tableBuilder.addHashPartitions(ImmutableList.of("a"), 3);
     tableBuilder.addHashPartitions(ImmutableList.of("b", "c"), 3, 42);
-    tableBuilder.setRangePartitionColumns(ImmutableList.<String>of());
+    tableBuilder.setRangePartitionColumns(ImmutableList.of());
     testPartitionSchema(tableBuilder);
   }
 
@@ -376,37 +378,37 @@ public class TestFlexiblePartitioning {
   @Test(timeout = 100000)
   public void testUnpartitionedTable() throws Exception {
     CreateTableOptions tableBuilder =
-        new CreateTableOptions().setRangePartitionColumns(ImmutableList.<String>of());
+        new CreateTableOptions().setRangePartitionColumns(ImmutableList.of());
     testPartitionSchema(tableBuilder);
   }
 
   public static class Row implements Comparable<Row> {
-    private final String a;
-    private final String b;
-    private final String c;
+    private final String valA;
+    private final String valB;
+    private final String valC;
 
     public Row(String a, String b, String c) {
-      this.a = a;
-      this.b = b;
-      this.c = c;
+      this.valA = a;
+      this.valB = b;
+      this.valC = c;
     }
 
-    public String getA() {
-      return a;
+    public String getValA() {
+      return valA;
     }
 
-    public String getB() {
-      return b;
+    public String getValB() {
+      return valB;
     }
 
-    public String getC() {
-      return c;
+    public String getValC() {
+      return valC;
     }
 
     public void fillPartialRow(PartialRow row) {
-      row.addString("a", a);
-      row.addString("b", b);
-      row.addString("c", c);
+      row.addString("a", valA);
+      row.addString("b", valB);
+      row.addString("c", valC);
     }
 
     private static Row fromResult(RowResult result) {
@@ -435,34 +437,38 @@ public class TestFlexiblePartitioning {
 
     @Override
     public boolean equals(Object o) {
-      if (this == o) return true;
-      if (o == null || getClass() != o.getClass()) return false;
+      if (this == o) {
+        return true;
+      }
+      if (!(o instanceof Row)) {
+        return false;
+      }
       Row row = (Row) o;
-      return Objects.equals(a, row.a)
-          && Objects.equals(b, row.b)
-          && Objects.equals(c, row.c);
+      return Objects.equals(valA, row.valA) &&
+          Objects.equals(valB, row.valB) &&
+          Objects.equals(valC, row.valC);
     }
 
     @Override
     public int hashCode() {
-      return Objects.hash(a, b, c);
+      return Objects.hash(valA, valB, valC);
     }
 
     @Override
     public int compareTo(Row other) {
       return ComparisonChain.start()
-                            .compare(a, other.a)
-                            .compare(b, other.b)
-                            .compare(c, other.c)
+                            .compare(valA, other.valA)
+                            .compare(valB, other.valB)
+                            .compare(valC, other.valC)
                             .result();
     }
 
     @Override
     public String toString() {
       return MoreObjects.toStringHelper(this)
-                        .add("a", a)
-                        .add("b", b)
-                        .add("c", c)
+                        .add("a", valA)
+                        .add("b", valB)
+                        .add("c", valC)
                         .toString();
     }
   }

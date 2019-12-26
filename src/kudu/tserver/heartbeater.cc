@@ -52,7 +52,6 @@
 #include "kudu/server/rpc_server.h"
 #include "kudu/server/webserver.h"
 #include "kudu/tserver/tablet_server.h"
-#include "kudu/tserver/tablet_server_options.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/util/condition_variable.h"
 #include "kudu/util/flag_tags.h"
@@ -60,6 +59,7 @@
 #include "kudu/util/logging.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/mutex.h"
+#include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
@@ -110,37 +110,13 @@ using kudu::master::TabletReportPB;
 using kudu::pb_util::SecureDebugString;
 using kudu::rpc::ErrorStatusPB;
 using kudu::rpc::RpcController;
-using std::shared_ptr;
 using std::string;
 using std::vector;
 using strings::Substitute;
 
 namespace kudu {
 
-namespace rpc {
-class Messenger;
-}
-
 namespace tserver {
-
-namespace {
-
-// Creates a proxy to 'hostport'.
-Status MasterServiceProxyForHostPort(const HostPort& hostport,
-                                     const shared_ptr<rpc::Messenger>& messenger,
-                                     gscoped_ptr<MasterServiceProxy>* proxy) {
-  vector<Sockaddr> addrs;
-  RETURN_NOT_OK(hostport.ResolveAddresses(&addrs));
-  if (addrs.size() > 1) {
-    LOG(WARNING) << "Master address '" << hostport.ToString() << "' "
-                 << "resolves to " << addrs.size() << " different addresses. Using "
-                 << addrs[0].ToString();
-  }
-  proxy->reset(new MasterServiceProxy(messenger, addrs[0], hostport.host()));
-  return Status::OK();
-}
-
-} // anonymous namespace
 
 // Most of the actual logic of the heartbeater is inside this inner class,
 // to avoid having too many dependencies from the header itself.
@@ -153,7 +129,7 @@ class Heartbeater::Thread {
   Status Start();
   Status Stop();
   void TriggerASAP();
-  void MarkTabletDirty(const string& tablet_id, const string& reason);
+  void MarkTabletsDirty(const vector<string>& tablet_ids, const string& reason);
   void GenerateIncrementalTabletReport(TabletReportPB* report);
   void GenerateFullTabletReport(TabletReportPB* report);
 
@@ -171,6 +147,8 @@ class Heartbeater::Thread {
   Status SetupRegistration(ServerRegistrationPB* reg);
   void SetupCommonField(master::TSToMasterCommonPB* common);
   bool IsCurrentThread() const;
+  // Creates a proxy to 'hostport'.
+  Status MasterServiceProxyForHostPort(gscoped_ptr<MasterServiceProxy>* proxy);
 
   // The host and port of the master that this thread will heartbeat to.
   //
@@ -237,11 +215,10 @@ class Heartbeater::Thread {
 // Heartbeater
 ////////////////////////////////////////////////////////////
 
-Heartbeater::Heartbeater(const TabletServerOptions& opts, TabletServer* server) {
-  DCHECK_GT(opts.master_addresses.size(), 0);
-
-  for (const auto& addr : opts.master_addresses) {
-    threads_.emplace_back(new Thread(addr, server));
+Heartbeater::Heartbeater(UnorderedHostPortSet master_addrs, TabletServer* server) {
+  DCHECK_GT(master_addrs.size(), 0);
+  for (auto addr : master_addrs) {
+    threads_.emplace_back(new Thread(std::move(addr), server));
   }
 }
 Heartbeater::~Heartbeater() {
@@ -282,9 +259,9 @@ void Heartbeater::TriggerASAP() {
   }
 }
 
-void Heartbeater::MarkTabletDirty(const string& tablet_id, const string& reason) {
+void Heartbeater::MarkTabletsDirty(const vector<string>& tablet_ids, const string& reason) {
   for (const auto& thread : threads_) {
-    thread->MarkTabletDirty(tablet_id, reason);
+    thread->MarkTabletsDirty(tablet_ids, reason);
   }
 }
 
@@ -334,8 +311,7 @@ Heartbeater::Thread::Thread(HostPort master_address, TabletServer* server)
 
 Status Heartbeater::Thread::ConnectToMaster() {
   gscoped_ptr<MasterServiceProxy> new_proxy;
-  RETURN_NOT_OK(MasterServiceProxyForHostPort(master_address_, server_->messenger(), &new_proxy));
-
+  RETURN_NOT_OK(MasterServiceProxyForHostPort(&new_proxy));
   // Ping the master to verify that it's alive.
   master::PingRequestPB req;
   master::PingResponsePB resp;
@@ -369,6 +345,7 @@ Status Heartbeater::Thread::SetupRegistration(ServerRegistrationPB* reg) {
     reg->set_https_enabled(server_->web_server()->IsSecure());
   }
   reg->set_software_version(VersionInfo::GetVersionInfo());
+  reg->set_start_time(server_->start_time());
 
   return Status::OK();
 }
@@ -398,6 +375,9 @@ int Heartbeater::Thread::GetMillisUntilNextHeartbeat() const {
 
 Status Heartbeater::Thread::DoHeartbeat(MasterErrorPB* error,
                                         ErrorStatusPB* error_status) {
+  // Update the tablet statistics if necessary.
+  server_->tablet_manager()->UpdateTabletStatsIfNecessary();
+
   if (PREDICT_FALSE(server_->fail_heartbeats_for_tests())) {
     return Status::IOError("failing all heartbeats for tests");
   }
@@ -481,7 +461,11 @@ Status Heartbeater::Thread::DoHeartbeat(MasterErrorPB* error,
                           master_address_.ToString());
     GenerateIncrementalTabletReport(req.mutable_tablet_report());
   }
+
   req.set_num_live_tablets(server_->tablet_manager()->GetNumLiveTablets());
+  auto num_live_tablets_by_dimension = server_->tablet_manager()->GetNumLiveTabletsByDimension();
+  req.mutable_num_live_tablets_by_dimension()->insert(num_live_tablets_by_dimension.begin(),
+                                                      num_live_tablets_by_dimension.end());
 
   VLOG(2) << "Sending heartbeat:\n" << SecureDebugString(req);
   master::TSHeartbeatResponsePB resp;
@@ -584,13 +568,27 @@ void Heartbeater::Thread::RunThread() {
     const auto& s = DoHeartbeat(&error, &error_status);
     if (!s.ok()) {
       const auto& err_msg = s.ToString();
-      LOG(WARNING) << Substitute("Failed to heartbeat to $0: $1",
-                                 master_address_.ToString(), err_msg);
+      KLOG_EVERY_N_SECS(WARNING, 60)
+          << Substitute("Failed to heartbeat to $0 ($1 consecutive failures): $2",
+                        master_address_.ToString(), consecutive_failed_heartbeats_, err_msg);
       consecutive_failed_heartbeats_++;
-      // If we encountered a network error (e.g., connection
-      // refused), try reconnecting.
+
+      // Reset master proxy if too many heartbeats failed in a row. The idea
+      // is to do so when HBs have already backed off from the 'fast HB retry'
+      // behavior. This might be useful in situations when NetworkError isn't
+      // going to be received from the remote side any soon, so resetting
+      // the proxy is a viable alternative to try.
+      //
+      // The 'num_failures_to_reset_proxy' is the number of consecutive errors
+      // to happen before the master proxy is reset again.
+      const auto num_failures_to_reset_proxy =
+          FLAGS_heartbeat_max_failures_before_backoff * 10;
+
+      // If we encountered a network error (e.g., connection refused) or
+      // there were too many consecutive errors while sending heartbeats since
+      // the proxy was reset last time, try reconnecting.
       if (s.IsNetworkError() ||
-          consecutive_failed_heartbeats_ >= FLAGS_heartbeat_max_failures_before_backoff) {
+          consecutive_failed_heartbeats_ % num_failures_to_reset_proxy == 0) {
         proxy_.reset();
       }
       string msg;
@@ -668,28 +666,31 @@ void Heartbeater::Thread::TriggerASAP() {
   cond_.Signal();
 }
 
-void Heartbeater::Thread::MarkTabletDirty(const string& tablet_id, const string& reason) {
+void Heartbeater::Thread::MarkTabletsDirty(const vector<string>& tablet_ids,
+                                           const string& /*reason*/) {
   std::lock_guard<simple_spinlock> l(dirty_tablets_lock_);
 
   // Even though this is an atomic load, it needs to hold the lock. To see why,
   // consider this sequence:
   // 0. Tablet t exists in dirty_tablets_.
-  // 1. T1 calls MarkTabletDirty(t), loads x from next_report_seq_, and is
+  // 1. T1 calls MarkTabletsDirty(t), loads x from next_report_seq_, and is
   //    descheduled.
   // 2. T2 generates a tablet report, incrementing next_report_seq_ to x+1.
-  // 3. T3 calls MarkTabletDirty(t), loads x+1 into next_report_seq_, and
+  // 3. T3 calls MarkTabletsDirty(t), loads x+1 into next_report_seq_, and
   //    writes x+1 to state->change_seq.
   // 4. T1 is scheduled. It tries to write x to state->change_seq, failing the
   //    CHECK_GE().
   int32_t seqno = next_report_seq_.load();
 
-  TabletReportState* state = FindOrNull(dirty_tablets_, tablet_id);
-  if (state != nullptr) {
-    CHECK_GE(seqno, state->change_seq);
-    state->change_seq = seqno;
-  } else {
-    TabletReportState state = { seqno };
-    InsertOrDie(&dirty_tablets_, tablet_id, state);
+  for (const auto& tablet_id : tablet_ids) {
+    TabletReportState* state = FindOrNull(dirty_tablets_, tablet_id);
+    if (state != nullptr) {
+      CHECK_GE(seqno, state->change_seq);
+      state->change_seq = seqno;
+    } else {
+      TabletReportState state = { seqno };
+      InsertOrDie(&dirty_tablets_, tablet_id, state);
+    }
   }
 }
 
@@ -711,6 +712,22 @@ void Heartbeater::Thread::GenerateFullTabletReport(TabletReportPB* report) {
   report->set_sequence_number(next_report_seq_.fetch_add(1));
   report->set_is_incremental(false);
   server_->tablet_manager()->PopulateFullTabletReport(report);
+}
+
+Status Heartbeater::Thread::MasterServiceProxyForHostPort(
+    gscoped_ptr<MasterServiceProxy>* proxy) {
+  vector<Sockaddr> addrs;
+  RETURN_NOT_OK(server_->dns_resolver()->ResolveAddresses(master_address_,
+                                                          &addrs));
+  CHECK(!addrs.empty());
+  if (addrs.size() > 1) {
+    LOG(WARNING) << Substitute(
+        "Master address '$0' resolves to $1 different addresses. Using $2",
+        master_address_.ToString(), addrs.size(), addrs[0].ToString());
+  }
+  proxy->reset(new MasterServiceProxy(
+      server_->messenger(), addrs[0], master_address_.host()));
+  return Status::OK();
 }
 
 } // namespace tserver

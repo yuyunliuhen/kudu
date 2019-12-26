@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <stdint.h>
+
 #include <algorithm>
 #include <memory>
 #include <ostream>
 #include <string>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -32,6 +35,7 @@
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/walltime.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master-test-util.h"
 #include "kudu/master/master.h"
@@ -64,6 +68,7 @@ DECLARE_int32(heartbeat_interval_ms);
 METRIC_DECLARE_counter(rows_inserted);
 METRIC_DECLARE_counter(rows_updated);
 
+using boost::none;
 using std::shared_ptr;
 using std::string;
 using std::vector;
@@ -111,7 +116,7 @@ void CreateTableForTesting(MiniMaster* mini_master,
     {
       CatalogManager::ScopedLeaderSharedLock l(catalog);
       ASSERT_OK(l.first_failed_status());
-      ASSERT_OK(catalog->IsCreateTableDone(&req, &resp));
+      ASSERT_OK(catalog->IsCreateTableDone(&req, &resp, /*user=*/none));
     }
     if (resp.done()) {
       is_table_created = true;
@@ -143,6 +148,7 @@ class RegistrationTest : public KuduTest {
   void SetUp() override {
     // Make heartbeats faster to speed test runtime.
     FLAGS_heartbeat_interval_ms = 10;
+    setup_time_ = WallTime_Now();
 
     KuduTest::SetUp();
 
@@ -183,6 +189,7 @@ class RegistrationTest : public KuduTest {
           cluster_->mini_master()->master()->catalog_manager();
       Status s;
       TabletLocationsPB loc;
+      CatalogManager::TSInfosDict infos_dict;
       do {
         master::CatalogManager::ScopedLeaderSharedLock l(catalog);
         const Status& ls = l.first_failed_status();
@@ -194,9 +201,13 @@ class RegistrationTest : public KuduTest {
           break;  // exiting out of the 'do {...} while (false)' scope
         }
         RETURN_NOT_OK(ls);
-        s = catalog->GetTabletLocations(tablet_id, master::VOTER_REPLICA, &loc);
+        s = catalog->GetTabletLocations(tablet_id,
+                                        master::VOTER_REPLICA,
+                                        &loc,
+                                        &infos_dict,
+                                        /*user=*/none);
       } while (false);
-      if (s.ok() && loc.replicas_size() == expected_count) {
+      if (s.ok() && loc.interned_replicas_size() == expected_count) {
         if (locations) {
           *locations = std::move(loc);
         }
@@ -209,6 +220,7 @@ class RegistrationTest : public KuduTest {
  protected:
   gscoped_ptr<InternalMiniCluster> cluster_;
   Schema schema_;
+  int64_t setup_time_;
 };
 
 TEST_F(RegistrationTest, TestTSRegisters) {
@@ -227,18 +239,29 @@ TEST_F(RegistrationTest, TestTSRegisters) {
         << "Should not include wildcards in registration";
   }
 
-  ASSERT_NO_FATAL_FAILURE(CheckTabletServersPage());
+  NO_FATALS(CheckTabletServersPage());
 
   // Restart the master, so it loses the descriptor, and ensure that the
   // heartbeater thread handles re-registering.
   cluster_->mini_master()->Shutdown();
   ASSERT_OK(cluster_->mini_master()->Restart());
 
-  ASSERT_OK(cluster_->WaitForTabletServerCount(1));
+  int64_t seqno = descs.back()->latest_seqno();
+  descs.clear();
+  ASSERT_OK(cluster_->WaitForTabletServerCount(
+      1, InternalMiniCluster::MatchMode::MATCH_TSERVERS, &descs));
+  ASSERT_EQ(descs.back()->latest_seqno(), seqno);
 
-  // TODO: when the instance ID / sequence number stuff is implemented,
-  // restart the TS and ensure that it re-registers with the newer sequence
-  // number.
+  // Restart the tserver, so it will register, and ensure that it gets the
+  // newer sequence number.
+  cluster_->mini_tablet_server(0)->Shutdown();
+  ASSERT_OK(cluster_->mini_tablet_server(0)->Restart());
+
+  seqno = descs.back()->latest_seqno();
+  descs.clear();
+  ASSERT_OK(cluster_->WaitForTabletServerCount(
+      1, InternalMiniCluster::MatchMode::MATCH_TSERVERS, &descs));
+  ASSERT_GT(descs.back()->latest_seqno(), seqno);
 }
 
 TEST_F(RegistrationTest, TestMasterSoftwareVersion) {
@@ -250,6 +273,21 @@ TEST_F(RegistrationTest, TestMasterSoftwareVersion) {
     ASSERT_TRUE(reg.has_software_version());
     ASSERT_STR_CONTAINS(reg.software_version(),
                         VersionInfo::GetVersionInfo());
+    ASSERT_LE(setup_time_, reg.start_time());
+    ASSERT_LE(reg.start_time(), WallTime_Now());
+  }
+}
+
+TEST_F(RegistrationTest, TestServerStartTime) {
+  ServerRegistrationPB reg;
+  cluster_->mini_master()->master()->GetMasterRegistration(&reg);
+  ASSERT_LE(setup_time_, reg.start_time());
+  ASSERT_LE(reg.start_time(), WallTime_Now());
+
+  for (int i = 0; i < cluster_->num_tablet_servers(); ++i) {
+    auto start_time = cluster_->mini_tablet_server(i)->server()->start_time();
+    ASSERT_LE(setup_time_, start_time);
+    ASSERT_LE(start_time, WallTime_Now());
   }
 }
 
@@ -276,7 +314,7 @@ TEST_F(RegistrationTest, TestTabletReports) {
       cluster_->mini_master(), "tablet-reports-1", schema_, &tablet_id_1));
   TabletLocationsPB locs_1;
   ASSERT_OK(WaitForReplicaCount(tablet_id_1, 1, &locs_1));
-  ASSERT_EQ(1, locs_1.replicas_size());
+  ASSERT_EQ(1, locs_1.interned_replicas_size());
 
   // Check that we inserted the right number of rows for the new single-tablet table
   // (one for the table, one for the tablet).
@@ -358,7 +396,7 @@ TEST_F(RegistrationTest, TestExposeHttpsURLs) {
   // dealing with figuring out what the hostname should be, just
   // use a more permissive regex which doesn't check the host.
   string expected_url_regex = strings::Substitute(
-      "https://[a-zA-Z0-9.-]+:$0/", opts->port);
+      "https://[a-zA-Z0-9.-]+:$0", opts->port);
 
   // Need "eventually" here because the tserver may take a few seconds
   // to re-register while starting up.

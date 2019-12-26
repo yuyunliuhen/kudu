@@ -20,6 +20,8 @@
 #define KUDU_COMMON_WIRE_PROTOCOL_H
 
 #include <cstdint>
+#include <map>
+#include <string>
 #include <vector>
 
 #include "kudu/util/status.h"
@@ -32,6 +34,7 @@ class optional;
 namespace google {
 namespace protobuf {
 template <typename Element> class RepeatedPtrField;
+template <typename Key, typename T> class Map;
 }
 }
 
@@ -56,6 +59,8 @@ class HostPortPB;
 class RowwiseRowBlockPB;
 class SchemaPB;
 class ServerEntryPB;
+class ServerRegistrationPB;
+class TableExtraConfigPB;
 
 // Convert the given C++ Status object into the equivalent Protobuf.
 void StatusToPB(const Status& status, AppStatusPB* pb);
@@ -90,6 +95,8 @@ enum SchemaPBConversionFlags {
   // protobuf. Used when sending schemas from the client to the master
   // for create/alter table.
   SCHEMA_PB_WITHOUT_WRITE_DEFAULT = 1 << 2,
+
+  SCHEMA_PB_WITHOUT_COMMENT = 1 << 3,
 };
 
 // Convert the specified schema to protobuf.
@@ -105,7 +112,8 @@ Status SchemaFromPB(const SchemaPB& pb, Schema *schema);
 void ColumnSchemaToPB(const ColumnSchema& schema, ColumnSchemaPB *pb, int flags = 0);
 
 // Return the ColumnSchema created from the specified protobuf.
-ColumnSchema ColumnSchemaFromPB(const ColumnSchemaPB& pb);
+// If the column schema is invalid, return a non-OK status.
+Status ColumnSchemaFromPB(const ColumnSchemaPB& pb, boost::optional<ColumnSchema>* col_schema);
 
 // Convert the given list of ColumnSchemaPB objects into a Schema object.
 //
@@ -134,6 +142,21 @@ Status ColumnPredicateFromPB(const Schema& schema,
                              Arena* arena,
                              const ColumnPredicatePB& pb,
                              boost::optional<ColumnPredicate>* predicate);
+
+// Convert a extra configuration properties protobuf to map.
+Status ExtraConfigPBToMap(const TableExtraConfigPB& pb,
+                          std::map<std::string, std::string>* configs);
+
+// Convert the table's extra configuration protobuf::map to protobuf.
+Status ExtraConfigPBFromPBMap(const google::protobuf::Map<std::string, std::string>& configs,
+                              TableExtraConfigPB* pb);
+
+// Parse int32_t type value from 'value', and store in 'result' when succeed.
+Status ParseInt32Config(const std::string& name, const std::string& value, int32_t* result);
+
+// Convert a extra configuration properties protobuf to protobuf::map.
+Status ExtraConfigPBToPBMap(const TableExtraConfigPB& pb,
+                            google::protobuf::Map<std::string, std::string>* configs);
 
 // Encode the given row block into the provided protobuf and data buffers.
 //
@@ -195,5 +218,8 @@ Status ExtractRowsFromRowBlockPB(const Schema& schema,
 Status FindLeaderHostPort(const google::protobuf::RepeatedPtrField<ServerEntryPB>& entries,
                           HostPort* leader_hostport);
 
+// Extract 'start_time' in ServerRegistrationPB, and convert it to localtime as a string
+// or '<unknown>' if lack this field.
+std::string StartTimeToString(const ServerRegistrationPB& reg);
 } // namespace kudu
 #endif

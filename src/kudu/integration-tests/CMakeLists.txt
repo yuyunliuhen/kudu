@@ -23,7 +23,9 @@ endif()
 set(INTEGRATION_TESTS_SRCS
   cluster_itest_util.cc
   cluster_verifier.cc
+  data_gen_util.cc
   external_mini_cluster-itest-base.cc
+  hms_itest-base.cc
   internal_mini_cluster-itest-base.cc
   log_verifier.cc
   mini_cluster_fs_inspector.cc
@@ -44,6 +46,7 @@ target_link_libraries(itest_util
   kudu_curl_util
   kudu_fs
   kudu_test_util
+  kudu_tools_test_util
   kudu_tools_util
   security_test_util)
 add_dependencies(itest_util
@@ -51,14 +54,16 @@ add_dependencies(itest_util
   kudu-tserver)
 
 # Tests
-SET_KUDU_TEST_LINK_LIBS(itest_util)
+SET_KUDU_TEST_LINK_LIBS(itest_util gumbo-parser gumbo-query)
 ADD_KUDU_TEST(all_types-itest
   PROCESSORS 4
   NUM_SHARDS 8)
-ADD_KUDU_TEST(alter_table-randomized-test NUM_SHARDS 2 PROCESSORS 4)
+ADD_KUDU_TEST(alter_table-randomized-test NUM_SHARDS 3 PROCESSORS 4)
 ADD_KUDU_TEST(alter_table-test PROCESSORS 3)
-ADD_KUDU_TEST(authn_token_expire-itest)
+ADD_KUDU_TEST(auth_token_expire-itest)
+ADD_KUDU_TEST(authz_token-itest PROCESSORS 2)
 ADD_KUDU_TEST(catalog_manager_tsk-itest PROCESSORS 2)
+ADD_KUDU_TEST(varchar-itest)
 ADD_KUDU_TEST(client_failover-itest)
 ADD_KUDU_TEST(client-negotiation-failover-itest)
 ADD_KUDU_TEST(client-stress-test
@@ -79,6 +84,7 @@ ADD_KUDU_TEST(fuzz-itest RUN_SERIAL true)
 ADD_KUDU_TEST(heavy-update-compaction-itest RUN_SERIAL true)
 ADD_KUDU_TEST(linked_list-test RUN_SERIAL true)
 ADD_KUDU_TEST(log-rolling-itest)
+ADD_KUDU_TEST(maintenance_mode-itest)
 ADD_KUDU_TEST(master_cert_authority-itest PROCESSORS 2)
 ADD_KUDU_TEST(master_failover-itest NUM_SHARDS 4 PROCESSORS 3)
 ADD_KUDU_TEST_DEPENDENCIES(master_failover-itest
@@ -88,7 +94,11 @@ ADD_KUDU_TEST(master_migration-itest)
 ADD_KUDU_TEST_DEPENDENCIES(master_migration-itest
   kudu)
 ADD_KUDU_TEST(master_replication-itest)
-ADD_KUDU_TEST(master-stress-test RUN_SERIAL true)
+ADD_KUDU_TEST(master_sentry-itest RUN_SERIAL true NUM_SHARDS 8 PROCESSORS 4)
+ADD_KUDU_TEST(master-stress-test RUN_SERIAL true NUM_SHARDS 3)
+if(${KUDU_TCMALLOC_AVAILABLE})
+  ADD_KUDU_TEST(memory_gc-itest)
+endif()
 ADD_KUDU_TEST(multidir_cluster-itest)
 ADD_KUDU_TEST(open-readonly-fs-itest PROCESSORS 4)
 ADD_KUDU_TEST(raft_config_change-itest)
@@ -104,7 +114,7 @@ ADD_KUDU_TEST(security-itest)
 ADD_KUDU_TEST(security-master-auth-itest)
 ADD_KUDU_TEST(security-unknown-tsk-itest PROCESSORS 4)
 ADD_KUDU_TEST(stop_tablet-itest PROCESSORS 4)
-ADD_KUDU_TEST(table_locations-itest
+ADD_KUDU_TEST(table_locations-itest RUN_SERIAL true
   DATA_FILES ../scripts/first_argument.sh)
 ADD_KUDU_TEST(tablet_copy-itest NUM_SHARDS 6 PROCESSORS 4)
 ADD_KUDU_TEST(tablet_copy_client_session-itest)
@@ -115,11 +125,13 @@ ADD_KUDU_TEST(tombstoned_voting-imc-itest)
 ADD_KUDU_TEST(tombstoned_voting-itest)
 ADD_KUDU_TEST(tombstoned_voting-stress-test RUN_SERIAL true)
 ADD_KUDU_TEST(token_signer-itest)
-ADD_KUDU_TEST(ts_location_assignment-itest
+ADD_KUDU_TEST(location_assignment-itest
   DATA_FILES ../scripts/assign-location.py)
 ADD_KUDU_TEST(ts_recovery-itest PROCESSORS 4)
+ADD_KUDU_TEST(ts_sentry-itest NUM_SHARDS 2)
 ADD_KUDU_TEST(ts_tablet_manager-itest)
 ADD_KUDU_TEST(update_scan_delta_compact-test RUN_SERIAL true)
+ADD_KUDU_TEST(webserver-crawl-itest LABELS no_dist_test)
 ADD_KUDU_TEST(webserver-stress-itest RUN_SERIAL true)
 ADD_KUDU_TEST(write_throttling-itest)
 

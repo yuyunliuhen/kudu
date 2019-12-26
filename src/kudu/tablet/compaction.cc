@@ -23,7 +23,6 @@
 #include <memory>
 #include <ostream>
 #include <string>
-#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -116,7 +115,7 @@ class MemRowSetCompactionInput : public CompactionInput {
     // Realloc the internal block storage if we don't have enough space to
     // copy the whole leaf node's worth of data into it.
     if (PREDICT_FALSE(!row_block_ || num_in_block > row_block_->nrows())) {
-      row_block_.reset(new RowBlock(iter_->schema(), num_in_block, nullptr));
+      row_block_.reset(new RowBlock(&iter_->schema(), num_in_block, nullptr));
     }
 
     arena_.Reset();
@@ -136,7 +135,8 @@ class MemRowSetCompactionInput : public CompactionInput {
       // Handle the rare case where a row was inserted and deleted in the same operation.
       // This row can never be observed and should not be compacted/flushed. This saves
       // us some trouble later on on compactions.
-      // See: MergeCompactionInput::CompareAndMergeDuplicatedRows().
+      //
+      // See CompareDuplicatedRows().
       if (PREDICT_FALSE(input_row.redo_head != nullptr &&
           input_row.redo_head->timestamp() == insertion_timestamp)) {
         // Get the latest mutation.
@@ -181,7 +181,7 @@ class MemRowSetCompactionInput : public CompactionInput {
   DISALLOW_COPY_AND_ASSIGN(MemRowSetCompactionInput);
   gscoped_ptr<RowBlock> row_block_;
 
-  gscoped_ptr<MemRowSet::Iterator> iter_;
+  unique_ptr<MemRowSet::Iterator> iter_;
 
   // Arena used to store the projected undo/redo mutations of the current block.
   Arena arena_;
@@ -196,14 +196,14 @@ class MemRowSetCompactionInput : public CompactionInput {
 // CompactionInput yielding rows and mutations from an on-disk DiskRowSet.
 class DiskRowSetCompactionInput : public CompactionInput {
  public:
-  DiskRowSetCompactionInput(gscoped_ptr<RowwiseIterator> base_iter,
+  DiskRowSetCompactionInput(unique_ptr<RowwiseIterator> base_iter,
                             unique_ptr<DeltaIterator> redo_delta_iter,
                             unique_ptr<DeltaIterator> undo_delta_iter)
       : base_iter_(std::move(base_iter)),
         redo_delta_iter_(std::move(redo_delta_iter)),
         undo_delta_iter_(std::move(undo_delta_iter)),
         arena_(32 * 1024),
-        block_(base_iter_->schema(), kRowsPerBlock, &arena_),
+        block_(&base_iter_->schema(), kRowsPerBlock, &arena_),
         redo_mutation_block_(kRowsPerBlock, static_cast<Mutation *>(nullptr)),
         undo_mutation_block_(kRowsPerBlock, static_cast<Mutation *>(nullptr)) {}
 
@@ -260,7 +260,7 @@ class DiskRowSetCompactionInput : public CompactionInput {
 
  private:
   DISALLOW_COPY_AND_ASSIGN(DiskRowSetCompactionInput);
-  gscoped_ptr<RowwiseIterator> base_iter_;
+  unique_ptr<RowwiseIterator> base_iter_;
   unique_ptr<DeltaIterator> redo_delta_iter_;
   unique_ptr<DeltaIterator> undo_delta_iter_;
 
@@ -455,7 +455,7 @@ class MergeCompactionInput : public CompactionInput {
 
     while (true) {
       int smallest_idx = -1;
-      CompactionInputRow* smallest;
+      CompactionInputRow* smallest = nullptr;
 
       // Iterate over the inputs to find the one with the smallest next row.
       // It may seem like an O(n lg k) merge using a heap would be more efficient,
@@ -690,7 +690,7 @@ class MergeCompactionInput : public CompactionInput {
     num_dup_rows_++;
     if (row_idx == 0) {
       duplicated_rows_.push_back(std::unique_ptr<RowBlock>(
-          new RowBlock(*schema_, kDuplicatedRowsPerBlock, static_cast<Arena*>(nullptr))));
+          new RowBlock(schema_, kDuplicatedRowsPerBlock, static_cast<Arena*>(nullptr))));
     }
     return duplicated_rows_.back()->row(row_idx);
   }
@@ -853,8 +853,8 @@ Status CompactionInput::Create(const DiskRowSet &rowset,
                                gscoped_ptr<CompactionInput>* out) {
   CHECK(projection->has_column_ids());
 
-  shared_ptr<ColumnwiseIterator> base_cwise(rowset.base_data_->NewIterator(projection, io_context));
-  gscoped_ptr<RowwiseIterator> base_iter(new MaterializingIterator(base_cwise));
+  unique_ptr<ColumnwiseIterator> base_cwise(rowset.base_data_->NewIterator(projection, io_context));
+  unique_ptr<RowwiseIterator> base_iter(NewMaterializingIterator(std::move(base_cwise)));
 
   // Creates a DeltaIteratorMerger that will only include the relevant REDO deltas.
   RowIteratorOptions redo_opts;
@@ -919,11 +919,11 @@ Status RowSetsInCompaction::CreateCompactionInput(const MvccSnapshot &snap,
 }
 
 void RowSetsInCompaction::DumpToLog() const {
-  LOG(INFO) << "Selected " << rowsets_.size() << " rowsets to compact:";
+  VLOG(1) << "Selected " << rowsets_.size() << " rowsets to compact:";
   // Dump the selected rowsets to the log, and collect corresponding iterators.
   for (const shared_ptr<RowSet> &rs : rowsets_) {
-    LOG(INFO) << rs->ToString() << "(current size on disk: ~"
-              << rs->OnDiskSize() << " bytes)";
+    VLOG(1) << rs->ToString() << "(current size on disk: ~"
+            << rs->OnDiskSize() << " bytes)";
   }
 }
 
@@ -1102,12 +1102,13 @@ Status FlushCompactionInput(CompactionInput* input,
 
   DCHECK(out->schema().has_column_ids());
 
-  RowBlock block(out->schema(), kCompactionOutputBlockNumRows, nullptr);
+  RowBlock block(&out->schema(), kCompactionOutputBlockNumRows, nullptr);
 
   while (input->HasMoreBlocks()) {
     RETURN_NOT_OK(input->PrepareBlock(&rows));
 
     int n = 0;
+    int live_row_count = 0;
     for (int i = 0; i < rows.size(); i++) {
       CompactionInputRow* input_row = &rows[i];
       RETURN_NOT_OK(out->RollIfNecessary());
@@ -1163,19 +1164,25 @@ Status FlushCompactionInput(CompactionInput* input,
         out->AppendRedoDeltas(dst_row.row_index(), new_redos_head, &index_in_current_drs);
       }
 
+      // If the REDO is empty, it should not be a DELETE.
+      if (new_redos_head == nullptr) {
+        live_row_count++;
+      }
+
       DVLOG(4) << "Output Row: " << dst_row.schema()->DebugRow(dst_row)
                << "; RowId: " << index_in_current_drs;
 
       n++;
       if (n == block.nrows()) {
-        RETURN_NOT_OK(out->AppendBlock(block));
+        RETURN_NOT_OK(out->AppendBlock(block, live_row_count));
+        live_row_count = 0;
         n = 0;
       }
     }
 
     if (n > 0) {
       block.Resize(n);
-      RETURN_NOT_OK(out->AppendBlock(block));
+      RETURN_NOT_OK(out->AppendBlock(block, live_row_count));
       block.Resize(block.row_capacity());
     }
 
@@ -1216,7 +1223,6 @@ Status ReupdateMissedDeltas(const IOContext* io_context,
   // updates. So, this can be made much faster.
   vector<CompactionInputRow> rows;
   const Schema* schema = &input->schema();
-  const Schema key_schema(input->schema().CreateKeyProjection());
 
   rowid_t output_row_offset = 0;
   while (input->HasMoreBlocks()) {

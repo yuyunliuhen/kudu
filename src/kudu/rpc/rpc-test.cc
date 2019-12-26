@@ -72,6 +72,9 @@ METRIC_DECLARE_histogram(rpc_incoming_queue_time);
 
 DECLARE_bool(rpc_reopen_outbound_connections);
 DECLARE_int32(rpc_negotiation_inject_delay_ms);
+DECLARE_int32(tcp_keepalive_probe_period_s);
+DECLARE_int32(tcp_keepalive_retry_period_s);
+DECLARE_int32(tcp_keepalive_retry_count);
 
 using std::shared_ptr;
 using std::string;
@@ -534,12 +537,25 @@ TEST_P(TestRpc, TestClientConnectionMetrics) {
     });
 
     // Test the OutboundTransfer queue.
-    DumpRunningRpcsRequestPB dump_req;
-    DumpRunningRpcsResponsePB dump_resp;
+    DumpConnectionsRequestPB dump_req;
+    DumpConnectionsResponsePB dump_resp;
     dump_req.set_include_traces(false);
-    ASSERT_OK(client_messenger->DumpRunningRpcs(dump_req, &dump_resp));
+    ASSERT_OK(client_messenger->DumpConnections(dump_req, &dump_resp));
     ASSERT_EQ(1, dump_resp.outbound_connections_size());
-    ASSERT_GT(dump_resp.outbound_connections(0).outbound_queue_size(), 0);
+    const auto& conn = dump_resp.outbound_connections(0);
+    ASSERT_GT(conn.outbound_queue_size(), 0);
+
+#ifdef __linux__
+    // Test that the socket statistics are present. We only assert on those that
+    // we know to be present on all kernel versions.
+    ASSERT_TRUE(conn.has_socket_stats());
+    ASSERT_GT(conn.socket_stats().rtt(), 0);
+    ASSERT_GT(conn.socket_stats().rttvar(), 0);
+    ASSERT_GT(conn.socket_stats().snd_cwnd(), 0);
+    ASSERT_GT(conn.socket_stats().send_bytes_per_sec(), 0);
+    ASSERT_TRUE(conn.socket_stats().has_send_queue_bytes());
+    ASSERT_TRUE(conn.socket_stats().has_receive_queue_bytes());
+#endif
 
     // Unblock all of the calls and wait for them to finish.
     latch.Wait();
@@ -768,6 +784,34 @@ TEST_P(TestRpc, TestCallLongerThanKeepalive) {
                                  req, &resp, &controller));
 }
 
+// Test a call which leaves the TCP connection idle for extended period of time
+// and verifies that the call succeeds (i.e. the connection is not closed).
+TEST_P(TestRpc, TestTCPKeepalive) {
+  // Set up server.
+  Sockaddr server_addr;
+  bool enable_ssl = GetParam();
+  ASSERT_OK(StartTestServer(&server_addr, enable_ssl));
+
+  // Set up client.
+  FLAGS_tcp_keepalive_probe_period_s = 1;
+  FLAGS_tcp_keepalive_retry_period_s = 1;
+  FLAGS_tcp_keepalive_retry_count = 1;
+  shared_ptr<Messenger> client_messenger;
+  ASSERT_OK(CreateMessenger("Client", &client_messenger, 1, enable_ssl));
+  Proxy p(client_messenger, server_addr, server_addr.host(),
+      GenericCalculatorService::static_service_name());
+
+  // Make a call which sleeps for longer than TCP keepalive probe period,
+  // triggering TCP keepalive probes.
+  RpcController controller;
+  SleepRequestPB req;
+  req.set_sleep_micros(8 * 1000 * 1000); // 8 seconds.
+  req.set_deferred(true);
+  SleepResponsePB resp;
+  ASSERT_OK(p.SyncRequest(GenericCalculatorService::kSleepMethodName,
+      req, &resp, &controller));
+}
+
 // Test that the RpcSidecar transfers the expected messages.
 TEST_P(TestRpc, TestRpcSidecar) {
   // Set up server.
@@ -898,15 +942,15 @@ TEST_P(TestRpc, TestCallTimeout) {
   // Test a very short timeout - we expect this will time out while the
   // call is still trying to connect, or in the send queue. This was triggering ASAN failures
   // before.
-  ASSERT_NO_FATAL_FAILURE(DoTestExpectTimeout(p, MonoDelta::FromNanoseconds(1)));
+  NO_FATALS(DoTestExpectTimeout(p, MonoDelta::FromNanoseconds(1)));
 
   // Test a longer timeout - expect this will time out after we send the request,
   // but shorter than our threshold for two-stage timeout handling.
-  ASSERT_NO_FATAL_FAILURE(DoTestExpectTimeout(p, MonoDelta::FromMilliseconds(200)));
+  NO_FATALS(DoTestExpectTimeout(p, MonoDelta::FromMilliseconds(200)));
 
   // Test a longer timeout - expect this will trigger the "two-stage timeout"
   // code path.
-  ASSERT_NO_FATAL_FAILURE(DoTestExpectTimeout(p, MonoDelta::FromMilliseconds(1500)));
+  NO_FATALS(DoTestExpectTimeout(p, MonoDelta::FromMilliseconds(1500)));
 }
 
 // Inject 500ms delay in negotiation, and send a call with a short timeout, followed by
@@ -926,7 +970,7 @@ TEST_P(TestRpc, TestCallTimeoutDoesntAffectNegotiation) {
           GenericCalculatorService::static_service_name());
 
   FLAGS_rpc_negotiation_inject_delay_ms = 500;
-  ASSERT_NO_FATAL_FAILURE(DoTestExpectTimeout(p, MonoDelta::FromMilliseconds(50)));
+  NO_FATALS(DoTestExpectTimeout(p, MonoDelta::FromMilliseconds(50)));
   ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName));
 
   // Only the second call should have been received by the server, because we
@@ -971,7 +1015,7 @@ TEST_F(TestRpc, TestNegotiationTimeout) {
           GenericCalculatorService::static_service_name());
 
   bool is_negotiation_error = false;
-  ASSERT_NO_FATAL_FAILURE(DoTestExpectTimeout(
+  NO_FATALS(DoTestExpectTimeout(
       p, MonoDelta::FromMilliseconds(100), &is_negotiation_error));
   EXPECT_TRUE(is_negotiation_error);
 
@@ -1054,11 +1098,15 @@ TEST_F(TestRpc, TestServerShutsDown) {
     // EINVAL is possible if the controller socket had already disconnected by
     // the time it trys to set the SO_SNDTIMEO socket option as part of the
     // normal blocking SASL handshake.
+    //
+    // ENOTCONN is possible simply because the server closes the connection
+    // after the connection is established.
     ASSERT_TRUE(s.posix_code() == EPIPE ||
                 s.posix_code() == ECONNRESET ||
                 s.posix_code() == ESHUTDOWN ||
                 s.posix_code() == ECONNREFUSED ||
-                s.posix_code() == EINVAL)
+                s.posix_code() == EINVAL ||
+                s.posix_code() == ENOTCONN)
       << "Unexpected status: " << s.ToString();
   }
 }

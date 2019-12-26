@@ -21,9 +21,6 @@
 #include <cstdint>
 #include <utility>
 
-#include <gflags/gflags_declare.h>
-#include <glog/logging.h>
-
 #include "kudu/fs/block_id.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
@@ -31,8 +28,6 @@
 #include "kudu/gutil/singleton.h"
 #include "kudu/util/cache.h"
 #include "kudu/util/slice.h"
-
-DECLARE_string(block_cache_type);
 
 template <class T> class scoped_refptr;
 
@@ -50,7 +45,7 @@ class BlockCache {
  public:
   // Parse the gflag which configures the block cache. FATALs if the flag is
   // invalid.
-  static CacheType GetConfiguredCacheTypeOrDie();
+  static Cache::MemoryType GetConfiguredCacheMemoryTypeOrDie();
 
   // BlockId refers to the unique identifier for a Kudu block, that is, for an
   // entire CFile. This is different than the block cache's notion of a block,
@@ -81,9 +76,12 @@ class BlockCache {
   // cache insertion path.
   class PendingEntry {
    public:
-    PendingEntry() : cache_(nullptr), handle_(nullptr) {}
-    PendingEntry(Cache* cache, Cache::PendingHandle* handle)
-        : cache_(cache), handle_(handle) {
+    PendingEntry()
+        : handle_(Cache::UniquePendingHandle(nullptr,
+                                             Cache::PendingHandleDeleter(nullptr))) {
+    }
+    explicit PendingEntry(Cache::UniquePendingHandle handle)
+        : handle_(std::move(handle)) {
     }
     PendingEntry(PendingEntry&& other) noexcept : PendingEntry() {
       *this = std::move(other);
@@ -102,22 +100,21 @@ class BlockCache {
 
     // Return true if this is a valid pending entry.
     bool valid() const {
-      return handle_ != nullptr;
+      return static_cast<bool>(handle_);
     }
 
     // Return the pointer into which the value should be written.
     uint8_t* val_ptr() {
-      return cache_->MutableValue(handle_);
+      return handle_.get_deleter().cache()->MutableValue(&handle_);
     }
 
    private:
     friend class BlockCache;
 
-    Cache* cache_;
-    Cache::PendingHandle* handle_;
+    Cache::UniquePendingHandle handle_;
   };
 
-  static BlockCache *GetSingleton() {
+  static BlockCache* GetSingleton() {
     return Singleton<BlockCache>::get();
   }
 
@@ -176,27 +173,17 @@ class BlockCache {
 // Scoped reference to a block from the block cache.
 class BlockCacheHandle {
  public:
-  BlockCacheHandle() :
-    handle_(NULL)
-  {}
-
-  ~BlockCacheHandle() {
-    if (handle_ != NULL) {
-      Release();
-    }
+  BlockCacheHandle()
+      : handle_(Cache::UniqueHandle(nullptr, Cache::HandleDeleter(nullptr))) {
   }
 
-  void Release() {
-    CHECK_NOTNULL(cache_)->Release(CHECK_NOTNULL(handle_));
-    handle_ = NULL;
-  }
+  ~BlockCacheHandle() = default;
 
   // Swap this handle with another handle.
   // This can be useful to transfer ownership of a handle by swapping
   // with an empty BlockCacheHandle.
-  void swap(BlockCacheHandle *dst) {
-    std::swap(this->cache_, dst->cache_);
-    std::swap(this->handle_, dst->handle_);
+  void swap(BlockCacheHandle* dst) {
+    std::swap(handle_, dst->handle_);
   }
 
   // Return the data in the cached block.
@@ -204,46 +191,39 @@ class BlockCacheHandle {
   // NOTE: this slice is only valid until the block cache handle is
   // destructed or explicitly Released().
   Slice data() const {
-    return cache_->Value(handle_);
+    return handle_.get_deleter().cache()->Value(handle_);
   }
 
   bool valid() const {
-    return handle_ != NULL;
+    return static_cast<bool>(handle_);
   }
 
  private:
   DISALLOW_COPY_AND_ASSIGN(BlockCacheHandle);
   friend class BlockCache;
 
-  void SetHandle(Cache *cache, Cache::Handle *handle) {
-    if (handle_ != NULL) Release();
-
-    cache_ = cache;
-    handle_ = handle;
+  void SetHandle(Cache::UniqueHandle handle) {
+    handle_ = std::move(handle);
   }
 
-  Cache::Handle *handle_;
-  Cache *cache_;
+  Cache::UniqueHandle handle_;
 };
 
 
 inline BlockCache::PendingEntry& BlockCache::PendingEntry::operator=(
     BlockCache::PendingEntry&& other) noexcept {
   reset();
-  cache_ = other.cache_;
-  handle_ = other.handle_;
-  other.cache_ = nullptr;
-  other.handle_ = nullptr;
+  handle_ = std::move(other.handle_);
   return *this;
 }
 
 inline void BlockCache::PendingEntry::reset() {
-  if (cache_ && handle_) {
-    cache_->Free(handle_);
-  }
-  cache_ = nullptr;
-  handle_ = nullptr;
+  handle_.reset();
 }
+
+// Validates the block cache capacity. Won't permit the cache to grow large
+// enough to cause pernicious flushing behavior. See KUDU-2318.
+bool ValidateBlockCacheCapacity();
 
 } // namespace cfile
 } // namespace kudu

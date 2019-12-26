@@ -28,6 +28,7 @@
 #include <stdint.h>
 
 #include <cstddef>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,7 @@
 
 namespace kudu {
 
+class AuthzTokenTest;
 class ClientStressTest_TestUniqueClientIds_Test;
 class KuduPartialRow;
 class MonoDelta;
@@ -63,6 +65,7 @@ class KuduTable;
 
 namespace tools {
 class LeaderMasterProxy;
+class RemoteKsckCluster;
 } // namespace tools
 
 namespace client {
@@ -76,6 +79,7 @@ class KuduSession;
 class KuduStatusCallback;
 class KuduTableAlterer;
 class KuduTableCreator;
+class KuduTableStatistics;
 class KuduTablet;
 class KuduTabletServer;
 class KuduUpdate;
@@ -85,6 +89,8 @@ class KuduWriteOperation;
 class ResourceMetrics;
 
 namespace internal {
+template <class ReqClass, class RespClass>
+class AsyncLeaderMasterRpc; // IWYU pragma: keep
 class Batcher;
 class ErrorCollector;
 class GetTableSchemaRpc;
@@ -93,6 +99,7 @@ class MetaCache;
 class RemoteTablet;
 class RemoteTabletServer;
 class ReplicaController;
+class RetrieveAuthzTokenRpc;
 class WriteRpc;
 } // namespace internal
 
@@ -453,6 +460,16 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   Status GetTablet(const std::string& tablet_id,
                    KuduTablet** tablet) KUDU_NO_EXPORT;
 
+  /// Get the table statistics by table name.
+  ///
+  /// @param [in] table_name
+  ///   Name of the table.
+  /// @param [out] statistics
+  ///   Table statistics. The caller takes ownership of the statistics.
+  /// @return Operation status.
+  Status GetTableStatistics(const std::string& table_name,
+                            KuduTableStatistics** statistics);
+
   /// Get the master RPC addresses as configured on the last leader master this
   /// client connected to, as a CSV. If the client has not connected to a leader
   /// master, an empty string is returned.
@@ -468,8 +485,11 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   enum ReplicaSelection {
     LEADER_ONLY,      ///< Select the LEADER replica.
 
-    CLOSEST_REPLICA,  ///< Select the closest replica to the client,
-                      ///< or a random one if all replicas are equidistant.
+    CLOSEST_REPLICA,  ///< Select the closest replica to the client.
+                      ///< Local replicas are considered the closest,
+                      ///< followed by replicas in the same location as the
+                      ///< client, followed by all other replicas. If there are
+                      ///< multiple closest replicas, one is chosen randomly.
 
     FIRST_REPLICA     ///< Select the first replica in the list.
   };
@@ -490,38 +510,9 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
 
   /// Get the highest HybridTime timestamp observed by the client.
   ///
-  /// The latest observed timestamp can be used to start a snapshot scan on a
-  /// table which is guaranteed to contain all data written or previously read
-  /// by this client. See KuduScanner for more details on timestamps.
-  ///
-  /// How to get Read-Your-Writes consistency:
-  /// the code snippet below uses KuduClient::GetLatestObservedTimestamp() along
-  /// with KuduScanner::SetSnapshotRaw() to perform READ_AT_SNAPSHOT scan
-  /// containing the data which has just been written.  Notice extra 1
-  /// added to the timestamp passed to KuduScanner::SetSnapshotRaw():
-  /// @code
-  ///   shared_ptr<KuduClient> client;
-  ///   ... // open/initialize the client
-  ///   shared_ptr<KuduSession> session(client->NewSession());
-  ///   ... // set Kudu session properties
-  ///   shared_ptr<KuduTable> table;
-  ///   ... // open the table
-  ///   unique_ptr<KuduInsert> insert_op(table->NewInsert());
-  ///   ... // populate new insert operation with data
-  ///   RETURN_NOT_OK(session->Apply(insert_op.release()));
-  ///   RETURN_NOT_OK(session->Flush());
-  ///   uint64_t snapshot_timestamp = client->GetLatestObservedTimestamp() + 1;
-  ///   KuduScanner scanner(table.get());
-  ///   RETURN_NOT_OK(scanner.SetSnapshotRaw(snapshot_timestamp));
-  ///   RETURN_NOT_OK(scanner.SetSelection(KuduClient::LEADER_ONLY));
-  ///   RETURN_NOT_OK(scanner.SetReadMode(KuduScanner::READ_AT_SNAPSHOT));
-  ///   RETURN_NOT_OK(scanner.Open());
-  ///   ... // retrieve scanned rows
-  /// @endcode
-  /// There are currently races in which, in rare occasions, Read-Your-Writes
-  /// consistency might not hold even in this case. These are being
-  /// taken care of as part of
-  /// <a href="https://issues.apache.org/jira/browse/KUDU-430">KUDU-430</a>
+  /// This is useful when retrieving timestamp from one client and
+  /// forwarding it to another to enforce external consistency when
+  /// using KuduSession::CLIENT_PROPAGATED external consistency mode.
   ///
   /// @note This method is experimental and will either disappear or
   ///   change in a future release.
@@ -585,10 +576,20 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   ///   arbitrary value if the Hive Metastore integration is not enabled.
   std::string GetHiveMetastoreUuid() const KUDU_NO_EXPORT;
 
+  /// Private API.
+  ///
+  /// @return The location of the client, assigned when it first connects to
+  ///   a cluster. An empty string will be returned if no location has been
+  ///   assigned yet, or if the leader master did not assign a location to
+  ///   the client.
+  std::string location() const KUDU_NO_EXPORT;
   /// @endcond
 
  private:
   class KUDU_NO_EXPORT Data;
+
+  template <class ReqClass, class RespClass>
+  friend class internal::AsyncLeaderMasterRpc;
 
   friend class ClientTest;
   friend class ConnectToClusterBaseTest;
@@ -607,17 +608,22 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   friend class internal::MetaCache;
   friend class internal::RemoteTablet;
   friend class internal::RemoteTabletServer;
+  friend class internal::RetrieveAuthzTokenRpc;
   friend class internal::WriteRpc;
+  friend class kudu::AuthzTokenTest;
   friend class kudu::SecurityUnknownTskTest;
   friend class tools::LeaderMasterProxy;
+  friend class tools::RemoteKsckCluster;
 
   FRIEND_TEST(kudu::ClientStressTest, TestUniqueClientIds);
+  FRIEND_TEST(ClientTest, TestCacheAuthzTokens);
   FRIEND_TEST(ClientTest, TestGetSecurityInfoFromMaster);
   FRIEND_TEST(ClientTest, TestGetTabletServerBlacklist);
   FRIEND_TEST(ClientTest, TestMasterDown);
   FRIEND_TEST(ClientTest, TestMasterLookupPermits);
   FRIEND_TEST(ClientTest, TestMetaCacheExpiry);
   FRIEND_TEST(ClientTest, TestNonCoveringRangePartitions);
+  FRIEND_TEST(ClientTest, TestRetrieveAuthzTokenInParallel);
   FRIEND_TEST(ClientTest, TestReplicatedTabletWritesWithLeaderElection);
   FRIEND_TEST(ClientTest, TestScanFaultTolerance);
   FRIEND_TEST(ClientTest, TestScanTimeout);
@@ -650,7 +656,7 @@ class KUDU_EXPORT KuduTabletServer {
   uint16_t port() const;
 
   /// @cond PRIVATE_API
-  ///
+
   /// Private API.
   ///
   /// @return The location of the tablet server.
@@ -881,6 +887,28 @@ class KUDU_EXPORT KuduTableCreator {
   /// @return Reference to the modified table creator.
   KuduTableCreator& num_replicas(int n_replicas);
 
+  /// Set the dimension label for all tablets created at table creation time.
+  ///
+  /// @note By default, the master will try to place newly created tablet replicas on tablet
+  /// servers with a small number of tablet replicas. If the dimension label is provided,
+  /// newly created replicas will be evenly distributed in the cluster based on the dimension
+  /// label. In other words, the master will try to place newly created tablet replicas on
+  /// tablet servers with a small number of tablet replicas belonging to this dimension label.
+  ///
+  /// @param [in] dimension_label
+  ///   The dimension label for the tablet to be created.
+  /// @return Reference to the modified table creator.
+  KuduTableCreator& dimension_label(const std::string& dimension_label);
+
+  /// Sets the table's extra configuration properties.
+  ///
+  /// If the value of the kv pair is empty, the property will be ignored.
+  ///
+  /// @param [in] extra_configs
+  ///   The table's extra configuration properties.
+  /// @return Reference to the modified table creator.
+  KuduTableCreator& extra_configs(const std::map<std::string, std::string>& extra_configs);
+
   /// Set the timeout for the table creation operation.
   ///
   /// This includes any waiting after the create has been submitted
@@ -927,6 +955,39 @@ class KUDU_EXPORT KuduTableCreator {
   Data* data_;
 
   DISALLOW_COPY_AND_ASSIGN(KuduTableCreator);
+};
+
+/// @brief In-memory statistics of table.
+class KUDU_EXPORT KuduTableStatistics {
+ public:
+  KuduTableStatistics();
+  ~KuduTableStatistics();
+
+  /// @return The table's on disk size.
+  ///
+  /// @note This statistic is pre-replication.
+  int64_t on_disk_size() const;
+
+  /// @return The table's live row count.
+  ///  -1 is returned if the table doesn't support live_row_count.
+  ///
+  /// @note This statistic is pre-replication.
+  int64_t live_row_count() const;
+
+  /// Stringify this Statistics.
+  ///
+  /// @return A string describing this statistics
+  std::string ToString() const;
+
+ private:
+  class KUDU_NO_EXPORT Data;
+
+  friend class KuduClient;
+
+  // Owned.
+  Data* data_;
+
+  DISALLOW_COPY_AND_ASSIGN(KuduTableStatistics);
 };
 
 /// @brief A representation of a table on a particular cluster.
@@ -1075,6 +1136,9 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   /// @return The partition schema for the table.
   const PartitionSchema& partition_schema() const;
 
+  /// @return The table's extra configuration properties.
+  const std::map<std::string, std::string>& extra_configs() const;
+
   /// @cond PRIVATE_API
 
   /// List the partitions of this table in 'partitions'. This operation may
@@ -1101,7 +1165,8 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
             const std::string& id,
             int num_replicas,
             const KuduSchema& schema,
-            const PartitionSchema& partition_schema);
+            const PartitionSchema& partition_schema,
+            const std::map<std::string, std::string>& extra_configs);
 
   // Owned.
   Data* data_;
@@ -1198,6 +1263,47 @@ class KUDU_EXPORT KuduTableAlterer {
       KuduTableCreator::RangePartitionBound lower_bound_type = KuduTableCreator::INCLUSIVE_BOUND,
       KuduTableCreator::RangePartitionBound upper_bound_type = KuduTableCreator::EXCLUSIVE_BOUND);
 
+  /// Add a range partition to the table with dimension label.
+  ///
+  /// @note The table alterer takes ownership of the rows.
+  ///
+  /// @note Multiple range partitions may be added as part of a single alter
+  ///   table transaction by calling this method multiple times on the table
+  ///   alterer.
+  ///
+  /// @note This client may immediately write and scan the new tablets when
+  ///   Alter() returns success, however other existing clients may have to wait
+  ///   for a timeout period to elapse before the tablets become visible. This
+  ///   period is configured by the master's 'table_locations_ttl_ms' flag, and
+  ///   defaults to 5 minutes.
+  ///
+  /// @note See KuduTableCreator::dimension_label() for details on dimension label.
+  ///
+  /// @param [in] lower_bound
+  ///   The lower bound of the range partition to add. If the row is empty, then
+  ///   the lower bound is unbounded. If any of the columns are unset, the
+  ///   logical minimum value for the column's type will be used by default.
+  /// @param [in] upper_bound
+  ///   The upper bound of the range partition to add. If the row is empty, then
+  ///   the upper bound is unbounded. If any of the individual columns are
+  ///   unset, the logical minimum value for the column' type will be used by
+  ///   default.
+  /// @param [in] dimension_label
+  ///   The dimension label for the tablet to be created.
+  /// @param [in] lower_bound_type
+  ///   The type of the lower bound, either inclusive or exclusive. Defaults to
+  ///   inclusive.
+  /// @param [in] upper_bound_type
+  ///   The type of the lower bound, either inclusive or exclusive. Defaults to
+  ///   exclusive.
+  /// @return Raw pointer to this alterer object.
+  KuduTableAlterer* AddRangePartitionWithDimension(
+      KuduPartialRow* lower_bound,
+      KuduPartialRow* upper_bound,
+      const std::string& dimension_label,
+      KuduTableCreator::RangePartitionBound lower_bound_type = KuduTableCreator::INCLUSIVE_BOUND,
+      KuduTableCreator::RangePartitionBound upper_bound_type = KuduTableCreator::EXCLUSIVE_BOUND);
+
   /// Drop the range partition from the table with the specified lower bound and
   /// upper bound. The bounds must match an existing range partition exactly,
   /// and may not span multiple range partitions.
@@ -1230,6 +1336,17 @@ class KUDU_EXPORT KuduTableAlterer {
       KuduPartialRow* upper_bound,
       KuduTableCreator::RangePartitionBound lower_bound_type = KuduTableCreator::INCLUSIVE_BOUND,
       KuduTableCreator::RangePartitionBound upper_bound_type = KuduTableCreator::EXCLUSIVE_BOUND);
+
+  /// Change the table's extra configuration properties.
+  ///
+  /// @note These configuration properties will be merged into existing configuration properties.
+  ///
+  /// @note If the value of the kv pair is empty, the property will be unset.
+  ///
+  /// @param [in] extra_configs
+  ///   The table's extra configuration properties.
+  /// @return Raw pointer to this alterer object.
+  KuduTableAlterer* AlterExtraConfig(const std::map<std::string, std::string>& extra_configs);
 
   /// Set a timeout for the alteration operation.
   ///
@@ -2137,9 +2254,6 @@ class KUDU_EXPORT KuduScanner {
 
   /// Set snapshot timestamp for scans in @c READ_AT_SNAPSHOT mode (raw).
   ///
-  /// See KuduClient::GetLatestObservedTimestamp() for details on how to
-  /// use this method to achieve Read-Your-Writes behavior.
-  ///
   /// @note This method is experimental and will either disappear or
   ///   change in a future release.
   ///
@@ -2148,6 +2262,27 @@ class KUDU_EXPORT KuduScanner {
   ///   (i.e. as returned by a previous call to a server).
   /// @return Operation result status.
   Status SetSnapshotRaw(uint64_t snapshot_timestamp) WARN_UNUSED_RESULT;
+
+  /// @cond PRIVATE_API
+
+  /// Set the start and end timestamp for a diff scan. The timestamps should be
+  /// encoded HT timestamps.
+  ///
+  /// Additionally sets any other scan properties required by diff scans.
+  ///
+  /// Private API.
+  ///
+  /// @param [in] start_timestamp
+  ///   Start timestamp to set in raw encoded form
+  ///   (i.e. as returned by a previous call to a server).
+  /// @param [in] end_timestamp
+  ///   End timestamp to set in raw encoded form
+  ///   (i.e. as returned by a previous call to a server).
+  /// @return Operation result status.
+  Status SetDiffScan(uint64_t start_timestamp, uint64_t end_timestamp)
+      WARN_UNUSED_RESULT KUDU_NO_EXPORT;
+
+  /// @endcond
 
   /// Set the maximum time that Open() and NextBatch() are allowed to take.
   ///
@@ -2396,6 +2531,13 @@ class KUDU_EXPORT KuduScanTokenBuilder {
   /// @copydoc KuduScanner::SetSnapshotRaw
   Status SetSnapshotRaw(uint64_t snapshot_timestamp) WARN_UNUSED_RESULT;
 
+  /// @cond PRIVATE_API
+
+  /// @copydoc KuduScanner::SetDiffScan
+  Status SetDiffScan(uint64_t start_timestamp, uint64_t end_timestamp)
+      WARN_UNUSED_RESULT KUDU_NO_EXPORT;
+  /// @endcond
+
   /// @copydoc KuduScanner::SetTimeoutMillis
   Status SetTimeoutMillis(int millis) WARN_UNUSED_RESULT;
 
@@ -2488,7 +2630,7 @@ class KUDU_EXPORT KuduPartitioner {
   ///   The row to be partitioned.
   /// @param [out] partition
   ///   The resulting partition index, or -1 if the row falls into a
-  ///   non-covered range. The result will be less than @c NumPartitioons().
+  ///   non-covered range. The result will be less than @c NumPartitions().
   ///
   /// @return Status::OK if successful. May return a bad Status if the
   ///   provided row does not have all columns of the partition key

@@ -81,6 +81,8 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+using strings::Substitute;
+
 namespace kudu {
 
 namespace clock {
@@ -112,7 +114,7 @@ class KuduTabletTest : public KuduTest {
     TabletHarness::Options opts(dir);
     opts.enable_metrics = true;
     opts.clock_type = clock_type_;
-    bool first_time = harness_ == NULL;
+    bool first_time = harness_ == nullptr;
     harness_.reset(new TabletHarness(schema_, opts));
     CHECK_OK(harness_->Create(first_time));
   }
@@ -142,11 +144,15 @@ class KuduTabletTest : public KuduTest {
     return harness_->fs_manager();
   }
 
-  void AlterSchema(const Schema& schema) {
+  void AlterSchema(const Schema& schema,
+                   boost::optional<TableExtraConfigPB> extra_config = boost::none) {
     tserver::AlterSchemaRequestPB req;
     req.set_schema_version(tablet()->metadata()->schema_version() + 1);
+    if (extra_config) {
+      *(req.mutable_new_extra_config()) = *extra_config;
+    }
 
-    AlterSchemaTransactionState tx_state(NULL, &req, NULL);
+    AlterSchemaTransactionState tx_state(nullptr, &req, nullptr);
     ASSERT_OK(tablet()->CreatePreparedAlterSchema(&tx_state, &schema));
     ASSERT_OK(tablet()->AlterSchema(&tx_state));
     tx_state.Finish();
@@ -197,7 +203,7 @@ static inline Status SilentIterateToStringList(RowwiseIterator* iter,
                                                int* fetched) {
   const Schema& schema = iter->schema();
   Arena arena(1024);
-  RowBlock block(schema, 100, &arena);
+  RowBlock block(&schema, 100, &arena);
   *fetched = 0;
   while (iter->HasNext()) {
     RETURN_NOT_OK(iter->NextBlock(&block));
@@ -216,7 +222,7 @@ static inline Status IterateToStringList(RowwiseIterator* iter,
   out->clear();
   Schema schema = iter->schema();
   Arena arena(1024);
-  RowBlock block(schema, 100, &arena);
+  RowBlock block(&schema, 100, &arena);
   int fetched = 0;
   while (iter->HasNext() && fetched < limit) {
     RETURN_NOT_OK(iter->NextBlock(&block));
@@ -239,9 +245,12 @@ static inline void CollectRowsForSnapshots(
     std::vector<std::vector<std::string>* >* collected_rows) {
   for (const MvccSnapshot& snapshot : snaps) {
     DVLOG(1) << "Snapshot: " <<  snapshot.ToString();
-    gscoped_ptr<RowwiseIterator> iter;
-    ASSERT_OK(tablet->NewRowIterator(schema, snapshot, UNORDERED, &iter));
-    ASSERT_OK(iter->Init(NULL));
+    RowIteratorOptions opts;
+    opts.projection = &schema;
+    opts.snap_to_include = snapshot;
+    std::unique_ptr<RowwiseIterator> iter;
+    ASSERT_OK(tablet->NewRowIterator(std::move(opts), &iter));
+    ASSERT_OK(iter->Init(nullptr));
     auto collector = new std::vector<std::string>();
     ASSERT_OK(IterateToStringList(iter.get(), collector));
     for (const auto& mrs : *collector) {
@@ -262,12 +271,13 @@ static inline void VerifySnapshotsHaveSameResult(
   // Now iterate again and make sure we get the same thing.
   for (const MvccSnapshot& snapshot : snaps) {
     DVLOG(1) << "Snapshot: " <<  snapshot.ToString();
-    gscoped_ptr<RowwiseIterator> iter;
-    ASSERT_OK(tablet->NewRowIterator(schema,
-                                            snapshot,
-                                            UNORDERED,
-                                            &iter));
-    ASSERT_OK(iter->Init(NULL));
+
+    RowIteratorOptions opts;
+    opts.projection = &schema;
+    opts.snap_to_include = snapshot;
+    std::unique_ptr<RowwiseIterator> iter;
+    ASSERT_OK(tablet->NewRowIterator(std::move(opts), &iter));
+    ASSERT_OK(iter->Init(nullptr));
     std::vector<std::string> collector;
     ASSERT_OK(IterateToStringList(iter.get(), &collector));
     ASSERT_EQ(collector.size(), expected_rows[idx]->size());
@@ -287,7 +297,7 @@ static inline void VerifySnapshotsHaveSameResult(
 static inline Status DumpRowSet(const RowSet& rs,
                                 const RowIteratorOptions& opts,
                                 std::vector<std::string>* out) {
-  gscoped_ptr<RowwiseIterator> iter;
+  std::unique_ptr<RowwiseIterator> iter;
   RETURN_NOT_OK(rs.NewRowIterator(opts, &iter));
   RETURN_NOT_OK(iter->Init(nullptr));
   RETURN_NOT_OK(IterateToStringList(iter.get(), out));
@@ -296,21 +306,21 @@ static inline Status DumpRowSet(const RowSet& rs,
 
 // Take an un-initialized iterator, Init() it, and iterate through all of its rows.
 // The resulting string contains a line per entry.
-static inline std::string InitAndDumpIterator(gscoped_ptr<RowwiseIterator> iter) {
-  CHECK_OK(iter->Init(NULL));
+static inline std::string InitAndDumpIterator(RowwiseIterator* iter) {
+  CHECK_OK(iter->Init(nullptr));
 
   std::vector<std::string> out;
-  CHECK_OK(IterateToStringList(iter.get(), &out));
+  CHECK_OK(IterateToStringList(iter, &out));
   return JoinStrings(out, "\n");
 }
 
 // Dump all of the rows of the tablet into the given vector.
 static inline Status DumpTablet(const Tablet& tablet,
-                         const Schema& projection,
-                         std::vector<std::string>* out) {
-  gscoped_ptr<RowwiseIterator> iter;
+                                const Schema& projection,
+                                std::vector<std::string>* out) {
+  std::unique_ptr<RowwiseIterator> iter;
   RETURN_NOT_OK(tablet.NewRowIterator(projection, &iter));
-  RETURN_NOT_OK(iter->Init(NULL));
+  RETURN_NOT_OK(iter->Init(nullptr));
   std::vector<std::string> rows;
   RETURN_NOT_OK(IterateToStringList(iter.get(), &rows));
   std::sort(rows.begin(), rows.end());
@@ -323,14 +333,14 @@ static inline Status DumpTablet(const Tablet& tablet,
 template<class RowSetWriterClass>
 static Status WriteRow(const Slice &row_slice, RowSetWriterClass *writer) {
   const Schema &schema = writer->schema();
-  DCHECK_EQ(row_slice.size(), schema.byte_size());
+  DCHECK_EQ(row_slice.size(), schema.byte_size() + ContiguousRowHelper::null_bitmap_size(schema));
 
-  RowBlock block(schema, 1, NULL);
+  RowBlock block(&schema, 1, nullptr);
   ConstContiguousRow row(&schema, row_slice.data());
   RowBlockRow dst_row = block.row(0);
-  RETURN_NOT_OK(CopyRow(row, &dst_row, reinterpret_cast<Arena*>(NULL)));
+  RETURN_NOT_OK(CopyRow(row, &dst_row, static_cast<Arena*>(nullptr)));
 
-  return writer->AppendBlock(block);
+  return writer->AppendBlock(block, 1);
 }
 
 // Tracks encoded deltas and provides a DeltaIterator-like interface for
@@ -348,8 +358,8 @@ class MirroredDeltas {
   using ComparatorType = typename std::conditional<T::kTag == REDO,
                                                    std::less<Timestamp>,
                                                    std::greater<Timestamp>>::type;
-  using MirroredDeltaMap = std::map<rowid_t,
-                                    std::map<Timestamp, faststring, ComparatorType>>;
+  using MirroredDeltaTimestampMap = std::map<Timestamp, faststring, ComparatorType>;
+  using MirroredDeltaMap = std::map<rowid_t, MirroredDeltaTimestampMap>;
 
   explicit MirroredDeltas(const Schema* schema)
       : schema_(schema),
@@ -414,8 +424,8 @@ class MirroredDeltas {
                       const SelectionVector& filter) {
     if (VLOG_IS_ON(3)) {
       std::string lower_ts_str = lower_ts ? lower_ts->ToString() : "INF";
-      VLOG(3) << "Begin applying for timestamps [" << lower_ts_str << ","
-              << upper_ts << ")";
+      VLOG(3) << Substitute("Begin applying for timestamps [$0, $1)",
+                            lower_ts_str, upper_ts.ToString());
     }
     for (int i = 0; i < cb->nrows(); i++) {
       rowid_t row_idx = start_row_idx + i;
@@ -493,17 +503,53 @@ class MirroredDeltas {
   //
   // Deltas not relevant to 'lower_ts' or 'upper_ts' are skipped. The set of
   // rows considered is determined by 'start_row_idx' and the number of rows in 'sel_vec'.
-  void SelectUpdates(Timestamp lower_ts, Timestamp upper_ts,
+  void SelectDeltas(Timestamp lower_ts, Timestamp upper_ts,
                      rowid_t start_row_idx, SelectionVector* sel_vec) {
     for (int i = 0; i < sel_vec->nrows(); i++) {
+      boost::optional<const typename MirroredDeltaTimestampMap::mapped_type&> first;
+      boost::optional<const typename MirroredDeltaTimestampMap::mapped_type&> last;
       for (const auto& e : all_deltas_[start_row_idx + i]) {
         if (!IsDeltaRelevantForSelect(lower_ts, upper_ts, e.first)) {
           // Must keep iterating; short-circuit out of the select criteria is
           // complex and not worth using in test code.
           continue;
         }
+        if (!first.is_initialized()) {
+          first = e.second;
+        }
+        last = e.second;
+      }
+
+      // No relevant deltas.
+      if (!first) {
+        continue;
+      }
+
+      // One relevant delta.
+      if (first == last) {
         sel_vec->SetRowSelected(i);
-        break;
+        continue;
+      }
+
+      // At least two relevant deltas.
+      bool first_liveness;
+      {
+        RowChangeList changes(*first);
+        RowChangeListDecoder decoder(changes);
+        decoder.InitNoSafetyChecks();
+        first_liveness = !decoder.is_reinsert();
+      }
+      bool last_liveness;
+      {
+        RowChangeList changes(*last);
+        RowChangeListDecoder decoder(changes);
+        decoder.InitNoSafetyChecks();
+        last_liveness = !decoder.is_delete();
+      }
+      if (!first_liveness && !last_liveness) {
+        sel_vec->SetRowUnselected(i);
+      } else {
+        sel_vec->SetRowSelected(i);
       }
     }
   }
@@ -647,12 +693,12 @@ void CreateRandomDeltas(const Schema& schema,
 
   // Randomly generate deltas using the keys.
   //
-  // Because the timestamps are sorted sorted in DeltaType order, we can track
+  // Because the timestamps are sorted in DeltaType order, we can track
   // the deletion status of each row directly.
   faststring buf;
   RowChangeListEncoder encoder(&buf);
-  bool is_deleted;
-  boost::optional<rowid_t> prev_row_idx;
+  bool is_deleted = false;
+  auto prev_row_idx = boost::make_optional<rowid_t>(false, 0);
   for (i = 0; i < sorted_keys.size(); i++) {
     encoder.Reset();
     const auto& k = sorted_keys[i];
@@ -666,7 +712,7 @@ void CreateRandomDeltas(const Schema& schema,
     if (is_deleted) {
       // The row is deleted; we must REINSERT it.
       DCHECK(allow_reinserts);
-      RowBuilder rb(schema);
+      RowBuilder rb(&schema);
       for (int i = 0; i < schema.num_columns(); i++) {
         rb.AddUint32(prng->Next());
       }
@@ -692,10 +738,16 @@ void CreateRandomDeltas(const Schema& schema,
                                                      schema.num_columns(),
                                                      num_cols_to_update);
       for (auto idx : idxs_to_update) {
-        uint32_t u32_val = prng->Next();
+        // Pick a random value to assign to the UPDATE. NULL is an option if the
+        // schema supports it.
         auto col_id = schema.column_id(idx);
         const auto& col = schema.column(idx);
-        encoder.AddColumnUpdate(col, col_id, &u32_val);
+        if (col.is_nullable() && prng->Uniform(10) == 0) {
+          encoder.AddColumnUpdate(col, col_id, nullptr);
+        } else {
+          uint32_t u32_val = prng->Next();
+          encoder.AddColumnUpdate(col, col_id, &u32_val);
+        }
       }
       VLOG(3) << "UPDATE: " << k.row_idx() << "," << k.timestamp().ToString()
               << ": " << encoder.as_changelist().ToString(schema);
@@ -890,27 +942,24 @@ void RunDeltaFuzzTest(const DeltaStore& store,
     Schema projection = GetRandomProjection(*mirror->schema(), prng, kMaxColsToProject,
                                             lower_ts ? AllowIsDeleted::YES :
                                                        AllowIsDeleted::NO);
-    size_t projection_vc_is_deleted_idx =
-        projection.find_first_is_deleted_virtual_column();
-    SCOPED_TRACE(strings::Substitute("Projection $0", projection.ToString()));
+    SCOPED_TRACE(Substitute("Projection $0", projection.ToString()));
     RowIteratorOptions opts;
     opts.projection = &projection;
     if (lower_ts) {
       opts.snap_to_exclude = MvccSnapshot(*lower_ts);
     }
     opts.snap_to_include = MvccSnapshot(upper_ts);
-    SCOPED_TRACE(strings::Substitute("Timestamps: [$0,$1)",
+    SCOPED_TRACE(Substitute("Timestamps: [$0,$1)",
                                      lower_ts ? lower_ts->ToString() : "INF",
                                      upper_ts.ToString()));
-    DeltaIterator* raw_iter;
-    Status s = store.NewDeltaIterator(opts, &raw_iter);
+    std::unique_ptr<DeltaIterator> iter;
+    Status s = store.NewDeltaIterator(opts, &iter);
     if (s.IsNotFound()) {
       ASSERT_STR_CONTAINS(s.ToString(), "MvccSnapshot outside the range of this delta");
       ASSERT_TRUE(mirror->CheckAllDeltasCulled(lower_ts, upper_ts));
       continue;
     }
     ASSERT_OK(s);
-    std::unique_ptr<DeltaIterator> iter(raw_iter);
     ASSERT_OK(iter->Init(nullptr));
 
     // Run tests in batches, in case there's some bug related to batching.
@@ -918,7 +967,7 @@ void RunDeltaFuzzTest(const DeltaStore& store,
     rowid_t start_row_idx = 0;
     while (iter->HasNext()) {
       int batch_size = prng->Uniform(kMaxBatchSize) + 1;
-      SCOPED_TRACE(strings::Substitute("batch starting at $0 ($1 rows)",
+      SCOPED_TRACE(Substitute("batch starting at $0 ($1 rows)",
                                        start_row_idx, batch_size));
       int prepare_flags = DeltaIterator::PREPARE_FOR_APPLY |
                           DeltaIterator::PREPARE_FOR_COLLECT;
@@ -927,7 +976,7 @@ void RunDeltaFuzzTest(const DeltaStore& store,
       }
       ASSERT_OK(iter->PrepareBatch(batch_size, prepare_flags));
 
-      // Test SelectUpdates: the selection vector begins all false and a row is
+      // Test SelectDeltas: the selection vector begins all false and a row is
       // set if there is at least one relevant update for it.
       //
       // Note: we retain 'actual_selected' for use as a possible filter in the
@@ -937,9 +986,13 @@ void RunDeltaFuzzTest(const DeltaStore& store,
         SelectionVector expected_selected(batch_size);
         expected_selected.SetAllFalse();
         actual_selected.SetAllFalse();
-        mirror->SelectUpdates(*lower_ts, upper_ts, start_row_idx, &expected_selected);
-        ASSERT_OK(iter->SelectUpdates(&actual_selected));
-        ASSERT_EQ(expected_selected, actual_selected);
+        mirror->SelectDeltas(*lower_ts, upper_ts, start_row_idx, &expected_selected);
+        SelectedDeltas deltas(batch_size);
+        ASSERT_OK(iter->SelectDeltas(&deltas));
+        deltas.ToSelectionVector(&actual_selected);
+        ASSERT_EQ(expected_selected, actual_selected)
+            << "Expected selvec: " << expected_selected.ToString()
+            << "\nActual selvec: " << actual_selected.ToString();
       }
 
       // Test ApplyDeletes: the selection vector is all true and a row is unset
@@ -954,20 +1007,23 @@ void RunDeltaFuzzTest(const DeltaStore& store,
         actual_deleted.SetAllTrue();
         ASSERT_OK(mirror->ApplyDeletes(upper_ts, start_row_idx, &expected_deleted));
         ASSERT_OK(iter->ApplyDeletes(&actual_deleted));
-        ASSERT_EQ(expected_deleted, actual_deleted);
+        ASSERT_EQ(expected_deleted, actual_deleted)
+            << "Expected selvec: " << expected_deleted.ToString()
+            << "\nActual selvec: " << actual_deleted.ToString();
       }
 
       // Test ApplyUpdates: all relevant updates are applied to the column block.
       for (int j = 0; j < opts.projection->num_columns(); j++) {
-        SCOPED_TRACE(strings::Substitute("Column $0", j));
-        ScopedColumnBlock<UINT32> expected_scb(batch_size, false);
-        ScopedColumnBlock<UINT32> actual_scb(batch_size, false);
+        SCOPED_TRACE(Substitute("Column $0", j));
+        bool col_is_nullable = opts.projection->column(j).is_nullable();
+        ScopedColumnBlock<UINT32> expected_scb(batch_size, col_is_nullable);
+        ScopedColumnBlock<UINT32> actual_scb(batch_size, col_is_nullable);
         for (int k = 0; k < batch_size; k++) {
           expected_scb[k] = 0;
           actual_scb[k] = 0;
         }
         const SelectionVector& filter = lower_ts ? actual_selected : actual_deleted;
-        if (j == projection_vc_is_deleted_idx) {
+        if (j == opts.projection->first_is_deleted_virtual_column_idx()) {
           // Reconstruct the expected IS_DELETED state using 'actual_selected'
           // and 'actual_deleted', which we've already verified above.
           DCHECK(lower_ts);

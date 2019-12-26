@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -31,7 +32,9 @@
 #include <glog/logging.h>
 
 #include "kudu/common/common.pb.h"
+#include "kudu/common/iterator.h"
 #include "kudu/common/partition.h"
+#include "kudu/common/rowblock.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/consensus.pb.h"
@@ -46,9 +49,12 @@
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
+#include "kudu/fs/data_dirs.h"
 #include "kudu/fs/fs_manager.h"
+#include "kudu/fs/io_context.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/escaping.h"
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/numbers.h"
@@ -59,6 +65,7 @@
 #include "kudu/rpc/messenger.h"
 #include "kudu/tablet/diskrowset.h"
 #include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/rowset.h"
 #include "kudu/tablet/rowset_metadata.h"
 #include "kudu/tablet/tablet_mem_trackers.h"
 #include "kudu/tablet/tablet_metadata.h"
@@ -69,16 +76,20 @@
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/memory/arena.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/status.h"
 
-DEFINE_bool(dump_data, false,
-            "Dump the data for each column in the rowset.");
-DEFINE_bool(metadata_only, false,
-            "Only dump the block metadata when printing blocks.");
-DEFINE_int64(nrows, 0, "Number of rows to dump");
+DEFINE_bool(dump_all_columns, true,
+            "If true, dumped rows include all of the columns in the rowset. If "
+            "false, dumped rows include just the key columns (in a comparable format).");
+DEFINE_bool(dump_metadata, true,
+            "If true, dumps rowset metadata before dumping data. If false, "
+            "only dumps the data.");
+DEFINE_int64(nrows, -1, "Number of rows to dump. If negative, dumps all rows.");
 DEFINE_bool(list_detail, false,
             "Print partition info for the local replicas");
 DEFINE_int64(rowset_index, -1,
@@ -98,6 +109,7 @@ using consensus::ConsensusMetadataManager;
 using consensus::OpId;
 using consensus::RaftConfigPB;
 using consensus::RaftPeerPB;
+using fs::IOContext;
 using fs::ReadableBlock;
 using log::LogEntryPB;
 using log::LogEntryReader;
@@ -117,6 +129,7 @@ using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
 using tablet::DiskRowSet;
+using tablet::RowIteratorOptions;
 using tablet::RowSetMetadata;
 using tablet::TabletMetadata;
 using tablet::TabletDataState;
@@ -142,6 +155,7 @@ string Indent(int indent) {
 Status FsInit(unique_ptr<FsManager>* fs_manager) {
   FsManagerOpts fs_opts;
   fs_opts.read_only = true;
+  fs_opts.update_instances = fs::UpdateInstanceBehavior::DONT_UPDATE;
   unique_ptr<FsManager> fs_ptr(new FsManager(Env::Default(), fs_opts));
   RETURN_NOT_OK(fs_ptr->Open());
   fs_manager->swap(fs_ptr);
@@ -175,7 +189,7 @@ Status FindLastLoggedOpId(FsManager* fs, const string& tablet_id,
   RETURN_NOT_OK(LogReader::Open(fs, scoped_refptr<log::LogIndex>(), tablet_id,
                                 scoped_refptr<MetricEntity>(), &reader));
   SegmentSequence segs;
-  RETURN_NOT_OK(reader->GetSegmentsSnapshot(&segs));
+  reader->GetSegmentsSnapshot(&segs);
   // Reverse iterate the segments to find the 'last replicated' entry quickly.
   // Note that we still read the entries within a segment in sequential
   // fashion, so the last entry within the first 'found' segment will
@@ -238,7 +252,7 @@ Status BackupConsensusMetadata(FsManager* fs_manager,
   string cmeta_filename = fs_manager->GetConsensusMetadataPath(tablet_id);
   string backup_filename = Substitute("$0.pre_rewrite.$1", cmeta_filename, env->NowMicros());
   WritableFileOptions opts;
-  opts.mode = Env::CREATE_NON_EXISTING;
+  opts.mode = Env::MUST_CREATE;
   opts.sync_on_close = true;
   RETURN_NOT_OK(env_util::CopyFile(env, cmeta_filename, backup_filename, opts));
   LOG(INFO) << "Backed up old consensus metadata to " << backup_filename;
@@ -513,7 +527,7 @@ Status DumpWals(const RunnerContext& context) {
                                 &reader));
 
   SegmentSequence segments;
-  RETURN_NOT_OK(reader->GetSegmentsSnapshot(&segments));
+  reader->GetSegmentsSnapshot(&segments);
 
   for (const scoped_refptr<ReadableLogSegment>& segment : segments) {
     RETURN_NOT_OK(PrintSegment(segment));
@@ -619,31 +633,64 @@ Status ListLocalReplicas(const RunnerContext& context) {
   return Status::OK();
 }
 
-Status DumpRowSetInternal(const shared_ptr<RowSetMetadata>& rs_meta,
-                          int indent) {
+Status DumpRowSetInternal(const IOContext& ctx,
+                          const shared_ptr<RowSetMetadata>& rs_meta,
+                          int indent,
+                          int64_t* rows_left) {
   tablet::RowSetDataPB pb;
   rs_meta->ToProtobuf(&pb);
 
-  cout << Indent(indent) << "RowSet metadata: " << pb_util::SecureDebugString(pb)
-       << endl << endl;
+  if (FLAGS_dump_metadata) {
+    cout << Indent(indent) << "RowSet metadata: " << pb_util::SecureDebugString(pb)
+         << endl << endl;
+  }
 
   scoped_refptr<log::LogAnchorRegistry> log_reg(new log::LogAnchorRegistry());
   shared_ptr<DiskRowSet> rs;
   RETURN_NOT_OK(DiskRowSet::Open(rs_meta,
                                  log_reg.get(),
                                  tablet::TabletMemTrackers(),
-                                 nullptr,
+                                 &ctx,
                                  &rs));
   vector<string> lines;
-  RETURN_NOT_OK(rs->DebugDump(&lines));
-  for (const auto& l : lines) {
-    cout << l << endl;
+  if (FLAGS_dump_all_columns) {
+    RETURN_NOT_OK(rs->DebugDump(&lines));
+  } else {
+    Schema key_proj = rs_meta->tablet_schema().CreateKeyProjection();
+    RowIteratorOptions opts;
+    opts.projection = &key_proj;
+    opts.io_context = &ctx;
+    unique_ptr<RowwiseIterator> it;
+    RETURN_NOT_OK(rs->NewRowIterator(opts, &it));
+    RETURN_NOT_OK(it->Init(nullptr));
+
+    Arena arena(1024);
+    RowBlock block(&key_proj, 100, &arena);
+    faststring key;
+    while (it->HasNext()) {
+      RETURN_NOT_OK(it->NextBlock(&block));
+      for (int i = 0; i < block.nrows(); i++) {
+        key_proj.EncodeComparableKey(block.row(i), &key);
+        lines.emplace_back(strings::b2a_hex(key.ToString()));
+      }
+    }
   }
 
+  // Respect 'rows_left' when dumping the output.
+  int64_t limit = *rows_left >= 0 ?
+                  std::min<int64_t>(*rows_left, lines.size()) : lines.size();
+  for (int i = 0; i < limit; i++) {
+    cout << lines[i] << endl;
+  }
+
+  if (*rows_left >= 0) {
+    *rows_left -= limit;
+  }
   return Status::OK();
 }
 
 Status DumpRowSet(const RunnerContext& context) {
+  const int kIndent = 2;
   unique_ptr<FsManager> fs_manager;
   RETURN_NOT_OK(FsInit(&fs_manager));
   const string& tablet_id = FindOrDie(context.required_args, kTabletIdArg);
@@ -656,11 +703,15 @@ Status DumpRowSet(const RunnerContext& context) {
     return Status::OK();
   }
 
+  IOContext ctx;
+  ctx.tablet_id = meta->tablet_id();
+  int64_t rows_left = FLAGS_nrows;
+
   // If rowset index is provided, only dump that rowset.
   if (FLAGS_rowset_index != -1) {
-    for (const shared_ptr<RowSetMetadata>& rs_meta : meta->rowsets())  {
+    for (const auto& rs_meta : meta->rowsets())  {
       if (rs_meta->id() == FLAGS_rowset_index) {
-        return Status::OK();
+        return DumpRowSetInternal(ctx, rs_meta, kIndent, &rows_left);
       }
     }
     return Status::InvalidArgument(
@@ -670,9 +721,9 @@ Status DumpRowSet(const RunnerContext& context) {
 
   // Rowset index not provided, dump all rowsets
   size_t idx = 0;
-  for (const shared_ptr<RowSetMetadata>& rs_meta : meta->rowsets())  {
+  for (const auto& rs_meta : meta->rowsets())  {
     cout << endl << "Dumping rowset " << idx++ << endl << kSeparatorLine;
-    RETURN_NOT_OK(DumpRowSetInternal(rs_meta, 2));
+    RETURN_NOT_OK(DumpRowSetInternal(ctx, rs_meta, kIndent, &rows_left));
   }
   return Status::OK();
 }
@@ -681,7 +732,23 @@ Status DumpMeta(const RunnerContext& context) {
   unique_ptr<FsManager> fs_manager;
   RETURN_NOT_OK(FsInit(&fs_manager));
   const string& tablet_id = FindOrDie(context.required_args, kTabletIdArg);
-  RETURN_NOT_OK(DumpTabletMeta(fs_manager.get(), tablet_id, 0));
+  return DumpTabletMeta(fs_manager.get(), tablet_id, 0);
+}
+
+Status DumpDataDirs(const RunnerContext& context) {
+  unique_ptr<FsManager> fs_manager;
+  RETURN_NOT_OK(FsInit(&fs_manager));
+  const string& tablet_id = FindOrDie(context.required_args, kTabletIdArg);
+  // Load the tablet meta to make sure the tablet's data directories are loaded
+  // into the manager.
+  scoped_refptr<TabletMetadata> unused_meta;
+  RETURN_NOT_OK(TabletMetadata::Load(fs_manager.get(), tablet_id, &unused_meta));
+  vector<string> data_dirs;
+  RETURN_NOT_OK(fs_manager->dd_manager()->FindDataDirsByTabletId(tablet_id,
+                                                                 &data_dirs));
+  for (const auto& dir : data_dirs) {
+    cout << dir << endl;
+  }
   return Status::OK();
 }
 
@@ -689,6 +756,15 @@ unique_ptr<Mode> BuildDumpMode() {
   unique_ptr<Action> dump_block_ids =
       ActionBuilder("block_ids", &DumpBlockIdsForLocalReplica)
       .Description("Dump the IDs of all blocks belonging to a local replica")
+      .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
+      .AddOptionalParameter("fs_data_dirs")
+      .AddOptionalParameter("fs_metadata_dir")
+      .AddOptionalParameter("fs_wal_dir")
+      .Build();
+
+  unique_ptr<Action> dump_data_dirs =
+      ActionBuilder("data_dirs", &DumpDataDirs)
+      .Description("Dump the data directories where the replica's data is stored")
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddOptionalParameter("fs_data_dirs")
       .AddOptionalParameter("fs_metadata_dir")
@@ -708,11 +784,11 @@ unique_ptr<Mode> BuildDumpMode() {
       ActionBuilder("rowset", &DumpRowSet)
       .Description("Dump the rowset contents of a local replica")
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
-      .AddOptionalParameter("dump_data")
+      .AddOptionalParameter("dump_all_columns")
+      .AddOptionalParameter("dump_metadata")
       .AddOptionalParameter("fs_data_dirs")
       .AddOptionalParameter("fs_metadata_dir")
       .AddOptionalParameter("fs_wal_dir")
-      .AddOptionalParameter("metadata_only")
       .AddOptionalParameter("nrows")
       .AddOptionalParameter("rowset_index")
       .Build();
@@ -733,6 +809,7 @@ unique_ptr<Mode> BuildDumpMode() {
   return ModeBuilder("dump")
       .Description("Dump a Kudu filesystem")
       .AddAction(std::move(dump_block_ids))
+      .AddAction(std::move(dump_data_dirs))
       .AddAction(std::move(dump_meta))
       .AddAction(std::move(dump_rowset))
       .AddAction(std::move(dump_wals))

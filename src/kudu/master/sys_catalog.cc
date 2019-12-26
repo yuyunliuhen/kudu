@@ -228,8 +228,7 @@ Status SysCatalogTable::Load(FsManager *fs_manager) {
     }
   }
 
-  RETURN_NOT_OK(SetupTablet(metadata));
-  return Status::OK();
+  return SetupTablet(metadata);
 }
 
 Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
@@ -252,6 +251,9 @@ Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
                                                   partitions[0],
                                                   tablet::TABLET_DATA_READY,
                                                   /*tombstone_last_logged_opid=*/ boost::none,
+                                                  /*supports_live_row_count=*/ true,
+                                                  /*extra_config=*/ boost::none,
+                                                  /*dimension_label=*/ boost::none,
                                                   &metadata));
 
   RaftConfigPB config;
@@ -304,10 +306,10 @@ Status SysCatalogTable::CreateDistributedConfig(const MasterOptions& options,
       LOG(INFO) << SecureShortDebugString(peer)
                 << " has no permanent_uuid. Determining permanent_uuid...";
       RaftPeerPB new_peer = peer;
-      RETURN_NOT_OK_PREPEND(consensus::SetPermanentUuidForRemotePeer(master_->messenger(),
-                                                                     &new_peer),
-                            Substitute("Unable to resolve UUID for peer $0",
-                                       SecureShortDebugString(peer)));
+      RETURN_NOT_OK_PREPEND(consensus::SetPermanentUuidForRemotePeer(
+          master_->messenger(), master_->dns_resolver(), &new_peer),
+          Substitute("Unable to resolve UUID for peer $0",
+                     SecureShortDebugString(peer)));
       resolved_config.add_peers()->CopyFrom(new_peer);
     }
   }
@@ -349,11 +351,22 @@ void SysCatalogTable::SysCatalogStateChanged(const string& tablet_id, const stri
   }
 }
 
-Status SysCatalogTable::SetupTablet(const scoped_refptr<tablet::TabletMetadata>& metadata) {
-  shared_ptr<Tablet> tablet;
-  scoped_refptr<Log> log;
+Status SysCatalogTable::SetupTablet(
+    const scoped_refptr<tablet::TabletMetadata>& metadata) {
+
+#define RETURN_NOT_OK_SHUTDOWN(s, m) \
+  do { \
+    const auto& _s = (s);                 \
+    if (PREDICT_FALSE(!_s.ok())) {        \
+      tablet_replica_->SetError(_s);      \
+      tablet_replica_->Shutdown();        \
+      return _s.CloneAndPrepend((m));     \
+    }                                     \
+  } while (0)
 
   InitLocalRaftPeerPB();
+  scoped_refptr<ConsensusMetadata> cmeta;
+  RETURN_NOT_OK(cmeta_manager_->Load(metadata->tablet_id(), &cmeta));
 
   // TODO(matteo): handle crash mid-creation of tablet? do we ever end up with
   // a partially created tablet here?
@@ -362,48 +375,47 @@ Status SysCatalogTable::SetupTablet(const scoped_refptr<tablet::TabletMetadata>&
       cmeta_manager_,
       local_peer_pb_,
       master_->tablet_apply_pool(),
-      Bind(&SysCatalogTable::SysCatalogStateChanged, Unretained(this), metadata->tablet_id())));
-  Status s = tablet_replica_->Init(master_->raft_pool());
-  if (!s.ok()) {
-    tablet_replica_->SetError(s);
-    tablet_replica_->Shutdown();
-    return s;
-  }
+      Bind(&SysCatalogTable::SysCatalogStateChanged,
+           Unretained(this),
+           metadata->tablet_id())));
+  RETURN_NOT_OK_SHUTDOWN(tablet_replica_->Init(master_->raft_pool()),
+                         "failed to initialize system catalog replica");
 
-  scoped_refptr<ConsensusMetadata> cmeta;
-  RETURN_NOT_OK(cmeta_manager_->Load(metadata->tablet_id(), &cmeta));
-
+  shared_ptr<Tablet> tablet;
+  scoped_refptr<Log> log;
   consensus::ConsensusBootstrapInfo consensus_info;
   tablet_replica_->SetBootstrapping();
-  RETURN_NOT_OK(BootstrapTablet(metadata,
-                                cmeta->CommittedConfig(),
-                                scoped_refptr<clock::Clock>(master_->clock()),
-                                master_->mem_tracker(),
-                                scoped_refptr<rpc::ResultTracker>(),
-                                metric_registry_,
-                                tablet_replica_,
-                                &tablet,
-                                &log,
-                                tablet_replica_->log_anchor_registry(),
-                                &consensus_info));
+  RETURN_NOT_OK_SHUTDOWN(BootstrapTablet(
+      metadata,
+      cmeta->CommittedConfig(),
+      scoped_refptr<clock::Clock>(master_->clock()),
+      master_->mem_tracker(),
+      scoped_refptr<rpc::ResultTracker>(),
+      metric_registry_,
+      tablet_replica_,
+      &tablet,
+      &log,
+      tablet_replica_->log_anchor_registry(),
+      &consensus_info), "failed to bootstrap system catalog");
 
   // TODO(matteo): Do we have a setSplittable(false) or something from the
   // outside is handling split in the TS?
 
-  RETURN_NOT_OK_PREPEND(tablet_replica_->Start(consensus_info,
-                                               tablet,
-                                               scoped_refptr<clock::Clock>(master_->clock()),
-                                               master_->messenger(),
-                                               scoped_refptr<rpc::ResultTracker>(),
-                                               log,
-                                               master_->tablet_prepare_pool()),
-                        "Failed to Start() TabletReplica");
+  RETURN_NOT_OK_SHUTDOWN(tablet_replica_->Start(
+      consensus_info,
+      tablet,
+      scoped_refptr<clock::Clock>(master_->clock()),
+      master_->messenger(),
+      scoped_refptr<rpc::ResultTracker>(),
+      log,
+      master_->tablet_prepare_pool(),
+      master_->dns_resolver()), "failed to start system catalog replica");
 
   tablet_replica_->RegisterMaintenanceOps(master_->maintenance_manager());
 
-  const Schema* schema = tablet->schema();
-  schema_ = SchemaBuilder(*schema).BuildWithoutIds();
+  schema_ = SchemaBuilder(*tablet->schema()).BuildWithoutIds();
   key_schema_ = schema_.CreateKeyProjection();
+
   return Status::OK();
 }
 
@@ -464,20 +476,8 @@ Status SysCatalogTable::SyncWrite(const WriteRequestPB *req, WriteResponsePB *re
   return Status::OK();
 }
 
-// Schema for the unified SysCatalogTable:
-//
-// (entry_type, entry_id) -> metadata
-//
-// entry_type is a enum defined in sys_tables. It indicates
-// whether an entry is a table or a tablet.
-//
-// entry_type is the first part of a compound key as to allow
-// efficient scans of entries of only a single type (e.g., only
-// scan all of the tables, or only scan all of the tablets).
-//
-// entry_id is either a table id or a tablet id. For tablet entries,
-// the table id that the tablet is associated with is stored in the
-// protobuf itself.
+// Schema for the unified SysCatalogTable. See the comment in the header for
+// more details.
 Schema SysCatalogTable::BuildTableSchema() {
   SchemaBuilder builder;
   CHECK_OK(builder.AddKeyColumn(kSysCatalogTableColType, INT8));
@@ -580,6 +580,15 @@ string SysCatalogTable::TskSeqNumberToEntryId(int64_t seq_number) {
   return entry_id;
 }
 
+Status SysCatalogTable::VisitTServerStates(TServerStateVisitor* visitor) {
+  TRACE_EVENT0("master", "SysCatalogTable::VisitTServerStates");
+  const auto processor = [&] (const string& entry_id,
+                              const SysTServerStateEntryPB& entry_data) {
+    return visitor->Visit(entry_id, entry_data);
+  };
+  return ProcessRows<SysTServerStateEntryPB, TSERVER_STATE>(processor);
+}
+
 Status SysCatalogTable::VisitTables(TableVisitor* visitor) {
   TRACE_EVENT0("master", "SysCatalogTable::VisitTables");
   auto processor = [&](
@@ -622,12 +631,12 @@ Status SysCatalogTable::ProcessRows(
   ScanSpec spec;
   spec.AddPredicate(pred);
 
-  gscoped_ptr<RowwiseIterator> iter;
+  unique_ptr<RowwiseIterator> iter;
   RETURN_NOT_OK(tablet_replica_->tablet()->NewRowIterator(schema_, &iter));
   RETURN_NOT_OK(iter->Init(&spec));
 
   Arena arena(32 * 1024);
-  RowBlock block(iter->schema(), 512, &arena);
+  RowBlock block(&iter->schema(), 512, &arena);
   while (iter->HasNext()) {
     RETURN_NOT_OK(iter->NextBlock(&block));
     const size_t nrows = block.nrows();
@@ -754,6 +763,41 @@ Status SysCatalogTable::RemoveTskEntries(const set<string>& entry_ids) {
     CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, id));
     enc.Add(RowOperationsPB::DELETE, row);
   }
+
+  WriteResponsePB resp;
+  return SyncWrite(&req, &resp);
+}
+
+Status SysCatalogTable::WriteTServerState(const string& tserver_id,
+                                          const SysTServerStateEntryPB& entry) {
+  DCHECK(!tserver_id.empty());
+  WriteRequestPB req;
+  req.set_tablet_id(kSysCatalogTabletId);
+  RETURN_NOT_OK(SchemaToPB(schema_, req.mutable_schema()));
+  KuduPartialRow row(&schema_);
+  RETURN_NOT_OK(row.SetInt8(kSysCatalogTableColType, TSERVER_STATE));
+  RETURN_NOT_OK(row.SetString(kSysCatalogTableColId, tserver_id));
+
+  faststring metadata_buf;
+  pb_util::SerializeToString(entry, &metadata_buf);
+  RETURN_NOT_OK(row.SetStringNoCopy(kSysCatalogTableColMetadata, metadata_buf));
+
+  RowOperationsPBEncoder enc(req.mutable_row_operations());
+  enc.Add(RowOperationsPB::INSERT, row);
+
+  WriteResponsePB resp;
+  return SyncWrite(&req, &resp);
+}
+
+Status SysCatalogTable::RemoveTServerState(const string& tserver_id) {
+  WriteRequestPB req;
+  req.set_tablet_id(kSysCatalogTabletId);
+  RowOperationsPBEncoder enc(req.mutable_row_operations());
+  RETURN_NOT_OK(SchemaToPB(schema_, req.mutable_schema()));
+  KuduPartialRow row(&schema_);
+  RETURN_NOT_OK(row.SetInt8(kSysCatalogTableColType, TSERVER_STATE));
+  RETURN_NOT_OK(row.SetStringNoCopy(kSysCatalogTableColId, tserver_id));
+  enc.Add(RowOperationsPB::DELETE, row);
 
   WriteResponsePB resp;
   return SyncWrite(&req, &resp);

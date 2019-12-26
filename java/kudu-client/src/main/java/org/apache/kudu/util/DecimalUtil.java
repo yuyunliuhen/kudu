@@ -17,16 +17,16 @@
 
 package org.apache.kudu.util;
 
+import static org.apache.kudu.Common.DataType;
+
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
 
 import com.google.common.base.Strings;
-
-import org.apache.kudu.ColumnTypeAttributes;
 import org.apache.yetus.audience.InterfaceAudience;
 
-import static org.apache.kudu.Common.DataType;
+import org.apache.kudu.ColumnTypeAttributes;
 
 @InterfaceAudience.Private
 public class DecimalUtil {
@@ -46,6 +46,7 @@ public class DecimalUtil {
   public static final BigInteger MIN_UNSCALED_DECIMAL128 = MAX_UNSCALED_DECIMAL128.negate();
   public static final int DECIMAL128_SIZE = 128 / Byte.SIZE;
 
+  public static final int MIN_DECIMAL_PRECISION = 1;
   public static final int MAX_DECIMAL_PRECISION = MAX_DECIMAL128_PRECISION;
 
   /**
@@ -132,7 +133,8 @@ public class DecimalUtil {
     }
     if (val.precision() > targetPrecision) {
       throw new IllegalArgumentException("Value precision " + val.precision() +
-          " (after scale coercion) can't be coerced to target precision " +  targetPrecision + ". ");
+          " (after scale coercion) can't be coerced to target precision " +
+          targetPrecision + ". ");
     }
     return val;
   }

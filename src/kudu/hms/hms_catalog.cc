@@ -20,6 +20,7 @@
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -45,8 +46,8 @@
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/slice.h"
+#include "kudu/util/thread.h"
 
-using boost::none;
 using boost::optional;
 using std::move;
 using std::string;
@@ -60,7 +61,6 @@ DEFINE_string(hive_metastore_uris, "",
               "If not set, the Kudu master will not send Kudu table catalog updates to Hive. The "
               "configured value must match the Hive hive.metastore.uris configuration.");
 DEFINE_validator(hive_metastore_uris, &kudu::hms::HmsCatalog::ValidateUris);
-TAG_FLAG(hive_metastore_uris, experimental);
 
 // Note: the hive_metastore_sasl_enabled and keytab_file combination is validated in master.cc.
 DEFINE_bool(hive_metastore_sasl_enabled, false,
@@ -68,57 +68,52 @@ DEFINE_bool(hive_metastore_sasl_enabled, false,
             "(Kerberos) security. Must match the value of the "
             "hive.metastore.sasl.enabled option in the Hive Metastore configuration. "
             "When enabled, the --keytab_file flag must be provided.");
-TAG_FLAG(hive_metastore_sasl_enabled, experimental);
 
 DEFINE_string(hive_metastore_kerberos_principal, "hive",
               "The service principal of the Hive Metastore server. Must match "
               "the primary (user) portion of hive.metastore.kerberos.principal option "
               "in the Hive Metastore configuration.");
-TAG_FLAG(hive_metastore_kerberos_principal, experimental);
 
 DEFINE_int32(hive_metastore_retry_count, 1,
              "The number of times that HMS operations will retry after "
              "encountering retriable failures, such as network errors.");
 TAG_FLAG(hive_metastore_retry_count, advanced);
-TAG_FLAG(hive_metastore_retry_count, experimental);
 
 DEFINE_int32(hive_metastore_send_timeout_seconds, 60,
              "Configures the socket send timeout, in seconds, for Thrift "
              "connections to the Hive Metastore.");
 TAG_FLAG(hive_metastore_send_timeout_seconds, advanced);
-TAG_FLAG(hive_metastore_send_timeout_seconds, experimental);
 
 DEFINE_int32(hive_metastore_recv_timeout_seconds, 60,
              "Configures the socket receive timeout, in seconds, for Thrift "
              "connections to the Hive Metastore.");
 TAG_FLAG(hive_metastore_recv_timeout_seconds, advanced);
-TAG_FLAG(hive_metastore_recv_timeout_seconds, experimental);
 
 DEFINE_int32(hive_metastore_conn_timeout_seconds, 60,
              "Configures the socket connect timeout, in seconds, for Thrift "
              "connections to the Hive Metastore.");
 TAG_FLAG(hive_metastore_conn_timeout_seconds, advanced);
-TAG_FLAG(hive_metastore_conn_timeout_seconds, experimental);
 
 DEFINE_int32(hive_metastore_max_message_size_bytes, 100 * 1024 * 1024,
              "Maximum size of Hive Metastore objects that can be received by the "
              "HMS client in bytes. Should match the metastore.server.max.message.size "
              "configuration.");
 TAG_FLAG(hive_metastore_max_message_size_bytes, advanced);
-TAG_FLAG(hive_metastore_max_message_size_bytes, experimental);
 
 namespace kudu {
 namespace hms {
 
 HmsCatalog::HmsCatalog(string master_addresses)
-    : master_addresses_(std::move(master_addresses)) {
+    : master_addresses_(std::move(master_addresses)),
+      running_(1) {
 }
 
 HmsCatalog::~HmsCatalog() {
   Stop();
 }
 
-Status HmsCatalog::Start() {
+Status HmsCatalog::Start(HmsClientVerifyKuduSyncConfig verify_service_config) {
+  running_.Reset(1);
   vector<HostPort> addresses;
   RETURN_NOT_OK(ParseUris(FLAGS_hive_metastore_uris, &addresses));
 
@@ -130,20 +125,31 @@ Status HmsCatalog::Start() {
   options.service_principal = FLAGS_hive_metastore_kerberos_principal;
   options.max_buf_size = FLAGS_hive_metastore_max_message_size_bytes;
   options.retry_count = FLAGS_hive_metastore_retry_count;
+  options.verify_service_config = verify_service_config == VERIFY;
 
-  return ha_client_.Start(std::move(addresses), std::move(options));
+  RETURN_NOT_OK(ha_client_.Start(std::move(addresses), std::move(options)));
+
+  RETURN_NOT_OK(Thread::Create("hms_catalog", "fetch_uuid",
+                               &HmsCatalog::LoopInitializeUuid, this,
+                               &uuid_initializing_thread_));
+  return Status::OK();
 }
 
 void HmsCatalog::Stop() {
+  running_.CountDown();
   ha_client_.Stop();
+  if (uuid_initializing_thread_) {
+    uuid_initializing_thread_->Join();
+  }
 }
 
 Status HmsCatalog::CreateTable(const string& id,
                                const string& name,
                                optional<const string&> owner,
-                               const Schema& schema) {
+                               const Schema& schema,
+                               const string& table_type) {
   hive::Table table;
-  RETURN_NOT_OK(PopulateTable(id, name, owner, schema, master_addresses_, &table));
+  RETURN_NOT_OK(PopulateTable(id, name, owner, schema, master_addresses_, table_type, &table));
   return ha_client_.Execute([&] (HmsClient* client) {
       return client->CreateTable(table, EnvironmentContext());
   });
@@ -180,8 +186,18 @@ Status HmsCatalog::UpgradeLegacyImpalaTable(const string& id,
       return Status::IllegalState("non-legacy table cannot be upgraded");
     }
 
-    RETURN_NOT_OK(PopulateTable(id, Substitute("$0.$1", db_name, tb_name),
-                                none, schema, master_addresses_, &table));
+    if (table.tableType != HmsClient::kManagedTable &&
+        table.tableType != HmsClient::kExternalTable) {
+      return Status::IllegalState(Substitute("Unsupported table type $0", table.tableType));
+    }
+
+    // If this is an unsynchronized table, only upgrade the storage handler.
+    if (!HmsClient::IsSynchronized(table)) {
+      table.parameters[HmsClient::kStorageHandlerKey] = HmsClient::kKuduStorageHandler;
+    } else {
+      RETURN_NOT_OK(PopulateTable(id, Substitute("$0.$1", db_name, tb_name),
+                                  table.owner, schema, master_addresses_, table.tableType, &table));
+    }
     return client->AlterTable(db_name, tb_name, table, EnvironmentContext());
   });
 }
@@ -194,22 +210,13 @@ Status HmsCatalog::DowngradeToLegacyImpalaTable(const string& name) {
   return ha_client_.Execute([&] (HmsClient* client) {
     hive::Table table;
     RETURN_NOT_OK(client->GetTable(hms_database.ToString(), hms_table.ToString(), &table));
-    if (table.parameters[HmsClient::kStorageHandlerKey] !=
-        HmsClient::kKuduStorageHandler) {
+    if (!hms::HmsClient::IsKuduTable(table)) {
       return Status::IllegalState("non-Kudu table cannot be downgraded");
     }
-
-    // Add the legacy Kudu-specific parameters. And set it to
-    // external table type.
-    table.tableType = HmsClient::kExternalTable;
-    table.parameters[HmsClient::kLegacyKuduTableNameKey] = name;
-    table.parameters[HmsClient::kKuduMasterAddrsKey] = master_addresses_;
+    // Downgrade the storage handler.
     table.parameters[HmsClient::kStorageHandlerKey] = HmsClient::kLegacyKuduStorageHandler;
-    table.parameters[HmsClient::kExternalTableKey] = "TRUE";
-
     // Remove the Kudu-specific field 'kudu.table_id'.
     EraseKeyReturnValuePtr(&table.parameters, HmsClient::kKuduTableIdKey);
-
     return client->AlterTable(table.dbName, table.tableName, table, EnvironmentContext());
   });
 }
@@ -224,9 +231,10 @@ Status HmsCatalog::GetKuduTables(vector<hive::Table>* kudu_tables) {
     for (const auto& database_name : database_names) {
       table_names.clear();
       tables.clear();
+      // NOTE: LIKE filters are used instead of = filters due to HIVE-21614
       RETURN_NOT_OK(client->GetTableNames(
             database_name,
-            Substitute("$0$1 = \"$2\" OR $0$1 = \"$3\"",
+            Substitute("$0$1 LIKE \"$2\" OR $0$1 LIKE \"$3\"",
               HmsClient::kHiveFilterFieldParams,
               HmsClient::kStorageHandlerKey,
               HmsClient::kKuduStorageHandler,
@@ -246,7 +254,8 @@ Status HmsCatalog::GetKuduTables(vector<hive::Table>* kudu_tables) {
 Status HmsCatalog::AlterTable(const string& id,
                               const string& name,
                               const string& new_name,
-                              const Schema& schema) {
+                              const Schema& schema,
+                              const bool& check_id) {
   Slice hms_database;
   Slice hms_table;
   RETURN_NOT_OK(ParseHiveTableIdentifier(name, &hms_database, &hms_table));
@@ -271,17 +280,18 @@ Status HmsCatalog::AlterTable(const string& id,
       RETURN_NOT_OK(client->GetTable(hms_database.ToString(), hms_table.ToString(), &table));
 
       // Check that the HMS entry belongs to the table being altered.
-      if (table.parameters[HmsClient::kStorageHandlerKey] != HmsClient::kKuduStorageHandler ||
-          table.parameters[HmsClient::kKuduTableIdKey] != id) {
+      if (!hms::HmsClient::IsKuduTable(table) ||
+          (check_id && table.parameters[HmsClient::kKuduTableIdKey] != id)) {
         // The original table isn't a Kudu table, or isn't the same Kudu table.
         return Status::NotFound("the HMS entry for the table being "
                                 "altered belongs to another table");
       }
 
       // Overwrite fields in the table that have changed, including the new name.
-      RETURN_NOT_OK(PopulateTable(id, new_name, none, schema, master_addresses_, &table));
+      RETURN_NOT_OK(PopulateTable(id, new_name, table.owner, schema, master_addresses_,
+          table.tableType, &table));
       return client->AlterTable(hms_database.ToString(), hms_table.ToString(),
-                                table, EnvironmentContext());
+                                table, EnvironmentContext(check_id));
   });
 }
 
@@ -290,6 +300,15 @@ Status HmsCatalog::GetNotificationEvents(int64_t last_event_id, int max_events,
   return ha_client_.Execute([&] (HmsClient* client) {
     return client->GetNotificationEvents(last_event_id, max_events, events);
   });
+}
+
+Status HmsCatalog::GetUuid(string* uuid) {
+  std::lock_guard<simple_spinlock> l(uuid_lock_);
+  if (!uuid_) {
+    return Status::NotSupported("No HMS UUID available");
+  }
+  *uuid = uuid_.value();
+  return Status::OK();
 }
 
 namespace {
@@ -311,7 +330,10 @@ string column_to_field_type(const ColumnSchema& column) {
     case DOUBLE: return "double";
     case STRING: return "string";
     case BINARY: return "binary";
+    case VARCHAR: return Substitute("varchar($0)",
+                                    column.type_attributes().length);
     case UNIXTIME_MICROS: return "timestamp";
+    case DATE: return "date";
     default: LOG(FATAL) << "unhandled column type: " << column.TypeToString();
   }
   __builtin_unreachable();
@@ -321,6 +343,7 @@ hive::FieldSchema column_to_field(const ColumnSchema& column) {
   hive::FieldSchema field;
   field.name = column.name();
   field.type = column_to_field_type(column);
+  field.comment = column.comment();
   return field;
 }
 
@@ -337,6 +360,7 @@ Status HmsCatalog::PopulateTable(const string& id,
                                  const optional<const string&>& owner,
                                  const Schema& schema,
                                  const string& master_addresses,
+                                 const string& table_type,
                                  hive::Table* table) {
   Slice hms_database_name;
   Slice hms_table_name;
@@ -347,22 +371,31 @@ Status HmsCatalog::PopulateTable(const string& id,
     table->owner = *owner;
   }
 
-  // Add the Kudu-specific parameters. This intentionally avoids overwriting
-  // other parameters.
-  table->parameters[HmsClient::kKuduTableIdKey] = id;
-  table->parameters[HmsClient::kKuduMasterAddrsKey] = master_addresses;
-  table->parameters[HmsClient::kStorageHandlerKey] = HmsClient::kKuduStorageHandler;
-  // Workaround for HIVE-19253.
-  table->parameters[HmsClient::kExternalTableKey] = "TRUE";
-
-  // Set the table type to external so that the table's (HD)FS directory will
-  // not be deleted when the table is dropped. Deleting the directory is
+  // TODO(HIVE-21640): Fix the issue described below and in HIVE-21640
+  // Setting the table type to managed means the table's (HD)FS directory will
+  // be deleted when the table is dropped. Deleting the directory is
   // unnecessary, and causes a race in the HMS between concurrent DROP TABLE and
   // CREATE TABLE operations on existing tables.
-  table->tableType = HmsClient::kExternalTable;
+  table->tableType = table_type;
 
-  // Remove the deprecated Kudu-specific field 'kudu.table_name'.
-  EraseKeyReturnValuePtr(&table->parameters, HmsClient::kLegacyKuduTableNameKey);
+  // TODO(HIVE-19253): Used along with table type to indicate an external table.
+  if (table_type == HmsClient::kExternalTable) {
+    table->parameters[HmsClient::kExternalTableKey] = "TRUE";
+  // Ensure the kExternalTableKey property is unset on a managed table.
+  } else if (table_type == HmsClient::kManagedTable) {
+    EraseKeyReturnValuePtr(&table->parameters, HmsClient::kExternalTableKey);
+  }
+
+  // Only set the table id on synchronized tables.
+  if (HmsClient::IsSynchronized(*table)) {
+    table->parameters[HmsClient::kKuduTableIdKey] = id;
+  }
+
+  // Add the Kudu-specific parameters. This intentionally avoids overwriting
+  // other parameters.
+  table->parameters[HmsClient::kKuduTableNameKey] = name;
+  table->parameters[HmsClient::kKuduMasterAddrsKey] = master_addresses;
+  table->parameters[HmsClient::kStorageHandlerKey] = HmsClient::kKuduStorageHandler;
 
   // Overwrite the entire set of columns.
   vector<hive::FieldSchema> fields;
@@ -423,13 +456,38 @@ bool HmsCatalog::ValidateUris(const char* flag_name, const string& metastore_uri
   return s.ok();
 }
 
+void HmsCatalog::LoopInitializeUuid() {
+  do {
+    // Fetch the UUID of the HMS DB, if available.
+    string uuid;
+    Status s = ha_client_.Execute([&] (HmsClient* client) {
+        return client->GetUuid(&uuid);
+      });
+    if (s.ok()) {
+      VLOG(1) << "Connected to HMS with uuid " << uuid;
+      std::lock_guard<simple_spinlock> l(uuid_lock_);
+      uuid_ = std::move(uuid);
+      return;
+    }
+    if (s.IsNotSupported()) {
+      VLOG(1) << "Unable to fetch UUID for HMS: " << s.ToString();
+      return;
+    }
+    // If we couldn't connect to the HMS at all, sleep and try again.
+    VLOG(1) << "Couldn't connect to HMS: " << s.ToString();
+  } while (!running_.WaitFor(MonoDelta::FromSeconds(1)));
+}
+
 bool HmsCatalog::IsEnabled() {
   return !FLAGS_hive_metastore_uris.empty();
 }
 
-hive::EnvironmentContext HmsCatalog::EnvironmentContext() {
+hive::EnvironmentContext HmsCatalog::EnvironmentContext(const bool& check_id) {
   hive::EnvironmentContext env_ctx;
-  env_ctx.__set_properties({ std::make_pair(hms::HmsClient::kKuduMasterEventKey, "true") });
+  env_ctx.__set_properties({
+    std::make_pair(hms::HmsClient::kKuduMasterEventKey, "true"),
+    std::make_pair(hms::HmsClient::kKuduCheckIdKey, check_id ? "true" : "false"),
+  });
   return env_ctx;
 }
 

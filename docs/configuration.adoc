@@ -28,11 +28,6 @@
 :sectlinks:
 :experimental:
 
-NOTE: Kudu is easier to configure with link:http://www.cloudera.com/content/www/en-us/products/cloudera-manager.html[Cloudera Manager]
-than in a standalone installation. See Cloudera's
-link:http://www.cloudera.com/documentation/kudu/latest/topics/kudu_installation.html[Kudu documentation]
-for more details about using Kudu with Cloudera Manager.
-
 == Configure Kudu
 
 === Configuration Basics
@@ -83,6 +78,11 @@ striping to a RAID-0 array.
 Additionally, `--fs_wal_dir` and `--fs_metadata_dir` may be the same as _one
 of_ the directories listed in `--fs_data_dirs`, but must not be sub-directories
 of any of them.
+
+WARNING: Each directory specified by a configuration flag on a given machine
+should be used by at most one Kudu process. If multiple Kudu processes on the
+same machine are configured to use the same directory, Kudu may refuse to start
+up.
 
 WARNING: Once `--fs_data_dirs` is set, extra tooling is required to change it.
 For more details, see the link:administration.html#change_dir_config[Kudu
@@ -139,6 +139,17 @@ do not read this flag.
 For the full list of flags for tablet servers, see the
 link:configuration_reference.html#kudu-tserver_supported[Kudu Tablet Server Configuration Reference].
 
+== Configure Kudu Tables
+Kudu allows certain configurations to be set per table. To configure the behavior of a Kudu table,
+you can set these configurations at table creation, or alter them via the Kudu API or Kudu command
+line tool.
+
+.Supported Configurable Properties for Kudu Tables
+|===
+| Configuration      | Valid Options     | Default     | Description
+
+| kudu.table.history_max_age_sec | integer | | Number of seconds to retain history for tablets in this table.
+|===
 
 == Next Steps
 - link:quickstart.html[Get Started With Kudu]

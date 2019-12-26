@@ -19,16 +19,14 @@
 
 apply plugin: "checkstyle" // Ensures Java code follows the defined coding style.
 apply plugin: "com.github.spotbugs"   // Performs static code analysis to look for bugs in Java code.
-apply plugin: "pmd"        // Performs static code analysis to look for common code smells in Java code.
 apply plugin: "com.github.ben-manes.versions" // Provides a task to determine which dependencies have updates.
 apply plugin: "ru.vyarus.animalsniffer" // Ensures Java code uses APIs from a particular version of Java.
-apply plugin: "scalafmt"
+apply plugin: "scalafmt" // Automatically formats Scala code on each build.
+apply plugin: "net.ltgt.errorprone" // Performs static code analysis to look for bugs in Java code.
 
 checkstyle {
-  configFile = file("$rootDir/kudu_style.xml")
-  configProperties = [
-      "checkstyle.suppressions.file" : "$rootDir/checkstyle_suppressions.xml"
-  ]
+  toolVersion = versions.checkstyle
+  configDir = file("$rootProject.projectDir/config/checkstyle")
   ignoreFailures = true
   showViolations = true
 }
@@ -43,6 +41,8 @@ spotbugs {
   toolVersion = versions.spotBugs
   ignoreFailures = true
   effort = "max"
+  reportLevel = "low"
+  excludeFilter = file("$rootProject.projectDir/config/spotbugs/excludeFilter.xml")
 }
 
 tasks.withType(com.github.spotbugs.SpotBugsTask) {
@@ -58,48 +58,36 @@ task spotbugs(dependsOn: [spotbugsMain, spotbugsTest], group: "Verification") {
   description = "Run SpotBugs analysis."
 }
 
-pmd {
-  toolVersion = versions.pmd
-  ignoreFailures = true
-}
-
 scalafmt {
   configFilePath = "$rootDir/.scalafmt.conf"
 }
 
-// Run scalafmt on compile
+// Run scalafmt on compile.
 tasks.withType(ScalaCompile) {
   if (!propertyExists("skipFormat")) {
      dependsOn("scalafmtAll")
   }
 }
 
-// Create an aggregate pmd task.
-// This simplifies running pmd on all the code by only needing one task instead of multiple in your command.
-task pmd(dependsOn: [pmdMain, pmdTest], group: "Verification") {
-  description = "Run PMD analysis."
-}
-
-
-// Disable error-prone if we are compiling with Java 10+ util support is added.
-// See https://github.com/google/error-prone/issues/860
-if (!JavaVersion.current().isJava10Compatible()) {
-  // Enable error-prone.
-  // Running with '-Derrorprone-fix=...' can instruct error-prone to automatically fix issues.
-  apply plugin: "net.ltgt.errorprone"
-  // Performs static code analysis to look for bugs in Java code.
-  tasks.withType(JavaCompile) {
-    options.compilerArgs += ['-XepExcludedPaths:.*/build/generated.*/.*',
-                             '-XepAllErrorsAsWarnings']
+// Configure error-prone.
+// Running with '-Derrorprone-fix=...' can instruct error-prone to automatically fix issues.
+tasks.withType(JavaCompile) {
+  options.errorprone {
+    disableWarningsInGeneratedCode = true
+    excludedPaths = '.*/build/generated.*/.*'
+    allErrorsAsWarnings = true
     def fix = propertyWithDefault("errorprone-fix", "")
     if (!fix.isEmpty()) {
-      options.compilerArgs += ['-XepPatchChecks:' + fix, '-XepPatchLocation:IN_PLACE']
+      errorproneArgs += ['-XepPatchChecks:' + fix, '-XepPatchLocation:IN_PLACE']
     }
   }
-// Set a specific version of Error Prone
-  dependencies {
-    errorprone libs.errorProne
-  }
+}
+dependencies {
+  // Set a specific version of Error Prone
+  errorprone libs.errorProne
+  // Configure Error Prone to use it's own static javac as described here:
+  // https://github.com/tbroyer/gradle-errorprone-plugin#jdk-8-support
+  errorproneJavac libs.errorProneJavac
 }
 
 // Define a Java API signature for use by animal-sniffer. It'll enforce that all
@@ -116,6 +104,7 @@ task animalsniffer(dependsOn: [animalsnifferMain, animalsnifferTest], group: "Ve
 
 // Configure the versions plugin to only show dependency updates for released versions.
 dependencyUpdates {
+  gradleReleaseChannel = "current"
   revision = "release"
   resolutionStrategy = {
     componentSelection { rules ->

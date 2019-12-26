@@ -25,13 +25,15 @@ import static org.junit.Assert.fail;
 import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
 import com.stumbleupon.async.Callback;
-
-import org.apache.kudu.test.cluster.MiniKuduCluster;
+import org.hamcrest.CoreMatchers;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
+
 import org.apache.kudu.consensus.Metadata;
 import org.apache.kudu.master.Master.ConnectToMasterResponsePB;
-import org.hamcrest.CoreMatchers;
+import org.apache.kudu.test.cluster.MiniKuduCluster;
+import org.apache.kudu.test.junit.RetryRule;
 
 public class TestConnectToCluster {
 
@@ -40,30 +42,26 @@ public class TestConnectToCluster {
       new HostAndPort("1", 9000),
       new HostAndPort("2", 9000));
 
+  @Rule
+  public RetryRule retryRule = new RetryRule();
+
   /**
    * Test that the client properly falls back to the old GetMasterRegistration
    * RPC when connecting to a master which does not support the new
    * ConnectToMaster RPC.
    */
-  @Test(timeout=60000)
+  @Test(timeout = 60000)
   public void testFallbackConnectRpc() throws Exception {
-    MiniKuduCluster cluster = new MiniKuduCluster.MiniKuduClusterBuilder()
-        .addMasterServerFlag("--master_support_connect_to_master_rpc=0")
-        .numMasterServers(1)
-        .numTabletServers(0)
-        .build();
-    KuduClient c = null;
-    try {
-      c = new KuduClient.KuduClientBuilder(cluster.getMasterAddressesAsString())
-          .build();
+    try (MiniKuduCluster cluster = new MiniKuduCluster.MiniKuduClusterBuilder()
+         .addMasterServerFlag("--master_support_connect_to_master_rpc=0")
+         .numMasterServers(1)
+         .numTabletServers(0)
+         .build();
+         KuduClient c = new KuduClient.KuduClientBuilder(cluster.getMasterAddressesAsString())
+             .build()) {
       // Call some method which uses the master. This forces us to connect
       // and verifies that the fallback works.
       c.listTabletServers();
-    } finally {
-      if (c != null) {
-        c.close();
-      }
-      cluster.shutdown();
     }
   }
 
@@ -73,20 +71,17 @@ public class TestConnectToCluster {
    * the resulting exception should clarify their error rather than
    * saying that no leader was found.
    */
-  @Test(timeout=60000)
+  @Test(timeout = 60000)
   public void testConnectToOneOfManyMasters() throws Exception {
-    MiniKuduCluster cluster = new MiniKuduCluster.MiniKuduClusterBuilder()
-        .numMasterServers(3)
-        .numTabletServers(0)
-        .build();
     int successes = 0;
-    try {
+    try (MiniKuduCluster cluster = new MiniKuduCluster.MiniKuduClusterBuilder()
+         .numMasterServers(3)
+         .numTabletServers(0)
+         .build()) {
       String[] masterAddrs = cluster.getMasterAddressesAsString().split(",", -1);
       assertEquals(3, masterAddrs.length);
       for (String masterAddr : masterAddrs) {
-        KuduClient c = null;
-        try {
-          c = new KuduClient.KuduClientBuilder(masterAddr).build();
+        try (KuduClient c = new KuduClient.KuduClientBuilder(masterAddr).build()) {
           // Call some method which uses the master. This forces us to connect.
           c.listTabletServers();
           successes++;
@@ -98,15 +93,10 @@ public class TestConnectToCluster {
                   "\\(.+?,.+?,.+?\\).*"));
           Assert.assertThat(Joiner.on("\n").join(e.getStackTrace()),
               CoreMatchers.containsString("testConnectToOneOfManyMasters"));
-        } finally {
-          if (c != null) {
-            c.close();
-          }
         }
       }
-    } finally {
-      cluster.shutdown();
     }
+
     // Typically, one of the connections will have succeeded. However, it's possible
     // that 0 succeeded in the case that the masters were slow at electing
     // themselves.
@@ -121,11 +111,11 @@ public class TestConnectToCluster {
    */
   @Test(timeout = 10000)
   public void testAggregateResponses() throws Exception {
-    NonRecoverableException reusableNRE = new NonRecoverableException(
+    final NonRecoverableException reusableNRE = new NonRecoverableException(
         Status.RuntimeError(""));
-    RecoverableException reusableRE = new RecoverableException(
+    final RecoverableException reusableRE = new RecoverableException(
         Status.RuntimeError(""));
-    NoLeaderFoundException retryResponse =
+    final NoLeaderFoundException retryResponse =
         new NoLeaderFoundException(Status.RuntimeError(""));
     // We don't test for a particular good response, so as long as we pass something that's not an
     // exception to runTest() we're good.
@@ -257,8 +247,6 @@ public class TestConnectToCluster {
       grrm.getDeferred().join(); // Don't care about the response.
       if ((expectedResponse instanceof Exception)) {
         fail("Should not work " + expectedResponse.getClass());
-      } else {
-        // ok
       }
     } catch (Exception ex) {
       assertEquals(expectedResponse.getClass(), ex.getClass());

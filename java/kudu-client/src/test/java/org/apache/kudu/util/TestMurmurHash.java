@@ -14,13 +14,18 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.util;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertEquals;
 
 import com.google.common.primitives.UnsignedLongs;
 import com.sangupta.murmur.Murmur2;
+import org.junit.Rule;
 import org.junit.Test;
+
+import org.apache.kudu.test.junit.RetryRule;
 
 /**
  * Test Murmur2 Hash64 returns the expected values for inputs.
@@ -30,17 +35,20 @@ import org.junit.Test;
  */
 public class TestMurmurHash {
 
-    @Test
-    public void testMurmur2Hash64() throws Exception {
-      long hash;
+  @Rule
+  public RetryRule retryRule = new RetryRule();
 
-      hash = Murmur2.hash64("ab".getBytes("UTF-8"), 2, 0);
-      assertEquals(UnsignedLongs.parseUnsignedLong("7115271465109541368"), hash);
+  @Test
+  public void testMurmur2Hash64() throws Exception {
+    long hash;
 
-      hash = Murmur2.hash64("abcdefg".getBytes("UTF-8"), 7, 0);
-      assertEquals(UnsignedLongs.parseUnsignedLong("2601573339036254301"), hash);
+    hash = Murmur2.hash64("ab".getBytes(UTF_8), 2, 0);
+    assertEquals(UnsignedLongs.parseUnsignedLong("7115271465109541368"), hash);
 
-      hash = Murmur2.hash64("quick brown fox".getBytes("UTF-8"), 15, 42);
-      assertEquals(UnsignedLongs.parseUnsignedLong("3575930248840144026"), hash);
-    }
+    hash = Murmur2.hash64("abcdefg".getBytes(UTF_8), 7, 0);
+    assertEquals(UnsignedLongs.parseUnsignedLong("2601573339036254301"), hash);
+
+    hash = Murmur2.hash64("quick brown fox".getBytes(UTF_8), 15, 42);
+    assertEquals(UnsignedLongs.parseUnsignedLong("3575930248840144026"), hash);
+  }
 }

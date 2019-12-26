@@ -16,9 +16,7 @@
 // under the License.
 //
 // Ksck, a tool to run a Kudu System Check.
-
-#ifndef KUDU_TOOLS_KSCK_H
-#define KUDU_TOOLS_KSCK_H
+#pragma once
 
 #include <atomic>
 #include <cstdint>
@@ -38,15 +36,18 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/rebalance/cluster_status.h" // IWYU pragma: keep
 #include "kudu/server/server_base.pb.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet.pb.h"  // IWYU pragma: keep
 #include "kudu/tools/ksck_results.h"
 #include "kudu/util/status.h"
+#include "kudu/util/threadpool.h"
 
 namespace kudu {
 
 class MonoDelta;
+
 namespace rpc {
 class Messenger;
 } // namespace rpc
@@ -120,11 +121,12 @@ class KsckTablet {
 // Representation of a table. Composed of tablets.
 class KsckTable {
  public:
-  KsckTable(std::string id, std::string name, const Schema& schema, int num_replicas)
+  KsckTable(std::string id, std::string name, Schema schema, int num_replicas)
       : id_(std::move(id)),
         name_(std::move(name)),
-        schema_(schema),
-        num_replicas_(num_replicas) {}
+        schema_(std::move(schema)),
+        num_replicas_(num_replicas) {
+  }
 
   const std::string& id() const {
     return id_;
@@ -146,7 +148,7 @@ class KsckTable {
     tablets_ = std::move(tablets);
   }
 
-  std::vector<std::shared_ptr<KsckTablet>>& tablets() {
+  const std::vector<std::shared_ptr<KsckTablet>>& tablets() const {
     return tablets_;
   }
 
@@ -286,14 +288,14 @@ class KsckTabletServer {
   // If Status is OK, 'health' will be HEALTHY
   // If the UUID is not what ksck expects, 'health' will be WRONG_SERVER_UUID
   // Otherwise 'health' will be UNAVAILABLE
-  virtual Status FetchInfo(KsckServerHealth* health) = 0;
+  virtual Status FetchInfo(cluster_summary::ServerHealth* health) = 0;
 
   // Connects to the configured tablet server and populates the consensus map. 'health' must not be
   // nullptr.
   //
   // If Status is OK, 'health' will be HEALTHY
   // Otherwise 'health' will be UNAVAILABLE
-  virtual Status FetchConsensusState(KsckServerHealth* health) = 0;
+  virtual Status FetchConsensusState(cluster_summary::ServerHealth* health) = 0;
 
   // Retrieves "unusual" flags from the KsckTabletServer.
   // "Unusual" flags ares ones tagged hidden, experimental, or unsafe.
@@ -407,9 +409,7 @@ class KsckCluster {
     RETURN_NOT_OK(Connect());
     RETURN_NOT_OK(RetrieveTablesList());
     RETURN_NOT_OK(RetrieveTabletServers());
-    for (const std::shared_ptr<KsckTable>& table : tables()) {
-      RETURN_NOT_OK(RetrieveTabletsList(table));
-    }
+    RETURN_NOT_OK(RetrieveAllTablets());
     return Status::OK();
   }
 
@@ -421,6 +421,9 @@ class KsckCluster {
 
   // Fetches the list of tables.
   virtual Status RetrieveTablesList() = 0;
+
+  // Fetches all tablets in the cluster.
+  virtual Status RetrieveAllTablets() = 0;
 
   // Fetches the list of tablets for the given table.
   // The table's tablet list is modified only if this method returns OK.
@@ -434,6 +437,10 @@ class KsckCluster {
     return tablet_servers_;
   }
 
+  const KsckTServerStateMap& ts_states() const {
+    return ts_states_;
+  }
+
   const std::vector<std::shared_ptr<KsckTable>>& tables() const {
     return tables_;
   }
@@ -444,11 +451,48 @@ class KsckCluster {
     return nullptr;
   }
 
+  // Setters for filtering the tables/tablets to be checked.
+  // Equivalent to the same functions in class 'Ksck'.
+  void set_table_filters(std::vector<std::string> table_names) {
+    table_filters_ = std::move(table_names);
+  }
+
+  // See above.
+  void set_tablet_id_filters(std::vector<std::string> tablet_ids) {
+    tablet_id_filters_ = std::move(tablet_ids);
+  }
+
+  const std::vector<std::string>& table_filters() const {
+    return table_filters_;
+  }
+
+  const std::vector<std::string>& tablet_id_filters() const {
+    return tablet_id_filters_;
+  }
+
+  int filtered_tables_count() const {
+    return filtered_tables_count_;
+  }
+
+  int filtered_tablets_count() const {
+    return filtered_tablets_count_;
+  }
+
  protected:
-  KsckCluster() = default;
+  KsckCluster() : filtered_tables_count_(0), filtered_tablets_count_(0) {}
   MasterList masters_;
   TSMap tablet_servers_;
+  KsckTServerStateMap ts_states_;
   std::vector<std::shared_ptr<KsckTable>> tables_;
+  std::unique_ptr<ThreadPool> pool_;
+
+  std::vector<std::string> table_filters_;
+  std::vector<std::string> tablet_id_filters_;
+
+  // The count of tables/tablets filtered out.
+  // Used to determine whether all tables/tablets have been filtered out.
+  std::atomic<int> filtered_tables_count_;
+  std::atomic<int> filtered_tablets_count_;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(KsckCluster);
@@ -487,7 +531,11 @@ class Ksck {
     tablet_id_filters_ = std::move(tablet_ids);
   }
 
-  const KsckResults& results() const;
+  void set_print_sections(const std::vector<std::string>& sections);
+
+  const KsckResults& results() const {
+    return results_;
+  }
 
   // Check that all masters are healthy.
   Status CheckMasterHealth();
@@ -563,16 +611,21 @@ class Ksck {
                               const MonoDelta& timeout,
                               const MonoDelta& retry_interval);
 
-  KsckCheckResult VerifyTablet(const std::shared_ptr<KsckTablet>& tablet,
-                           int table_num_replicas);
+  cluster_summary::HealthCheckResult VerifyTablet(
+      const std::shared_ptr<KsckTablet>& tablet,
+      int table_num_replicas);
 
   const std::shared_ptr<KsckCluster> cluster_;
+  std::unique_ptr<ThreadPool> pool_;
 
   bool check_replica_count_ = true;
   std::vector<std::string> table_filters_;
   std::vector<std::string> tablet_id_filters_;
 
   std::ostream* const out_;
+
+  // The output sections, could be a composite of PrintSections::Values
+  int print_sections_flags_ = PrintSections::ALL_SECTIONS;
 
   KsckResults results_;
 
@@ -582,4 +635,3 @@ class Ksck {
 } // namespace tools
 } // namespace kudu
 
-#endif // KUDU_TOOLS_KSCK_H

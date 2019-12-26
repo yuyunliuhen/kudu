@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <stdint.h>
-
+#include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <ostream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -41,7 +42,6 @@
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/raft_consensus.h"
-#include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -118,7 +118,7 @@ class TimestampAdvancementITest : public MiniClusterITestBase {
     NO_FATALS(StartCluster(3));
 
     // Write some rows to the cluster.
-    TestWorkload write(cluster_.get());;
+    TestWorkload write(cluster_.get());
 
     // Set a low batch size so we have finer-grained control over flushing of
     // the WAL. Too large, and the WAL may end up flushing in the background.
@@ -139,7 +139,7 @@ class TimestampAdvancementITest : public MiniClusterITestBase {
 
     // Flush the current log batch and roll over to get a fresh WAL segment.
     ASSERT_OK(tablet_replica->log()->WaitUntilAllFlushed());
-    ASSERT_OK(tablet_replica->log()->AllocateSegmentAndRollOver());
+    ASSERT_OK(tablet_replica->log()->AllocateSegmentAndRollOverForTests());
 
     // Also flush the MRS so we're free to GC the WAL segment we just wrote.
     ASSERT_OK(tablet_replica->tablet()->Flush());
@@ -180,12 +180,12 @@ class TimestampAdvancementITest : public MiniClusterITestBase {
   Status CheckForWriteReplicatesInLog(MiniTabletServer* ts, const string& tablet_id,
                                       bool* has_write_replicates) const {
     shared_ptr<LogReader> reader;
-    RETURN_NOT_OK(LogReader::Open(env_,
-                  ts->server()->fs_manager()->GetTabletWalDir(tablet_id),
-                  scoped_refptr<log::LogIndex>(), tablet_id,
-                  scoped_refptr<MetricEntity>(), &reader));
+    RETURN_NOT_OK(LogReader::Open(
+       ts->server()->fs_manager(),
+       scoped_refptr<log::LogIndex>(), tablet_id,
+       scoped_refptr<MetricEntity>(), &reader));
     log::SegmentSequence segs;
-    RETURN_NOT_OK(reader->GetSegmentsSnapshot(&segs));
+    reader->GetSegmentsSnapshot(&segs);
     unique_ptr<log::LogEntryPB> entry;
     for (const auto& seg : segs) {
       log::LogEntryReader reader(seg.get());
@@ -302,7 +302,9 @@ TEST_F(TimestampAdvancementITest, Kudu2463Test) {
   TServerDetails* leader;
   ASSERT_OK(FindTabletLeader(ts_map_, tablet_id, kTimeout, &leader));
   vector<TServerDetails*> followers;
-  ASSERT_OK(FindTabletFollowers(ts_map_, tablet_id, kTimeout, &followers));
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(FindTabletFollowers(ts_map_, tablet_id, kTimeout, &followers));
+  });
   ASSERT_FALSE(followers.empty());
   for (int i = 0; i < 20; i++) {
     RaftPeerPB::MemberType type = i % 2 == 0 ? RaftPeerPB::NON_VOTER : RaftPeerPB::VOTER;

@@ -14,32 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.test;
 
-import com.google.common.base.Stopwatch;
-import com.stumbleupon.async.Deferred;
-import org.apache.kudu.Common;
-import org.apache.kudu.client.AsyncKuduClient;
-import org.apache.kudu.client.AsyncKuduClient.AsyncKuduClientBuilder;
-import org.apache.kudu.client.DeadlineTracker;
-import org.apache.kudu.client.HostAndPort;
-import org.apache.kudu.client.KuduClient;
-import org.apache.kudu.client.KuduException;
-import org.apache.kudu.client.KuduTable;
-import org.apache.kudu.client.LocatedTablet;
-import org.apache.kudu.client.RemoteTablet;
-import org.apache.kudu.master.Master;
-import org.apache.kudu.test.cluster.MiniKuduCluster;
-import org.apache.kudu.test.cluster.MiniKuduCluster.MiniKuduClusterBuilder;
-import org.apache.kudu.test.cluster.FakeDNS;
-import org.apache.kudu.test.junit.RetryRule;
-import org.apache.yetus.audience.InterfaceAudience;
-import org.apache.yetus.audience.InterfaceStability;
-import org.junit.rules.ExternalResource;
-import org.junit.runner.Description;
-import org.junit.runners.model.Statement;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import static org.junit.Assert.fail;
 
 import java.io.IOException;
 import java.lang.annotation.ElementType;
@@ -48,9 +26,28 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 import java.util.List;
 import java.util.Random;
-import java.util.concurrent.TimeUnit;
 
-import static org.junit.Assert.fail;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
+import org.junit.rules.ExternalResource;
+import org.junit.runner.Description;
+import org.junit.runners.model.Statement;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.kudu.client.AsyncKuduClient;
+import org.apache.kudu.client.AsyncKuduClient.AsyncKuduClientBuilder;
+import org.apache.kudu.client.HostAndPort;
+import org.apache.kudu.client.KuduClient;
+import org.apache.kudu.client.KuduException;
+import org.apache.kudu.client.KuduTable;
+import org.apache.kudu.client.LocatedTablet;
+import org.apache.kudu.client.RemoteTablet;
+import org.apache.kudu.client.TimeoutTracker;
+import org.apache.kudu.test.cluster.FakeDNS;
+import org.apache.kudu.test.cluster.MiniKuduCluster;
+import org.apache.kudu.test.cluster.MiniKuduCluster.MiniKuduClusterBuilder;
+import org.apache.kudu.test.junit.RetryRule;
 
 /**
  * A Junit Rule that manages a Kudu cluster and clients for testing.
@@ -67,8 +64,8 @@ import static org.junit.Assert.fail;
  * }
  * </pre>
  */
-@InterfaceAudience.Private
-@InterfaceStability.Unstable
+@InterfaceAudience.Public
+@InterfaceStability.Evolving
 public class KuduTestHarness extends ExternalResource {
 
   private static final Logger LOG = LoggerFactory.getLogger(KuduTestHarness.class);
@@ -117,6 +114,13 @@ public class KuduTestHarness extends ExternalResource {
         clusterBuilder.addMasterServerFlag(flag);
       }
     }
+    // Pass through any location mapping defined in the method level annotation.
+    LocationConfig locationConfig = description.getAnnotation(LocationConfig.class);
+    if (locationConfig != null) {
+      for (String location : locationConfig.locations()) {
+        clusterBuilder.addLocation(location);
+      }
+    }
     // Set any tablet server flags defined in the method level annotation.
     TabletServerConfig tabletServerConfig = description.getAnnotation(TabletServerConfig.class);
     if (tabletServerConfig != null) {
@@ -152,7 +156,7 @@ public class KuduTestHarness extends ExternalResource {
         // shutting down the sync client effectively does that.
       }
     } catch (KuduException e) {
-      LOG.warn("Error while shutting down the test client");
+      LOG.warn("Error while shutting down the test client", e);
     } finally {
       if (miniCluster != null) {
         miniCluster.shutdown();
@@ -177,9 +181,10 @@ public class KuduTestHarness extends ExternalResource {
    * @param table a KuduTable which will get its single tablet's leader killed.
    * @throws Exception
    */
+  @SuppressWarnings("deprecation")
   public void killTabletLeader(KuduTable table) throws Exception {
     List<LocatedTablet> tablets = table.getTabletsLocations(DEFAULT_SLEEP);
-    if (tablets.isEmpty() || tablets.size() > 1) {
+    if (tablets.size() != 1) {
       fail("Currently only support killing leaders for tables containing 1 tablet, table " +
           table.getName() + " has " + tablets.size());
     }
@@ -228,17 +233,17 @@ public class KuduTestHarness extends ExternalResource {
   public HostAndPort findLeaderTabletServer(LocatedTablet tablet)
       throws Exception {
     LocatedTablet.Replica leader = null;
-    DeadlineTracker deadlineTracker = new DeadlineTracker();
-    deadlineTracker.setDeadline(DEFAULT_SLEEP);
+    TimeoutTracker timeoutTracker = new TimeoutTracker();
+    timeoutTracker.setTimeout(DEFAULT_SLEEP);
     while (leader == null) {
-      if (deadlineTracker.timedOut()) {
+      if (timeoutTracker.timedOut()) {
         fail("Timed out while trying to find a leader for this table");
       }
 
       leader = tablet.getLeaderReplica();
       if (leader == null) {
         LOG.info("Sleeping while waiting for a tablet LEADER to arise, currently slept {} ms",
-            deadlineTracker.getElapsedMillis());
+            timeoutTracker.getElapsedMillis());
         Thread.sleep(50);
       }
     }
@@ -262,20 +267,7 @@ public class KuduTestHarness extends ExternalResource {
    * @throws Exception if we are unable to find the leader master
    */
   public HostAndPort findLeaderMasterServer() throws Exception {
-    Stopwatch sw = Stopwatch.createStarted();
-    while (sw.elapsed(TimeUnit.MILLISECONDS) < DEFAULT_SLEEP) {
-      Deferred<Master.GetTableLocationsResponsePB> masterLocD =
-          asyncClient.getMasterTableLocationsPB(null);
-      Master.GetTableLocationsResponsePB r = masterLocD.join(DEFAULT_SLEEP);
-      Common.HostPortPB pb = r.getTabletLocations(0)
-          .getReplicas(0)
-          .getTsInfo()
-          .getRpcAddresses(0);
-      if (pb.getPort() != -1) {
-        return new HostAndPort(pb.getHost(), pb.getPort());
-      }
-    }
-    throw new IOException(String.format("No leader master found after %d ms", DEFAULT_SLEEP));
+    return client.findLeaderMasterServer();
   }
 
   /**
@@ -283,6 +275,7 @@ public class KuduTestHarness extends ExternalResource {
    * @param table table to query for a TS to restart
    * @throws Exception
    */
+  @SuppressWarnings("deprecation")
   public void restartTabletServer(KuduTable table) throws Exception {
     List<LocatedTablet> tablets = table.getTabletsLocations(DEFAULT_SLEEP);
     if (tablets.isEmpty()) {
@@ -440,5 +433,28 @@ public class KuduTestHarness extends ExternalResource {
   @Target({ElementType.METHOD})
   public @interface TabletServerConfig {
     String[] flags();
+  }
+
+  /**
+   * An annotation that can be added to each test method to
+   * define a location mapping for the cluster. Location
+   * mappings are defined as a series of 'location:number'
+   * pairs.
+   *
+   * Note that, in many Kudu tests, multiple masters will be run, each
+   * on their own network interface within the same machine, and client
+   * connections will appear to come from the same interface as the
+   * master being connected to. So, for example, if there are two
+   * clients, three masters, and three tablet servers, nine locations
+   * will be assigned: each client will get a location from each
+   * master (from a different IP), and each tablet server will get a
+   * location. The easiest way to work around this for our simple
+   * Java client tests is to set the number of mappings to be something
+   * at least (# masters) * (# clients) + (# tablet servers)
+   */
+  @Retention(RetentionPolicy.RUNTIME)
+  @Target({ElementType.METHOD})
+  public @interface LocationConfig {
+    String[] locations();
   }
 }

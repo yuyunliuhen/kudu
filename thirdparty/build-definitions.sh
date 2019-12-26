@@ -192,7 +192,6 @@ build_llvm() {
       CLANG_TOOL_CLANG_CHECK_BUILD \
       CLANG_TOOL_CLANG_DIFF_BUILD \
       CLANG_TOOL_CLANG_FORMAT_VS_BUILD \
-      CLANG_TOOL_CLANG_FUNC_MAPPING_BUILD \
       CLANG_TOOL_CLANG_FUZZER_BUILD \
       CLANG_TOOL_CLANG_IMPORT_TEST_BUILD \
       CLANG_TOOL_CLANG_OFFLOAD_BUNDLER_BUILD \
@@ -214,7 +213,6 @@ build_llvm() {
       LLVM_TOOL_LLVM_CVTRES_BUILD \
       LLVM_TOOL_LLVM_CXXDUMP_BUILD \
       LLVM_TOOL_LLVM_CXXFILT_BUILD \
-      LLVM_TOOL_LLVM_DEMANGLE_FUZZER_BUILD \
       LLVM_TOOL_LLVM_DIFF_BUILD \
       LLVM_TOOL_LLVM_DIS_BUILD \
       LLVM_TOOL_LLVM_DWARFDUMP_BUILD \
@@ -226,7 +224,6 @@ build_llvm() {
       LLVM_TOOL_LLVM_MC_ASSEMBLE_FUZZER_BUILD \
       LLVM_TOOL_LLVM_MC_BUILD \
       LLVM_TOOL_LLVM_MC_DISASSEMBLE_FUZZER_BUILD \
-      LLVM_TOOL_LLVM_MCMARKUP_BUILD \
       LLVM_TOOL_LLVM_MODEXTRACT_BUILD \
       LLVM_TOOL_LLVM_MT_BUILD \
       LLVM_TOOL_LLVM_NM_BUILD \
@@ -245,7 +242,6 @@ build_llvm() {
       LLVM_TOOL_LLVM_SPLIT_BUILD \
       LLVM_TOOL_LLVM_STRESS_BUILD \
       LLVM_TOOL_LLVM_STRINGS_BUILD \
-      LLVM_TOOL_MSBUILD_BUILD \
       LLVM_TOOL_OBJ2YAML_BUILD \
       LLVM_TOOL_OPT_BUILD \
       LLVM_TOOL_OPT_VIEWER_BUILD \
@@ -321,11 +317,12 @@ build_llvm() {
   cmake \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DLLVM_TEMPORARILY_ALLOW_OLD_TOOLCHAIN=ON \
     -DLLVM_INCLUDE_DOCS=OFF \
     -DLLVM_INCLUDE_EXAMPLES=OFF \
     -DLLVM_INCLUDE_TESTS=OFF \
     -DLLVM_INCLUDE_UTILS=OFF \
-    -DLLVM_TARGETS_TO_BUILD=X86 \
+    -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
     -DLLVM_ENABLE_RTTI=ON \
     -DCMAKE_CXX_FLAGS="$CLANG_CXXFLAGS" \
     -DCMAKE_EXE_LINKER_FLAGS="$CLANG_LDFLAGS" \
@@ -545,10 +542,10 @@ build_lz4() {
   CFLAGS="$EXTRA_CFLAGS" \
     cmake \
     -DCMAKE_BUILD_TYPE=release \
-    -DBUILD_TOOLS=0 \
+    -DBUILD_STATIC_LIBS=On \
     -DCMAKE_INSTALL_PREFIX:PATH=$PREFIX \
     $EXTRA_CMAKE_FLAGS \
-    $LZ4_SOURCE/cmake_unofficial
+    $LZ4_SOURCE/contrib/cmake_unofficial
   ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
   popd
 }
@@ -565,6 +562,9 @@ build_bitshuffle() {
   # suffix the AVX2 symbols with '_avx2'. OSX doesn't have objcopy, so we only
   # do this trick on Linux.
   if [ -n "$OS_LINUX" ]; then
+    AVX2_SUPPORT=$(echo | ${CC:-gcc} -mavx2 -dM -E - | awk '$2 == "__AVX2__" { print $3 }')
+  fi
+  if [ -n "$AVX2_SUPPORT" ]; then
     arches="default avx2"
   else
     arches="default"
@@ -642,7 +642,7 @@ build_mustache() {
   mkdir -p $MUSTACHE_BDIR
   pushd $MUSTACHE_BDIR
   # We add $PREFIX/include for boost and $PREFIX_COMMON/include for rapidjson.
-  ${CXX:-g++} $EXTRA_CXXFLAGS -I$PREFIX/include -I$PREFIX_COMMON/include -O3 -DNDEBUG -fPIC -c "$MUSTACHE_SOURCE/mustache.cc"
+  ${CXX:-g++} -std=c++11 $EXTRA_CXXFLAGS -I$PREFIX/include -I$PREFIX_COMMON/include -O3 -DNDEBUG -fPIC -c "$MUSTACHE_SOURCE/mustache.cc"
   ar rs libmustache.a mustache.o
   cp libmustache.a $PREFIX/lib/
   cp $MUSTACHE_SOURCE/mustache.h $PREFIX/include/
@@ -650,11 +650,21 @@ build_mustache() {
 }
 
 build_curl() {
-  # Configure for a very minimal install - basically only HTTP(S), since we only
-  # use this for testing our own HTTP/HTTPS endpoints at this point in time.
+  # Configure for a fairly minimal install - we only use this for testing
+  # so we just need HTTP/HTTPS with GSSAPI support (for SPNEGO testing).
   CURL_BDIR=$TP_BUILD_DIR/$CURL_NAME$MODE_SUFFIX
   mkdir -p $CURL_BDIR
   pushd $CURL_BDIR
+
+  # curl's configure script expects krb5-config to be in /usr/bin. If that's not
+  # the case (looking at you, SLES12's /usr/lib/mit/bin/krb5-config), we need to
+  # pass the right location via the KRB5CONFIG environment variable.
+  #
+  # TODO(adar): there's gotta be a way to do this without using export/unset.
+  KRB5CONFIG_LOCATION=$(which krb5-config 2>/dev/null || :)
+  if [ -n "$KRB5CONFIG_LOCATION" -a "$KRB5CONFIG_LOCATION" != "/usr/bin/krb5-config" ]; then
+    export KRB5CONFIG=$KRB5CONFIG_LOCATION
+  fi
 
   # Note: curl shows a message asking for CPPFLAGS to be used for include
   # directories, not CFLAGS.
@@ -679,7 +689,9 @@ build_curl() {
     --disable-telnet \
     --disable-tftp \
     --without-librtmp \
-    --without-libssh2
+    --without-libssh2 \
+    --with-gssapi
+  unset KRB5CONFIG
   make -j$PARALLEL $EXTRA_MAKEFLAGS install
   popd
 }
@@ -743,40 +755,8 @@ build_gcovr() {
 
 build_trace_viewer() {
   echo Installing trace-viewer into the www directory
+  mkdir -p $TP_DIR/../www/
   cp -a $TRACE_VIEWER_SOURCE/tracing.* $TP_DIR/../www/
-}
-
-build_nvml() {
-  NVML_BDIR=$TP_BUILD_DIR/$NVML_NAME$MODE_SUFFIX
-  mkdir -p $NVML_BDIR
-  pushd $NVML_BDIR
-
-  # It doesn't appear possible to isolate source and build directories, so just
-  # prepopulate the latter using the former.
-  rsync -av --delete $NVML_SOURCE/ .
-  cd src/
-
-  # The embedded jemalloc build doesn't pick up the EXTRA_CFLAGS environment
-  # variable, so we have to stick our flags into this config file.
-  if ! grep -q -e "$EXTRA_CFLAGS" jemalloc/jemalloc.cfg ; then
-    perl -p -i -e "s,(EXTRA_CFLAGS=\"),\$1$EXTRA_CFLAGS ," jemalloc/jemalloc.cfg
-  fi
-  for LIB in libvmem libpmem libpmemobj; do
-    # Disable -Werror; it prevents jemalloc from building via clang.
-    #
-    # Add PREFIX/lib to the rpath; libpmemobj depends on libpmem at runtime.
-    EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-error" \
-      EXTRA_LDFLAGS="$EXTRA_LDFLAGS -Wl,-rpath,$PREFIX/lib" \
-      make -j$PARALLEL $EXTRA_MAKEFLAGS DEBUG=0 $LIB
-
-    # NVML doesn't allow configuring PREFIX -- it always installs into
-    # DESTDIR/usr/lib. Additionally, the 'install' target builds all of
-    # the NVML libraries, even though we only need the three libraries above.
-    # So, we manually install the built artifacts.
-    cp -a $NVML_BDIR/src/include/$LIB.h $PREFIX/include
-    cp -a $NVML_BDIR/src/nondebug/$LIB.{so*,a} $PREFIX/lib
-  done
-  popd
 }
 
 build_boost() {
@@ -815,10 +795,16 @@ build_boost() {
 
   # If CC and CXX are set, set the compiler in user-config.jam.
   if [ -n "$CC" -a -n "$CXX" ]; then
-    # Determine the name of the compiler referenced in $CC. This assumes the compiler
-    # prints its name as the first word of the first line, which appears to work for gcc
-    # and clang, even when they're called through ccache.
-    local COMPILER=$($CC --version | awk 'NR==1 {print $1;}')
+    # Determine the name of the compiler referenced in $CC. This assumes
+    # the compiler prints its name in the first line of the output. The pattern
+    # matching works for various flavors of GCC and LLVM clang. As the last
+    # resort, output the first word of the first line. The '$CC --version'
+    # approach appears to work even if the compiler is called through ccache.
+    local COMPILER=$($CC --version | \
+      awk '/(Apple )?(clang|LLVM) version [[:digit:]]+\.[[:digit:]]+/ {
+             print "clang"; exit }
+           /\(GCC\) [[:digit:]]+\.[[:digit:]]+/{ print "gcc"; exit }
+           { print $1; exit }')
 
     # If the compiler binary used was 'cc' and not 'gcc', it will also report
     # itself as 'cc'. Coerce it to gcc.
@@ -916,5 +902,106 @@ build_bison() {
     $BISON_SOURCE/configure \
     --prefix=$PREFIX
   make -j$PARALLEL $EXTRA_MAKEFLAGS install
+  popd
+}
+
+build_yaml() {
+  YAML_SHARED_BDIR=$TP_BUILD_DIR/$YAML_NAME.shared$MODE_SUFFIX
+  YAML_STATIC_BDIR=$TP_BUILD_DIR/$YAML_NAME.static$MODE_SUFFIX
+  for SHARED in ON OFF; do
+    if [ $SHARED = "ON" ]; then
+      YAML_BDIR=$YAML_SHARED_BDIR
+    else
+      YAML_BDIR=$YAML_STATIC_BDIR
+    fi
+    mkdir -p $YAML_BDIR
+    pushd $YAML_BDIR
+    rm -rf CMakeCache.txt CMakeFiles/
+    CFLAGS="$EXTRA_CFLAGS -fPIC" \
+      CXXFLAGS="$EXTRA_CXXFLAGS -fPIC" \
+      LDFLAGS="$EXTRA_LDFLAGS" \
+      LIBS="$EXTRA_LIBS" \
+      cmake \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DYAML_CPP_BUILD_TESTS=OFF \
+      -DYAML_CPP_BUILD_TOOLS=OFF \
+      -DBUILD_SHARED_LIBS=$SHARED \
+      -DCMAKE_INSTALL_PREFIX=$PREFIX \
+      $EXTRA_CMAKE_FLAGS \
+      $YAML_SOURCE
+    ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
+    popd
+  done
+}
+
+build_chrony() {
+  CHRONY_BDIR=$TP_BUILD_DIR/$CHRONY_NAME$MODE_SUFFIX
+  mkdir -p $CHRONY_BDIR
+  pushd $CHRONY_BDIR
+
+  # The configure script for chrony doesn't follow the common policy of
+  # the autogen tools (probably, it's manually written from scratch).
+  # It's not possible to configure and build chrony in a separate directory;
+  # it's necessary to do so in the source directory itself.
+  rsync -av --delete $CHRONY_SOURCE/ .
+
+  # In the scope of using chrony in Kudu test framework, it's better to have
+  # leaner binaries for chronyd and chronyc, stripping off everything but
+  # essential functionality.
+  CFLAGS="$EXTRA_CFLAGS" \
+    CXXFLAGS="$EXTRA_CXXFLAGS" \
+    LDFLAGS="$EXTRA_LDFLAGS" \
+    LIBS="$EXTRA_LIBS" \
+    ./configure \
+    --prefix=$PREFIX \
+    --sysconfdir=$PREFIX/etc \
+    --localstatedir=$PREFIX/var \
+    --enable-debug \
+    --disable-ipv6 \
+    --disable-pps \
+    --disable-privdrop \
+    --disable-readline \
+    --without-editline \
+    --without-nettle \
+    --without-nss \
+    --without-tomcrypt \
+    --without-libcap \
+    --without-seccomp \
+    --disable-forcednsretry \
+    --disable-sechash
+
+  make -j$PARALLEL $EXTRA_MAKEFLAGS install
+  popd
+}
+
+build_gumbo_parser() {
+  GUMBO_PARSER_BDIR=$TP_BUILD_DIR/$GUMBO_PARSER_NAME$MODE_SUFFIX
+  mkdir -p $GUMBO_PARSER_BDIR
+  pushd $GUMBO_PARSER_BDIR
+  CFLAGS="$EXTRA_CFLAGS" \
+    CXXFLAGS="$EXTRA_CXXFLAGS" \
+    LDFLAGS="$EXTRA_LDFLAGS" \
+    LIBS="$EXTRA_LIBS" \
+    $GUMBO_PARSER_SOURCE/configure \
+    --prefix=$PREFIX
+  make -j$PARALLEL $EXTRA_MAKEFLAGS install
+  popd
+}
+
+build_gumbo_query() {
+  GUMBO_QUERY_BDIR=$TP_BUILD_DIR/$GUMBO_QUERY_NAME$MODE_SUFFIX
+  mkdir -p $GUMBO_QUERY_BDIR
+  pushd $GUMBO_QUERY_BDIR
+  rm -Rf CMakeCache.txt CMakeFiles/
+  cmake \
+    -DCMAKE_BUILD_TYPE=release \
+    -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DCMAKE_CXX_FLAGS="$EXTRA_CXXFLAGS" \
+    -DCMAKE_EXE_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS" \
+    -DCMAKE_MODULE_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS" \
+    -DCMAKE_SHARED_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS -L$PREFIX/lib -Wl,-rpath,$PREFIX/lib" \
+    $EXTRA_CMAKE_FLAGS \
+    $GUMBO_QUERY_SOURCE
+  ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
   popd
 }

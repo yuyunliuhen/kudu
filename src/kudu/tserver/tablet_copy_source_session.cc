@@ -59,12 +59,14 @@ TAG_FLAG(tablet_copy_transfer_chunk_size_bytes, hidden);
 METRIC_DEFINE_counter(server, tablet_copy_bytes_sent,
                       "Bytes Sent For Tablet Copy",
                       kudu::MetricUnit::kBytes,
-                      "Number of bytes sent during tablet copy operations since server start");
+                      "Number of bytes sent during tablet copy operations since server start",
+                      kudu::MetricLevel::kDebug);
 
 METRIC_DEFINE_gauge_int32(server, tablet_copy_open_source_sessions,
                           "Open Table Copy Source Sessions",
                           kudu::MetricUnit::kSessions,
-                          "Number of currently open tablet copy source sessions on this server");
+                          "Number of currently open tablet copy source sessions on this server",
+                          kudu::MetricLevel::kInfo);
 
 DEFINE_int32(tablet_copy_session_inject_latency_on_init_ms, 0,
              "How much latency (in ms) to inject when a tablet copy session is initialized. "
@@ -326,7 +328,7 @@ Status TabletCopySourceSession::GetLogSegmentPiece(uint64_t segment_seqno,
   DCHECK(init_once_.init_succeeded());
   RETURN_NOT_OK_PREPEND(CheckHealthyDirGroup(error_code),
                         "Tablet copy source could not get log segment");
-  ImmutableRandomAccessFileInfo* file_info;
+  ImmutableRWFileInfo* file_info;
   RETURN_NOT_OK(FindLogSegment(segment_seqno, &file_info, error_code));
   RETURN_NOT_OK(ReadFileChunkToBuf(file_info, offset, client_maxlen,
                                    Substitute("log segment $0", segment_seqno),
@@ -423,7 +425,7 @@ Status TabletCopySourceSession::OpenLogSegment(uint64_t segment_seqno) {
   CHECK_EQ(log_segment->header().sequence_number(), segment_seqno);
 
   uint64_t size = log_segment->readable_up_to();
-  Status s = AddImmutableFileToMap(&logs_, segment_seqno, log_segment->readable_file(), size);
+  Status s = AddImmutableFileToMap(&logs_, segment_seqno, log_segment->file(), size);
   if (!s.ok()) {
     s = s.CloneAndPrepend(
             Substitute("Error accessing data for log segment with seqno $0",
@@ -434,7 +436,7 @@ Status TabletCopySourceSession::OpenLogSegment(uint64_t segment_seqno) {
 }
 
 Status TabletCopySourceSession::FindLogSegment(uint64_t segment_seqno,
-                                              ImmutableRandomAccessFileInfo** file_info,
+                                              ImmutableRWFileInfo** file_info,
                                               TabletCopyErrorPB::Code* error_code) {
   if (!FindCopy(logs_, segment_seqno, file_info)) {
     *error_code = TabletCopyErrorPB::WAL_SEGMENT_NOT_FOUND;

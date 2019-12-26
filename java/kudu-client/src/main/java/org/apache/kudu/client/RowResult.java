@@ -20,14 +20,9 @@ package org.apache.kudu.client;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
 import java.sql.Timestamp;
-import java.text.DateFormat;
-import java.text.FieldPosition;
-import java.text.SimpleDateFormat;
+import java.util.Arrays;
 import java.util.BitSet;
-import java.util.Date;
-import java.util.TimeZone;
 
-import org.apache.kudu.util.TimestampUtil;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
 
@@ -36,9 +31,10 @@ import org.apache.kudu.ColumnTypeAttributes;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.util.Slice;
+import org.apache.kudu.util.TimestampUtil;
 
 /**
- * RowResult represents one row from a scanner. Do not reuse or store the objects.
+ * RowResult represents one row from a scanner.
  */
 @InterfaceAudience.Public
 @InterfaceStability.Evolving
@@ -46,14 +42,15 @@ public class RowResult {
 
   private static final int INDEX_RESET_LOCATION = -1;
 
+  private final Schema schema;
+  private final Slice indirectData;
+  private final int rowSize;
+  private final int[] columnOffsets;
+
+  private Slice rowData;
   private int index = INDEX_RESET_LOCATION;
   private int offset;
   private BitSet nullsBitSet;
-  private final int rowSize;
-  private final int[] columnOffsets;
-  private final Schema schema;
-  private final Slice rowData;
-  private final Slice indirectData;
 
   /**
    * Prepares the row representation using the provided data. Doesn't copy data
@@ -61,16 +58,17 @@ public class RowResult {
    * @param schema Schema used to build the rowData
    * @param rowData The Slice of data returned by the tablet server
    * @param indirectData The full indirect data that contains the strings
+   * @param rowIndex The index of the row in the rowData that this RowResult represents
    */
-  RowResult(Schema schema, Slice rowData, Slice indirectData) {
+  RowResult(Schema schema, Slice rowData, Slice indirectData, int rowIndex) {
     this.schema = schema;
     this.rowData = rowData;
     this.indirectData = indirectData;
+    this.rowSize = this.schema.getRowSize();
     int columnOffsetsSize = schema.getColumnCount();
     if (schema.hasNullableColumns()) {
       columnOffsetsSize++;
     }
-    this.rowSize = this.schema.getRowSize();
     columnOffsets = new int[columnOffsetsSize];
     // Empty projection, usually used for quick row counting.
     if (columnOffsetsSize == 0) {
@@ -86,19 +84,16 @@ public class RowResult {
       columnOffsets[i] = previousSize + currentOffset;
       currentOffset += previousSize;
     }
-  }
-
-  /**
-   * Package-protected, only meant to be used by the RowResultIterator
-   */
-  void advancePointer() {
-    advancePointerTo(this.index + 1);
+    advancePointerTo(rowIndex);
   }
 
   void resetPointer() {
     advancePointerTo(INDEX_RESET_LOCATION);
   }
 
+  /**
+   * Package-protected, only meant to be used by the RowResultIterator
+   */
   void advancePointerTo(int rowIndex) {
     this.index = rowIndex;
     this.offset = this.rowSize * this.index;
@@ -254,10 +249,8 @@ public class RowResult {
   public long getLong(int columnIndex) {
     checkValidColumn(columnIndex);
     checkNull(columnIndex);
-    // Can't check type because this could be a long, string, or Timestamp.
-    return Bytes.getLong(this.rowData.getRawArray(),
-                         this.rowData.getRawOffset() +
-                             getCurrentRowDataOffsetForColumn(columnIndex));
+    checkType(columnIndex, Type.INT64, Type.UNIXTIME_MICROS);
+    return getLongOrOffset(columnIndex);
   }
 
   /**
@@ -372,10 +365,7 @@ public class RowResult {
     checkValidColumn(columnIndex);
     checkNull(columnIndex);
     checkType(columnIndex, Type.UNIXTIME_MICROS);
-    ColumnSchema column = schema.getColumnByIndex(columnIndex);
-    long micros = Bytes.getLong(this.rowData.getRawArray(),
-        this.rowData.getRawOffset() +
-            getCurrentRowDataOffsetForColumn(columnIndex));
+    long micros = getLongOrOffset(columnIndex);
     return TimestampUtil.microsToTimestamp(micros);
   }
 
@@ -408,17 +398,46 @@ public class RowResult {
    * @throws IndexOutOfBoundsException if the column doesn't exist
    */
   public String getString(int columnIndex) {
+    checkType(columnIndex, Type.STRING);
+    return getVarLengthData(columnIndex);
+  }
+
+  private String getVarLengthData(int columnIndex) {
     checkValidColumn(columnIndex);
     checkNull(columnIndex);
-    checkType(columnIndex, Type.STRING);
-    // C++ puts a Slice in rowData which is 16 bytes long for simplity, but we only support ints.
-    long offset = getLong(columnIndex);
+    checkType(columnIndex, Type.STRING, Type.VARCHAR);
+    // C++ puts a Slice in rowData which is 16 bytes long for simplicity, but we only support ints.
+    long offset = getLongOrOffset(columnIndex);
     long length = rowData.getLong(getCurrentRowDataOffsetForColumn(columnIndex) + 8);
     assert offset < Integer.MAX_VALUE;
     assert length < Integer.MAX_VALUE;
     return Bytes.getString(indirectData.getRawArray(),
                            indirectData.getRawOffset() + (int)offset,
                            (int)length);
+  }
+
+  /**
+   * Get the specified column's varchar.
+   * @param columnIndex Column index in the schema
+   * @return a string
+   * @throws IllegalArgumentException if the column is null
+   * or if the type doesn't match the column's type
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public String getVarchar(int columnIndex) {
+    checkType(columnIndex, Type.VARCHAR);
+    return getVarLengthData(columnIndex);
+  }
+
+  /**
+   * Get the specified column's varchar.
+   * @param columnName name of the column to get data for
+   * @return a string
+   * @throws IllegalArgumentException if the column doesn't exist, is null,
+   * or if the type doesn't match the column's type
+   */
+  public String getVarchar(String columnName) {
+    return getVarchar(this.schema.getColumnIndex(columnName));
   }
 
   /**
@@ -447,7 +466,7 @@ public class RowResult {
     checkNull(columnIndex);
     // C++ puts a Slice in rowData which is 16 bytes long for simplicity,
     // but we only support ints.
-    long offset = getLong(columnIndex);
+    long offset = getLongOrOffset(columnIndex);
     long length = rowData.getLong(getCurrentRowDataOffsetForColumn(columnIndex) + 8);
     assert offset < Integer.MAX_VALUE;
     assert length < Integer.MAX_VALUE;
@@ -489,12 +508,24 @@ public class RowResult {
     checkType(columnIndex, Type.BINARY);
     // C++ puts a Slice in rowData which is 16 bytes long for simplicity,
     // but we only support ints.
-    long offset = getLong(columnIndex);
+    long offset = getLongOrOffset(columnIndex);
     long length = rowData.getLong(getCurrentRowDataOffsetForColumn(columnIndex) + 8);
     assert offset < Integer.MAX_VALUE;
     assert length < Integer.MAX_VALUE;
     return ByteBuffer.wrap(indirectData.getRawArray(), indirectData.getRawOffset() + (int) offset,
         (int) length);
+  }
+
+  /**
+   * Returns the long column value if the column type is INT64 or UNIXTIME_MICROS.
+   * Returns the column's offset into the indirectData if the column type is BINARY or STRING.
+   * @param columnIndex Column index in the schema
+   * @return a long value for the column
+   */
+  long getLongOrOffset(int columnIndex) {
+    return Bytes.getLong(this.rowData.getRawArray(),
+        this.rowData.getRawOffset() +
+            getCurrentRowDataOffsetForColumn(columnIndex));
   }
 
   /**
@@ -522,6 +553,100 @@ public class RowResult {
     }
     return schema.getColumnByIndex(columnIndex).isNullable() &&
         nullsBitSet.get(columnIndex);
+  }
+
+  /**
+   * Get the specified column's value as an Object.
+   *
+   * This method is useful when you don't care about autoboxing
+   * and your existing type handling logic is based on Java types.
+   *
+   * The Object type is based on the column's {@link Type}:
+   *  Type.BOOL -> java.lang.Boolean
+   *  Type.INT8 -> java.lang.Byte
+   *  Type.INT16 -> java.lang.Short
+   *  Type.INT32 -> java.lang.Integer
+   *  Type.INT64 -> java.lang.Long
+   *  Type.UNIXTIME_MICROS -> java.sql.Timestamp
+   *  Type.FLOAT -> java.lang.Float
+   *  Type.DOUBLE -> java.lang.Double
+   *  Type.VARCHAR -> java.lang.String
+   *  Type.STRING -> java.lang.String
+   *  Type.BINARY -> byte[]
+   *  Type.DECIMAL -> java.math.BigDecimal
+   *
+   * @param columnName name of the column in the schema
+   * @return the column's value as an Object, null if the value is null
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public Object getObject(String columnName) {
+    return getObject(this.schema.getColumnIndex(columnName));
+  }
+
+  /**
+   * Get the specified column's value as an Object.
+   *
+   * This method is useful when you don't care about autoboxing
+   * and your existing type handling logic is based on Java types.
+   *
+   * The Object type is based on the column's {@link Type}:
+   *  Type.BOOL -> java.lang.Boolean
+   *  Type.INT8 -> java.lang.Byte
+   *  Type.INT16 -> java.lang.Short
+   *  Type.INT32 -> java.lang.Integer
+   *  Type.INT64 -> java.lang.Long
+   *  Type.UNIXTIME_MICROS -> java.sql.Timestamp
+   *  Type.FLOAT -> java.lang.Float
+   *  Type.DOUBLE -> java.lang.Double
+   *  Type.VARCHAR -> java.lang.String
+   *  Type.STRING -> java.lang.String
+   *  Type.BINARY -> byte[]
+   *  Type.DECIMAL -> java.math.BigDecimal
+   *
+   * @param columnIndex Column index in the schema
+   * @return the column's value as an Object, null if the value is null
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public Object getObject(int columnIndex) {
+    checkValidColumn(columnIndex);
+    if (isNull(columnIndex)) {
+      return null;
+    }
+    Type type = schema.getColumnByIndex(columnIndex).getType();
+    switch (type) {
+      case BOOL: return getBoolean(columnIndex);
+      case INT8: return getByte(columnIndex);
+      case INT16: return getShort(columnIndex);
+      case INT32: return getInt(columnIndex);
+      case INT64: return getLong(columnIndex);
+      case UNIXTIME_MICROS: return getTimestamp(columnIndex);
+      case FLOAT: return getFloat(columnIndex);
+      case DOUBLE: return getDouble(columnIndex);
+      case VARCHAR: return getVarchar(columnIndex);
+      case STRING: return getString(columnIndex);
+      case BINARY: return getBinaryCopy(columnIndex);
+      case DECIMAL: return getDecimal(columnIndex);
+      default: throw new UnsupportedOperationException("Unsupported type: " + type);
+    }
+  }
+
+  /**
+   * @return true if the RowResult has the IS_DELETED virtual column
+   */
+  @InterfaceAudience.Private
+  @InterfaceStability.Unstable
+  public boolean hasIsDeleted() {
+    return schema.hasIsDeleted();
+  }
+
+  /**
+   * @return the value of the IS_DELETED virtual column
+   * @throws IllegalStateException if no IS_DELETED virtual column exists
+   */
+  @InterfaceAudience.Private
+  @InterfaceStability.Unstable
+  public boolean isDeleted() {
+    return getBoolean(schema.getIsDeletedIndex());
   }
 
   /**
@@ -575,14 +700,17 @@ public class RowResult {
     }
   }
 
-  private void checkType(int columnIndex, Type expectedType) {
+  private void checkType(int columnIndex, Type... types) {
     ColumnSchema columnSchema = schema.getColumnByIndex(columnIndex);
     Type columnType = columnSchema.getType();
-    if (!columnType.equals(expectedType)) {
-      throw new IllegalArgumentException("Column (name: " + columnSchema.getName() +
-          ", index: " + columnIndex + ") is of type " +
-          columnType.getName() + " but was requested as a type " + expectedType.getName());
+    for (Type type : types) {
+      if (columnType.equals(type)) {
+        return;
+      }
     }
+    throw new IllegalArgumentException("Column (name: " + columnSchema.getName() +
+        ", index: " + columnIndex + ") is of type " +
+        columnType.getName() + " but was requested as a type " + Arrays.toString(types));
   }
 
   @Override
@@ -625,8 +753,11 @@ public class RowResult {
             buf.append(getLong(i));
             break;
           case UNIXTIME_MICROS: {
-            buf.append(TimestampUtil.timestampToString(getLong(i)));
+            buf.append(TimestampUtil.timestampToString(getTimestamp(i)));
           } break;
+          case VARCHAR:
+            buf.append(getVarchar(i));
+            break;
           case STRING:
             buf.append(getString(i));
             break;

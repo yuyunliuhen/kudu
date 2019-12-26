@@ -18,6 +18,7 @@
 #include "kudu/common/partial_row.h"
 
 #include <cstring>
+#include <ostream>
 #include <string>
 #include <utility>
 
@@ -29,25 +30,28 @@
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
 #include "kudu/gutil/port.h"
-#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/bitmap.h"
+#include "kudu/util/char_util.h"
 #include "kudu/util/decimal_util.h"
 #include "kudu/util/int128.h"
 #include "kudu/util/logging.h"
+#ifndef NDEBUG
 #include "kudu/util/memory/overwrite.h"
+#endif
 #include "kudu/util/status.h"
 
 using std::string;
 using strings::Substitute;
 
 namespace kudu {
+
 namespace {
-inline Status FindColumn(const Schema& schema, const Slice& col_name, int* idx) {
-  StringPiece sp(reinterpret_cast<const char*>(col_name.data()), col_name.size());
-  *idx = schema.find_column(sp);
-  if (PREDICT_FALSE(*idx == -1)) {
-    return Status::NotFound("No such column", col_name);
+Status CheckDateValueInRange(int col_idx, int32_t val, const Schema& schema) {
+  if (PREDICT_FALSE(!DataTypeTraits<DATE>::IsValidValue(val))) {
+    const ColumnSchema& col = schema.column(col_idx);
+    return Status::InvalidArgument(
+        Substitute("value $0 out of range for date column '$1'", val, col.name()));
   }
   return Status::OK();
 }
@@ -118,7 +122,7 @@ Status KuduPartialRow::Set(const Slice& col_name,
                            const typename T::cpp_type& val,
                            bool owned) {
   int col_idx;
-  RETURN_NOT_OK(FindColumn(*schema_, col_name, &col_idx));
+  RETURN_NOT_OK(schema_->FindColumn(col_name, &col_idx));
   return Set<T>(col_idx, val, owned);
 }
 
@@ -162,63 +166,71 @@ Status KuduPartialRow::Set(int32_t column_idx, const uint8_t* val) {
     case BOOL: {
       RETURN_NOT_OK(SetBool(column_idx, *reinterpret_cast<const bool*>(val)));
       break;
-    };
+    }
     case INT8: {
       RETURN_NOT_OK(SetInt8(column_idx, *reinterpret_cast<const int8_t*>(val)));
       break;
-    };
+    }
     case INT16: {
       RETURN_NOT_OK(SetInt16(column_idx, *reinterpret_cast<const int16_t*>(val)));
       break;
-    };
+    }
     case INT32: {
       RETURN_NOT_OK(SetInt32(column_idx, *reinterpret_cast<const int32_t*>(val)));
       break;
-    };
+    }
     case INT64: {
       RETURN_NOT_OK(SetInt64(column_idx, *reinterpret_cast<const int64_t*>(val)));
       break;
-    };
+    }
     case FLOAT: {
       RETURN_NOT_OK(SetFloat(column_idx, *reinterpret_cast<const float*>(val)));
       break;
-    };
+    }
     case DOUBLE: {
       RETURN_NOT_OK(SetDouble(column_idx, *reinterpret_cast<const double*>(val)));
       break;
-    };
+    }
     case STRING: {
       // TODO(todd) Is reinterpret_cast unsafe here?
       RETURN_NOT_OK(SetStringCopy(column_idx, *reinterpret_cast<const Slice*>(val)));
       break;
-    };
+    }
     case BINARY: {
       // TODO(todd) Is reinterpret_cast unsafe here?
       RETURN_NOT_OK(SetBinaryCopy(column_idx, *reinterpret_cast<const Slice*>(val)));
       break;
-    };
+    }
+    case VARCHAR: {
+      RETURN_NOT_OK(SetVarchar(column_idx, *reinterpret_cast<const Slice*>(val)));
+      break;
+    }
     case UNIXTIME_MICROS: {
       RETURN_NOT_OK(SetUnixTimeMicros(column_idx, *reinterpret_cast<const int64_t*>(val)));
       break;
-    };
+    }
+    case DATE: {
+      RETURN_NOT_OK(SetDate(column_idx, *reinterpret_cast<const int32_t*>(val)));
+      break;
+    }
     case DECIMAL32: {
       RETURN_NOT_OK(Set<TypeTraits<DECIMAL32> >(column_idx,
                                                 *reinterpret_cast<const int32_t*>(val)));
       break;
-    };
+    }
     case DECIMAL64: {
       RETURN_NOT_OK(Set<TypeTraits<DECIMAL64> >(column_idx,
                                                 *reinterpret_cast<const int64_t*>(val)));
       break;
-    };
+    }
     case DECIMAL128: {
       RETURN_NOT_OK(Set<TypeTraits<DECIMAL128>>(column_idx, UnalignedLoad<int128_t>(val)));
       break;
-    };
+    }
     default: {
       return Status::InvalidArgument("Unknown column type in schema",
                                      column_schema.ToString());
-    };
+    }
   }
   return Status::OK();
 }
@@ -227,11 +239,19 @@ void KuduPartialRow::DeallocateStringIfSet(int col_idx, const ColumnSchema& col)
   if (BitmapTest(owned_strings_bitmap_, col_idx)) {
     ContiguousRow row(schema_, row_data_);
     const Slice* dst;
-    if (col.type_info()->type() == BINARY) {
-      dst = schema_->ExtractColumnFromRow<BINARY>(row, col_idx);
-    } else {
-      CHECK(col.type_info()->type() == STRING);
-      dst = schema_->ExtractColumnFromRow<STRING>(row, col_idx);
+    switch (col.type_info()->type()) {
+      case BINARY:
+        dst = schema_->ExtractColumnFromRow<BINARY>(row, col_idx);
+        break;
+      case VARCHAR:
+        dst = schema_->ExtractColumnFromRow<VARCHAR>(row, col_idx);
+        break;
+      case STRING:
+        dst = schema_->ExtractColumnFromRow<STRING>(row, col_idx);
+        break;
+      default:
+        LOG(FATAL) << "Unexpected type " << col.type_info()->type();
+        break;
     }
     delete [] dst->data();
     BitmapClear(owned_strings_bitmap_, col_idx);
@@ -263,8 +283,11 @@ Status KuduPartialRow::SetInt32(const Slice& col_name, int32_t val) {
 Status KuduPartialRow::SetInt64(const Slice& col_name, int64_t val) {
   return Set<TypeTraits<INT64> >(col_name, val);
 }
-Status KuduPartialRow::SetUnixTimeMicros(const Slice& col_name, int64_t val) {
-  return Set<TypeTraits<UNIXTIME_MICROS> >(col_name, val);
+Status KuduPartialRow::SetUnixTimeMicros(const Slice& col_name, int64_t micros_since_utc_epoch) {
+  return Set<TypeTraits<UNIXTIME_MICROS> >(col_name, micros_since_utc_epoch);
+}
+Status KuduPartialRow::SetDate(const Slice& col_name, int32_t days_since_unix_epoch) {
+  return Set<TypeTraits<DATE> >(col_name, days_since_unix_epoch);
 }
 Status KuduPartialRow::SetFloat(const Slice& col_name, float val) {
   return Set<TypeTraits<FLOAT> >(col_name, val);
@@ -274,7 +297,7 @@ Status KuduPartialRow::SetDouble(const Slice& col_name, double val) {
 }
 Status KuduPartialRow::SetUnscaledDecimal(const Slice& col_name, int128_t val) {
   int col_idx;
-  RETURN_NOT_OK(FindColumn(*schema_, col_name, &col_idx));
+  RETURN_NOT_OK(schema_->FindColumn(col_name, &col_idx));
   return SetUnscaledDecimal(col_idx, val);
 }
 Status KuduPartialRow::SetBool(int col_idx, bool val) {
@@ -292,8 +315,12 @@ Status KuduPartialRow::SetInt32(int col_idx, int32_t val) {
 Status KuduPartialRow::SetInt64(int col_idx, int64_t val) {
   return Set<TypeTraits<INT64> >(col_idx, val);
 }
-Status KuduPartialRow::SetUnixTimeMicros(int col_idx, int64_t val) {
-  return Set<TypeTraits<UNIXTIME_MICROS> >(col_idx, val);
+Status KuduPartialRow::SetUnixTimeMicros(int col_idx, int64_t micros_since_utc_epoch) {
+  return Set<TypeTraits<UNIXTIME_MICROS> >(col_idx, micros_since_utc_epoch);
+}
+Status KuduPartialRow::SetDate(int col_idx, int32_t days_since_unix_epoch) {
+  RETURN_NOT_OK(CheckDateValueInRange(col_idx, days_since_unix_epoch, *schema_));
+  return Set<TypeTraits<DATE> >(col_idx, days_since_unix_epoch);
 }
 Status KuduPartialRow::SetFloat(int col_idx, float val) {
   return Set<TypeTraits<FLOAT> >(col_idx, val);
@@ -301,10 +328,8 @@ Status KuduPartialRow::SetFloat(int col_idx, float val) {
 Status KuduPartialRow::SetDouble(int col_idx, double val) {
   return Set<TypeTraits<DOUBLE> >(col_idx, val);
 }
-Status KuduPartialRow::SetUnscaledDecimal(int col_idx, int128_t val) {
-  const ColumnSchema& col = schema_->column(col_idx);
-  const DataType col_type = col.type_info()->type();
 
+Status CheckDecimalValueInRange(ColumnSchema col, int128_t val) {
   int128_t max_val = MaxUnscaledDecimal(col.type_attributes().precision);
   int128_t min_val = -max_val;
   if (val < min_val || val > max_val) {
@@ -312,16 +337,25 @@ Status KuduPartialRow::SetUnscaledDecimal(int col_idx, int128_t val) {
         Substitute("value $0 out of range for decimal column '$1'",
                    DecimalToString(val, col.type_attributes().scale), col.name()));
   }
+  return Status::OK();
+}
+
+Status KuduPartialRow::SetUnscaledDecimal(int col_idx, int128_t val) {
+  const ColumnSchema& col = schema_->column(col_idx);
+  const DataType col_type = col.type_info()->type();
   switch (col_type) {
     case DECIMAL32:
+      RETURN_NOT_OK(CheckDecimalValueInRange(col, val));
       return Set<TypeTraits<DECIMAL32> >(col_idx, static_cast<int32_t>(val));
     case DECIMAL64:
+      RETURN_NOT_OK(CheckDecimalValueInRange(col, val));
       return Set<TypeTraits<DECIMAL64> >(col_idx, static_cast<int64_t>(val));
     case DECIMAL128:
+      RETURN_NOT_OK(CheckDecimalValueInRange(col, val));
       return Set<TypeTraits<DECIMAL128> >(col_idx, static_cast<int128_t>(val));
     default:
       return Status::InvalidArgument(
-          Substitute("invalid type $0 provided for column '$1' (expected DECIMAL)",
+          Substitute("invalid type $0 provided for column '$1' (expected decimal)",
                      col.type_info()->name(), col.name()));
   }
 }
@@ -332,11 +366,20 @@ Status KuduPartialRow::SetBinary(const Slice& col_name, const Slice& val) {
 Status KuduPartialRow::SetString(const Slice& col_name, const Slice& val) {
   return SetStringCopy(col_name, val);
 }
+Status KuduPartialRow::SetVarchar(const Slice& col_name, const Slice& val) {
+  int col_idx;
+  RETURN_NOT_OK(schema_->FindColumn(col_name, &col_idx));
+  return SetVarchar(col_idx, val);
+}
+
 Status KuduPartialRow::SetBinary(int col_idx, const Slice& val) {
   return SetBinaryCopy(col_idx, val);
 }
 Status KuduPartialRow::SetString(int col_idx, const Slice& val) {
   return SetStringCopy(col_idx, val);
+}
+Status KuduPartialRow::SetVarchar(int col_idx, const Slice& val) {
+  return SetSliceCopy<TypeTraits<VARCHAR> >(col_idx, val);
 }
 
 Status KuduPartialRow::SetBinaryCopy(const Slice& col_name, const Slice& val) {
@@ -365,33 +408,54 @@ Status KuduPartialRow::SetStringNoCopy(int col_idx, const Slice& val) {
   return Set<TypeTraits<STRING> >(col_idx, val, false);
 }
 
+Status KuduPartialRow::SetVarcharNoCopyUnsafe(const Slice& col_name, const Slice& val) {
+  int col_idx;
+  RETURN_NOT_OK(schema_->FindColumn(col_name, &col_idx));
+  return SetVarcharNoCopyUnsafe(col_idx, val);
+}
+
+Status KuduPartialRow::SetVarcharNoCopyUnsafe(int col_idx, const Slice& val) {
+  auto col = schema_->column(col_idx);
+  if (val.size() > col.type_attributes().length * 4) {
+    return Status::InvalidArgument(
+        Substitute("Value too long, limit is $0 characters",
+                   col.type_attributes().length));
+  }
+  return Set<TypeTraits<VARCHAR> >(col_idx, val);
+}
+
 template<typename T>
 Status KuduPartialRow::SetSliceCopy(const Slice& col_name, const Slice& val) {
-  auto relocated = new uint8_t[val.size()];
-  memcpy(relocated, val.data(), val.size());
-  Slice relocated_val(relocated, val.size());
-  Status s = Set<T>(col_name, relocated_val, true);
-  if (!s.ok()) {
-    delete [] relocated;
-  }
-  return s;
+  int col_idx;
+  RETURN_NOT_OK(schema_->FindColumn(col_name, &col_idx));
+  return SetSliceCopy<T>(col_idx, val);
 }
 
 template<typename T>
 Status KuduPartialRow::SetSliceCopy(int col_idx, const Slice& val) {
-  auto relocated = new uint8_t[val.size()];
-  memcpy(relocated, val.data(), val.size());
-  Slice relocated_val(relocated, val.size());
+  auto col = schema_->column(col_idx);
+  Slice relocated_val;
+  switch (T::type) {
+    case VARCHAR:
+      relocated_val = UTF8Truncate(val, col.type_attributes().length);
+      break;
+    case STRING:
+    case BINARY:
+      auto relocated = new uint8_t[val.size()];
+      memcpy(relocated, val.data(), val.size());
+      relocated_val = Slice(relocated, val.size());
+      break;
+  }
   Status s = Set<T>(col_idx, relocated_val, true);
   if (!s.ok()) {
-    delete [] relocated;
+    delete [] relocated_val.data();
   }
   return s;
 }
 
 Status KuduPartialRow::SetNull(const Slice& col_name) {
   int col_idx;
-  RETURN_NOT_OK(FindColumn(*schema_, col_name, &col_idx));
+  RETURN_NOT_OK(schema_->FindColumn(col_name, &col_idx));
   return SetNull(col_idx);
 }
 
@@ -413,7 +477,7 @@ Status KuduPartialRow::SetNull(int col_idx) {
 
 Status KuduPartialRow::Unset(const Slice& col_name) {
   int col_idx;
-  RETURN_NOT_OK(FindColumn(*schema_, col_name, &col_idx));
+  RETURN_NOT_OK(schema_->FindColumn(col_name, &col_idx));
   return Unset(col_idx);
 }
 
@@ -472,6 +536,11 @@ Status KuduPartialRow::Set<TypeTraits<UNIXTIME_MICROS> >(
     int col_idx,
     const TypeTraits<UNIXTIME_MICROS>::cpp_type& val,
     bool owned);
+
+template
+Status KuduPartialRow::Set<TypeTraits<DATE> >(int col_idx,
+                                              const TypeTraits<DATE>::cpp_type& val,
+                                              bool owned);
 
 template
 Status KuduPartialRow::Set<TypeTraits<STRING> >(int col_idx,
@@ -546,6 +615,11 @@ Status KuduPartialRow::Set<TypeTraits<UNIXTIME_MICROS> >(
     bool owned);
 
 template
+Status KuduPartialRow::Set<TypeTraits<DATE> >(const Slice& col_name,
+                                              const TypeTraits<DATE>::cpp_type& val,
+                                              bool owned);
+
+template
 Status KuduPartialRow::Set<TypeTraits<FLOAT> >(const Slice& col_name,
                                                const TypeTraits<FLOAT>::cpp_type& val,
                                                bool owned);
@@ -596,7 +670,7 @@ bool KuduPartialRow::IsColumnSet(int col_idx) const {
 
 bool KuduPartialRow::IsColumnSet(const Slice& col_name) const {
   int col_idx;
-  CHECK_OK(FindColumn(*schema_, col_name, &col_idx));
+  CHECK_OK(schema_->FindColumn(col_name, &col_idx));
   return IsColumnSet(col_idx);
 }
 
@@ -614,7 +688,7 @@ bool KuduPartialRow::IsNull(int col_idx) const {
 
 bool KuduPartialRow::IsNull(const Slice& col_name) const {
   int col_idx;
-  CHECK_OK(FindColumn(*schema_, col_name, &col_idx));
+  CHECK_OK(schema_->FindColumn(col_name, &col_idx));
   return IsNull(col_idx);
 }
 
@@ -637,6 +711,10 @@ Status KuduPartialRow::GetUnixTimeMicros(const Slice& col_name,
                                          int64_t* micros_since_utc_epoch) const {
   return Get<TypeTraits<UNIXTIME_MICROS> >(col_name, micros_since_utc_epoch);
 }
+Status KuduPartialRow::GetDate(const Slice& col_name,
+                               int32_t* days_since_unix_epoch) const {
+  return Get<TypeTraits<DATE> >(col_name, days_since_unix_epoch);
+}
 Status KuduPartialRow::GetFloat(const Slice& col_name, float* val) const {
   return Get<TypeTraits<FLOAT> >(col_name, val);
 }
@@ -644,8 +722,12 @@ Status KuduPartialRow::GetDouble(const Slice& col_name, double* val) const {
   return Get<TypeTraits<DOUBLE> >(col_name, val);
 }
 Status KuduPartialRow::GetUnscaledDecimal(const Slice &col_name, int128_t *val) {
+  // Call the const version of the function.
+  return const_cast<const KuduPartialRow*>(this)->GetUnscaledDecimal(col_name, val);
+}
+Status KuduPartialRow::GetUnscaledDecimal(const Slice &col_name, int128_t *val) const {
   int col_idx;
-  RETURN_NOT_OK(FindColumn(*schema_, col_name, &col_idx));
+  RETURN_NOT_OK(schema_->FindColumn(col_name, &col_idx));
   return GetUnscaledDecimal(col_idx, val);
 }
 Status KuduPartialRow::GetString(const Slice& col_name, Slice* val) const {
@@ -653,6 +735,11 @@ Status KuduPartialRow::GetString(const Slice& col_name, Slice* val) const {
 }
 Status KuduPartialRow::GetBinary(const Slice& col_name, Slice* val) const {
   return Get<TypeTraits<BINARY> >(col_name, val);
+}
+Status KuduPartialRow::GetVarchar(const Slice& col_name, Slice* val) const {
+  int col_idx;
+  RETURN_NOT_OK(schema_->FindColumn(col_name, &col_idx));
+  return GetVarchar(col_idx, val);
 }
 
 Status KuduPartialRow::GetBool(int col_idx, bool* val) const {
@@ -673,6 +760,9 @@ Status KuduPartialRow::GetInt64(int col_idx, int64_t* val) const {
 Status KuduPartialRow::GetUnixTimeMicros(int col_idx, int64_t* micros_since_utc_epoch) const {
   return Get<TypeTraits<UNIXTIME_MICROS> >(col_idx, micros_since_utc_epoch);
 }
+Status KuduPartialRow::GetDate(int col_idx, int32_t* days_since_unix_epoch) const {
+  return Get<TypeTraits<DATE> >(col_idx, days_since_unix_epoch);
+}
 Status KuduPartialRow::GetFloat(int col_idx, float* val) const {
   return Get<TypeTraits<FLOAT> >(col_idx, val);
 }
@@ -680,6 +770,10 @@ Status KuduPartialRow::GetDouble(int col_idx, double* val) const {
   return Get<TypeTraits<DOUBLE> >(col_idx, val);
 }
 Status KuduPartialRow::GetUnscaledDecimal(int col_idx, int128_t *val) {
+  // Call the const version of the function.
+  return const_cast<const KuduPartialRow*>(this)->GetUnscaledDecimal(col_idx, val);
+}
+Status KuduPartialRow::GetUnscaledDecimal(int col_idx, int128_t *val) const {
   const ColumnSchema& col = schema_->column(col_idx);
   const DataType col_type = col.type_info()->type();
   switch (col_type) {
@@ -700,7 +794,7 @@ Status KuduPartialRow::GetUnscaledDecimal(int col_idx, int128_t *val) {
       return Status::OK();
     default:
       return Status::InvalidArgument(
-          Substitute("invalid type $0 provided for column '$1' (expected DECIMAL)",
+          Substitute("invalid type $0 provided for column '$1' (expected decimal)",
                      col.type_info()->name(), col.name()));
   }
 }
@@ -710,12 +804,15 @@ Status KuduPartialRow::GetString(int col_idx, Slice* val) const {
 Status KuduPartialRow::GetBinary(int col_idx, Slice* val) const {
   return Get<TypeTraits<BINARY> >(col_idx, val);
 }
+Status KuduPartialRow::GetVarchar(int col_idx, Slice* val) const {
+  return Get<TypeTraits<VARCHAR> >(col_idx, val);
+}
 
 template<typename T>
 Status KuduPartialRow::Get(const Slice& col_name,
                            typename T::cpp_type* val) const {
   int col_idx;
-  RETURN_NOT_OK(FindColumn(*schema_, col_name, &col_idx));
+  RETURN_NOT_OK(schema_->FindColumn(col_name, &col_idx));
   return Get<T>(col_idx, val);
 }
 
@@ -780,11 +877,11 @@ string KuduPartialRow::ToEncodedRowKeyOrDie() const {
 //------------------------------------------------------------
 
 bool KuduPartialRow::AllColumnsSet() const {
-  return BitMapIsAllSet(isset_bitmap_, 0, schema_->num_columns());
+  return BitmapIsAllSet(isset_bitmap_, 0, schema_->num_columns());
 }
 
 bool KuduPartialRow::IsKeySet() const {
-  return BitMapIsAllSet(isset_bitmap_, 0, schema_->num_key_columns());
+  return BitmapIsAllSet(isset_bitmap_, 0, schema_->num_key_columns());
 }
 
 

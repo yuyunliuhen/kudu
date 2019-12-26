@@ -45,6 +45,7 @@
 #include "kudu/util/mutex.h"
 #include "kudu/util/oid_generator.h"
 #include "kudu/util/rw_mutex.h"
+#include "kudu/util/stopwatch.h"
 
 namespace kudu {
 
@@ -201,7 +202,7 @@ class Scanner {
 
   // Attach an actual iterator and a ScanSpec to this Scanner.
   // Takes ownership of 'iter' and 'spec'.
-  void Init(gscoped_ptr<RowwiseIterator> iter,
+  void Init(std::unique_ptr<RowwiseIterator> iter,
             gscoped_ptr<ScanSpec> spec);
 
   // Return true if the scanner has been initialized (i.e has an iterator).
@@ -224,6 +225,9 @@ class Scanner {
   // delaying the expiration of the Scanner for another TTL
   // period.
   void UpdateAccessTime();
+
+  // Add the timings in 'elapsed' to the total timings for this scanner.
+  void AddTimings(const CpuTimes& elapsed);
 
   // Return the auto-release pool which will be freed when this scanner
   // closes. This can be used as a storage area for the ScanSpec and any
@@ -321,6 +325,8 @@ class Scanner {
 
   ScanDescriptor descriptor() const;
 
+  CpuTimes cpu_times() const;
+
  private:
   friend class ScannerManager;
 
@@ -364,7 +370,7 @@ class Scanner {
   // schema used by the iterator.
   gscoped_ptr<Schema> client_projection_schema_;
 
-  gscoped_ptr<RowwiseIterator> iter_;
+  std::unique_ptr<RowwiseIterator> iter_;
 
   AutoReleasePool autorelease_pool_;
 
@@ -379,6 +385,10 @@ class Scanner {
   // The number of rows that have been serialized and sent over the wire by
   // this scanner.
   int64_t num_rows_returned_;
+
+  // The cumulative amounts of wall, user cpu, and system cpu time spent on
+  // this scanner, in seconds.
+  CpuTimes cpu_times_;
 
   DISALLOW_COPY_AND_ASSIGN(Scanner);
 };
@@ -420,6 +430,46 @@ struct ScanDescriptor {
   MonoTime start_time;
   MonoTime last_access_time;
   uint32_t last_call_seq_id;
+
+  // The cumulative amounts of wall, user cpu, and system cpu time spent on
+  // this scanner, in seconds.
+  CpuTimes cpu_times;
+};
+
+// RAII wrapper to update a scanner with timing information upon scope exit.
+class ScopedAddScannerTiming {
+ public:
+  // 'scanner' must outlive the scoped object.
+  // object pointed to by 'cpu_times' will contain the cpu timing information of the scanner upon
+  // scope exit
+  explicit ScopedAddScannerTiming(Scanner* scanner, CpuTimes* cpu_times)
+      : stopped_(false),
+        scanner_(scanner),
+        cpu_times_(cpu_times) {
+    sw_.start();
+  }
+
+  ~ScopedAddScannerTiming() {
+    if (!stopped_) {
+      Stop();
+    }
+  }
+
+  // Stop the timing and update the scanner.
+  void Stop() {
+    stopped_ = true;
+    sw_.stop();
+    scanner_->AddTimings(sw_.elapsed());
+    scanner_->UpdateAccessTime();
+    *cpu_times_ = scanner_->cpu_times();
+  }
+
+  bool stopped_;
+  Scanner* scanner_;
+  CpuTimes* cpu_times_;
+  Stopwatch sw_;
+
+  DISALLOW_COPY_AND_ASSIGN(ScopedAddScannerTiming);
 };
 
 } // namespace tserver

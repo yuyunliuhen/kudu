@@ -142,7 +142,7 @@ void MvccManager::CommitTransaction(Timestamp timestamp) {
   if (was_earliest && safe_time_ >= timestamp) {
     // If this transaction was the earliest in-flight, we might have to adjust
     // the "clean" timestamp.
-    AdjustCleanTime();
+    AdjustCleanTimeUnlocked();
   }
 }
 
@@ -206,7 +206,7 @@ void MvccManager::AdjustSafeTime(Timestamp safe_time) {
     return;
   }
 
-  AdjustCleanTime();
+  AdjustCleanTimeUnlocked();
 }
 
 // Remove any elements from 'v' which are < the given watermark.
@@ -226,12 +226,15 @@ void MvccManager::Close() {
   std::lock_guard<LockType> l(lock_);
   auto iter = waiters_.begin();
   while (iter != waiters_.end()) {
-    (*iter)->latch->CountDown();
+    auto* waiter = *iter;
     iter = waiters_.erase(iter);
+    waiter->latch->CountDown();
   }
 }
 
-void MvccManager::AdjustCleanTime() {
+void MvccManager::AdjustCleanTimeUnlocked() {
+  DCHECK(lock_.is_locked());
+
   // There are two possibilities:
   //
   // 1) We still have an in-flight transaction earlier than 'safe_time_'.
@@ -269,7 +272,7 @@ void MvccManager::AdjustCleanTime() {
   if (PREDICT_FALSE(!waiters_.empty())) {
     auto iter = waiters_.begin();
     while (iter != waiters_.end()) {
-      WaitingState* waiter = *iter;
+      auto* waiter = *iter;
       if (IsDoneWaitingUnlocked(*waiter)) {
         iter = waiters_.erase(iter);
         waiter->latch->CountDown();
@@ -283,7 +286,7 @@ void MvccManager::AdjustCleanTime() {
 Status MvccManager::WaitUntil(WaitFor wait_for, Timestamp ts, const MonoTime& deadline) const {
   TRACE_EVENT2("tablet", "MvccManager::WaitUntil",
                "wait_for", wait_for == ALL_COMMITTED ? "all_committed" : "none_applying",
-               "ts", ts.ToUint64())
+               "ts", ts.ToUint64());
 
   // If MVCC is closed, there's no point in waiting.
   RETURN_NOT_OK(CheckOpen());
@@ -305,8 +308,8 @@ Status MvccManager::WaitUntil(WaitFor wait_for, Timestamp ts, const MonoTime& de
   // We timed out. We need to clean up our entry in the waiters_ array.
 
   std::lock_guard<LockType> l(lock_);
-  // It's possible that while we were re-acquiring the lock, we did not get
-  // notified. In that case, we have no cleanup to do.
+  // It's possible that we got notified while we were re-acquiring the lock. In
+  // that case, we have no cleanup to do.
   if (waiting_state.latch->count() == 0) {
     return CheckOpen();
   }

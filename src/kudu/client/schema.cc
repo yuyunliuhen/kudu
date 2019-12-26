@@ -24,6 +24,7 @@
 #include <utility>
 
 #include <boost/optional/optional.hpp>
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/client/schema-internal.h"
@@ -38,9 +39,15 @@
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/util/decimal_util.h"
+#include "kudu/util/char_util.h"
 #include "kudu/util/compression/compression.pb.h"
+#include "kudu/util/decimal_util.h"
 #include "kudu/util/slice.h"
+#include "kudu/util/string_case.h"
+
+DEFINE_bool(show_attributes, false,
+            "Whether to show column attributes, including column encoding type, "
+            "compression type, and default read/write value.");
 
 MAKE_ENUM_LIMITS(kudu::client::KuduColumnStorageAttributes::EncodingType,
                  kudu::client::KuduColumnStorageAttributes::AUTO_ENCODING,
@@ -119,8 +126,10 @@ kudu::DataType ToInternalDataType(KuduColumnSchema::DataType type,
     case KuduColumnSchema::INT32: return kudu::INT32;
     case KuduColumnSchema::INT64: return kudu::INT64;
     case KuduColumnSchema::UNIXTIME_MICROS: return kudu::UNIXTIME_MICROS;
+    case KuduColumnSchema::DATE: return kudu::DATE;
     case KuduColumnSchema::FLOAT: return kudu::FLOAT;
     case KuduColumnSchema::DOUBLE: return kudu::DOUBLE;
+    case KuduColumnSchema::VARCHAR: return kudu::VARCHAR;
     case KuduColumnSchema::STRING: return kudu::STRING;
     case KuduColumnSchema::BINARY: return kudu::BINARY;
     case KuduColumnSchema::BOOL: return kudu::BOOL;
@@ -145,8 +154,10 @@ KuduColumnSchema::DataType FromInternalDataType(kudu::DataType type) {
     case kudu::INT32: return KuduColumnSchema::INT32;
     case kudu::INT64: return KuduColumnSchema::INT64;
     case kudu::UNIXTIME_MICROS: return KuduColumnSchema::UNIXTIME_MICROS;
+    case kudu::DATE: return KuduColumnSchema::DATE;
     case kudu::FLOAT: return KuduColumnSchema::FLOAT;
     case kudu::DOUBLE: return KuduColumnSchema::DOUBLE;
+    case kudu::VARCHAR: return KuduColumnSchema::VARCHAR;
     case kudu::STRING: return KuduColumnSchema::STRING;
     case kudu::BINARY: return KuduColumnSchema::BINARY;
     case kudu::BOOL: return KuduColumnSchema::BOOL;
@@ -162,7 +173,7 @@ KuduColumnSchema::DataType FromInternalDataType(kudu::DataType type) {
 ////////////////////////////////////////////////////////////
 
 KuduColumnTypeAttributes::KuduColumnTypeAttributes()
-    : data_(new Data(0, 0)) {
+    : data_(new Data(0, 0, 0)) {
 }
 
 KuduColumnTypeAttributes::KuduColumnTypeAttributes(const KuduColumnTypeAttributes& other)
@@ -171,7 +182,15 @@ KuduColumnTypeAttributes::KuduColumnTypeAttributes(const KuduColumnTypeAttribute
 }
 
 KuduColumnTypeAttributes::KuduColumnTypeAttributes(int8_t precision, int8_t scale)
-    : data_(new Data(precision, scale)) {
+    : data_(new Data(precision, scale, 0)) {
+}
+
+KuduColumnTypeAttributes::KuduColumnTypeAttributes(uint16_t length)
+    : data_(new Data(0, 0, length)) {
+}
+
+KuduColumnTypeAttributes::KuduColumnTypeAttributes(int8_t precision, int8_t scale, uint16_t length)
+    : data_(new Data(precision, scale, length)) {
 }
 
 KuduColumnTypeAttributes::~KuduColumnTypeAttributes() {
@@ -199,12 +218,66 @@ int8_t KuduColumnTypeAttributes::scale() const {
   return data_->scale;
 }
 
+uint16_t KuduColumnTypeAttributes::length() const {
+  return data_->length;
+}
+
+Status KuduColumnStorageAttributes::StringToEncodingType(
+    const string& encoding,
+    KuduColumnStorageAttributes::EncodingType* type) {
+  Status s;
+  string encoding_uc;
+  ToUpperCase(encoding, &encoding_uc);
+  if (encoding_uc == "AUTO_ENCODING") {
+    *type = KuduColumnStorageAttributes::AUTO_ENCODING;
+  } else if (encoding_uc == "PLAIN_ENCODING") {
+    *type = KuduColumnStorageAttributes::PLAIN_ENCODING;
+  } else if (encoding_uc == "PREFIX_ENCODING") {
+    *type = KuduColumnStorageAttributes::PREFIX_ENCODING;
+  } else if (encoding_uc == "RLE") {
+    *type = KuduColumnStorageAttributes::RLE;
+  } else if (encoding_uc == "DICT_ENCODING") {
+    *type = KuduColumnStorageAttributes::DICT_ENCODING;
+  } else if (encoding_uc == "BIT_SHUFFLE") {
+    *type = KuduColumnStorageAttributes::BIT_SHUFFLE;
+  } else if (encoding_uc == "GROUP_VARINT") {
+    *type = KuduColumnStorageAttributes::GROUP_VARINT;
+  } else {
+    s = Status::InvalidArgument(Substitute(
+        "encoding type $0 is not supported", encoding));
+  }
+  return s;
+}
+
+Status KuduColumnStorageAttributes::StringToCompressionType(
+    const string& compression,
+    KuduColumnStorageAttributes::CompressionType* type) {
+  Status s;
+  string compression_uc;
+  ToUpperCase(compression, &compression_uc);
+  if (compression_uc == "DEFAULT_COMPRESSION") {
+    *type = KuduColumnStorageAttributes::DEFAULT_COMPRESSION;
+  } else if (compression_uc == "NO_COMPRESSION") {
+    *type = KuduColumnStorageAttributes::NO_COMPRESSION;
+  } else if (compression_uc == "SNAPPY") {
+    *type = KuduColumnStorageAttributes::SNAPPY;
+  } else if (compression_uc == "LZ4") {
+    *type = KuduColumnStorageAttributes::LZ4;
+  } else if (compression_uc == "ZLIB") {
+    *type = KuduColumnStorageAttributes::ZLIB;
+  } else {
+    s = Status::InvalidArgument(Substitute(
+        "compression type $0 is not supported", compression));
+  }
+  return s;
+}
+
 ////////////////////////////////////////////////////////////
 // KuduColumnSpec
 ////////////////////////////////////////////////////////////
 
-KuduColumnSpec::KuduColumnSpec(const std::string& name)
-  : data_(new Data(name)) {
+KuduColumnSpec::KuduColumnSpec(const string& col_name)
+  : data_(new Data(col_name)) {
 }
 
 KuduColumnSpec::~KuduColumnSpec() {
@@ -212,47 +285,48 @@ KuduColumnSpec::~KuduColumnSpec() {
 }
 
 KuduColumnSpec* KuduColumnSpec::Type(KuduColumnSchema::DataType type) {
-  data_->has_type = true;
   data_->type = type;
   return this;
 }
 
-KuduColumnSpec* KuduColumnSpec::Default(KuduValue* v) {
-  data_->has_default = true;
-  delete data_->default_val;
-  data_->default_val = v;
+KuduColumnSpec* KuduColumnSpec::Default(KuduValue* value) {
+  if (value == nullptr) return this;
+  if (data_->default_val) {
+    delete data_->default_val.value();
+  }
+  data_->default_val = value;
   return this;
 }
 
 KuduColumnSpec* KuduColumnSpec::Compression(
     KuduColumnStorageAttributes::CompressionType compression) {
-  data_->has_compression = true;
   data_->compression = compression;
   return this;
 }
 
 KuduColumnSpec* KuduColumnSpec::Encoding(
     KuduColumnStorageAttributes::EncodingType encoding) {
-  data_->has_encoding = true;
   data_->encoding = encoding;
   return this;
 }
 
 KuduColumnSpec* KuduColumnSpec::BlockSize(int32_t block_size) {
-  data_->has_block_size = true;
   data_->block_size = block_size;
   return this;
 }
 
 KuduColumnSpec* KuduColumnSpec::Precision(int8_t precision) {
-  data_->has_precision = true;
   data_->precision = precision;
   return this;
 }
 
 KuduColumnSpec* KuduColumnSpec::Scale(int8_t scale) {
-  data_->has_scale = true;
   data_->scale = scale;
+  return this;
+}
+
+KuduColumnSpec* KuduColumnSpec::Length(uint16_t length) {
+  data_->length = length;
   return this;
 }
 
@@ -262,13 +336,11 @@ KuduColumnSpec* KuduColumnSpec::PrimaryKey() {
 }
 
 KuduColumnSpec* KuduColumnSpec::NotNull() {
-  data_->has_nullable = true;
   data_->nullable = false;
   return this;
 }
 
 KuduColumnSpec* KuduColumnSpec::Nullable() {
-  data_->has_nullable = true;
   data_->nullable = true;
   return this;
 }
@@ -278,16 +350,20 @@ KuduColumnSpec* KuduColumnSpec::RemoveDefault() {
   return this;
 }
 
-KuduColumnSpec* KuduColumnSpec::RenameTo(const std::string& new_name) {
-  data_->has_rename_to = true;
+KuduColumnSpec* KuduColumnSpec::RenameTo(const string& new_name) {
   data_->rename_to = new_name;
+  return this;
+}
+
+KuduColumnSpec* KuduColumnSpec::Comment(const string& comment) {
+  data_->comment = comment;
   return this;
 }
 
 Status KuduColumnSpec::ToColumnSchema(KuduColumnSchema* col) const {
   // Verify that the user isn't trying to use any methods that
   // don't make sense for CREATE.
-  if (data_->has_rename_to) {
+  if (data_->rename_to) {
     return Status::NotSupported("cannot rename a column during CreateTable",
                                 data_->name);
   }
@@ -296,134 +372,159 @@ Status KuduColumnSpec::ToColumnSchema(KuduColumnSchema* col) const {
                                 data_->name);
   }
 
-  if (!data_->has_type) {
+  if (!data_->type) {
     return Status::InvalidArgument("no type provided for column", data_->name);
   }
 
-  if (data_->type == KuduColumnSchema::DECIMAL) {
-    if (!data_->has_precision) {
-      return Status::InvalidArgument("no precision provided for decimal column", data_->name);
-    }
-    if (data_->precision < kMinDecimalPrecision ||
-        data_->precision > kMaxDecimalPrecision) {
-      return Status::InvalidArgument(
-          strings::Substitute("precision must be between $0 and $1",
-                              kMinDecimalPrecision,
-                              kMaxDecimalPrecision), data_->name);
-    }
-    if (data_->has_scale) {
-      if (data_->scale < kMinDecimalScale) {
-        return Status::InvalidArgument(
-            strings::Substitute("scale is less than the minimum value of $0",
-                                kMinDecimalScale), data_->name);
+  switch (data_->type.value()) {
+    case KuduColumnSchema::DECIMAL:
+      if (!data_->precision) {
+        return Status::InvalidArgument("no precision provided for decimal column", data_->name);
       }
-      if (data_->scale > data_->precision) {
+      if (data_->precision.value() < kMinDecimalPrecision ||
+          data_->precision.value() > kMaxDecimalPrecision) {
         return Status::InvalidArgument(
-            strings::Substitute("scale is greater than the precision value of",
-                                data_->precision), data_->name);
+            strings::Substitute("precision must be between $0 and $1",
+              kMinDecimalPrecision,
+              kMaxDecimalPrecision), data_->name);
       }
-    }
-  } else {
-    if (data_->has_precision) {
-      return Status::InvalidArgument(
-          strings::Substitute("precision is not valid on a $0 column", data_->type), data_->name);
-    }
-    if (data_->has_scale) {
-      return Status::InvalidArgument(
-          strings::Substitute("scale is not valid on a $0 column", data_->type), data_->name);
-    }
+      if (data_->scale) {
+        if (data_->scale.value() < kMinDecimalScale) {
+          return Status::InvalidArgument(
+              strings::Substitute("scale is less than the minimum value of $0",
+                kMinDecimalScale), data_->name);
+        }
+        if (data_->scale.value() > data_->precision.value()) {
+          return Status::InvalidArgument(
+              strings::Substitute("scale is greater than the precision value of",
+                data_->precision.value()), data_->name);
+        }
+      }
+      if (data_->length) {
+        return Status::InvalidArgument(
+            strings::Substitute("length is not applicable for column $0",
+              data_->type.value()), data_->name);
+      }
+      break;
+    case KuduColumnSchema::VARCHAR:
+      if (!data_->length) {
+        return Status::InvalidArgument("no length provided for VARCHAR column", data_->name);
+      }
+      if (data_->length.value() < kMinVarcharLength ||
+          data_->length.value() > kMaxVarcharLength) {
+        return Status::InvalidArgument(
+            strings::Substitute("length must be between $0 and $1",
+                                kMinVarcharLength,
+                                kMaxVarcharLength), data_->name);
+      }
+      if (data_->precision) {
+        return Status::InvalidArgument(
+            strings::Substitute("precision is not valid on a $0 column",
+                                data_->type.value()), data_->name);
+      }
+      if (data_->scale) {
+        return Status::InvalidArgument(
+            strings::Substitute("scale is not valid on a $0 column",
+                                data_->type.value()), data_->name);
+      }
+      break;
+    default:
+      if (data_->precision) {
+        return Status::InvalidArgument(
+            strings::Substitute("precision is not valid on a $0 column",
+                                data_->type.value()), data_->name);
+      }
+      if (data_->scale) {
+        return Status::InvalidArgument(
+            strings::Substitute("scale is not valid on a $0 column",
+                                data_->type.value()), data_->name);
+      }
+      if (data_->length) {
+        return Status::InvalidArgument(
+            strings::Substitute("length is not valid on a $0 column",
+                                data_->type.value()), data_->name);
+      }
   }
 
-  int8_t precision = (data_->has_precision) ? data_->precision : 0;
-  int8_t scale = (data_->has_scale) ? data_->scale : kDefaultDecimalScale;
+  int8_t precision = data_->precision ? data_->precision.value() : 0;
+  int8_t scale = data_->scale ? data_->scale.value() : kDefaultDecimalScale;
+  uint16_t length = data_->length ? data_->length.value() : 0;
 
-  KuduColumnTypeAttributes type_attrs(precision, scale);
-  DataType internal_type = ToInternalDataType(data_->type, type_attrs);
-  bool nullable = data_->has_nullable ? data_->nullable : true;
+  KuduColumnTypeAttributes type_attrs(precision, scale, length);
+  DataType internal_type = ToInternalDataType(data_->type.value(), type_attrs);
+  bool nullable = data_->nullable ? data_->nullable.value() : true;
 
   void* default_val = nullptr;
-  // TODO: distinguish between DEFAULT NULL and no default?
-  if (data_->has_default) {
+  // TODO(unknown): distinguish between DEFAULT NULL and no default?
+  if (data_->default_val) {
     ColumnTypeAttributes internal_type_attrs(precision, scale);
-    RETURN_NOT_OK(data_->default_val->data_->CheckTypeAndGetPointer(
+    RETURN_NOT_OK(data_->default_val.value()->data_->CheckTypeAndGetPointer(
         data_->name, internal_type, internal_type_attrs,  &default_val));
   }
 
-  // Encoding and compression
-  KuduColumnStorageAttributes::EncodingType encoding =
-    KuduColumnStorageAttributes::AUTO_ENCODING;
-  if (data_->has_encoding) {
-    encoding = data_->encoding;
-  }
+  // Encoding and compression.
+  KuduColumnStorageAttributes::EncodingType encoding = data_->encoding ?
+      data_->encoding.value() : KuduColumnStorageAttributes::AUTO_ENCODING;
+  KuduColumnStorageAttributes::CompressionType compression = data_->compression ?
+      data_->compression.value() : KuduColumnStorageAttributes::DEFAULT_COMPRESSION;
 
-  KuduColumnStorageAttributes::CompressionType compression =
-    KuduColumnStorageAttributes::DEFAULT_COMPRESSION;
-  if (data_->has_compression) {
-    compression = data_->compression;
-  }
+  // BlockSize: '0' signifies server-side default.
+  int32_t block_size = data_->block_size ? data_->block_size.value() : 0;
 
-  int32_t block_size = 0; // '0' signifies server-side default
-  if (data_->has_block_size) {
-    block_size = data_->block_size;
-  }
-
-  *col = KuduColumnSchema(data_->name, data_->type, nullable,
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  *col = KuduColumnSchema(data_->name, data_->type.value(), nullable,
                           default_val,
                           KuduColumnStorageAttributes(encoding, compression, block_size),
-                          type_attrs);
+                          type_attrs,
+                          data_->comment ? data_->comment.value() : "");
+#pragma GCC diagnostic pop
 
   return Status::OK();
 }
 
 Status KuduColumnSpec::ToColumnSchemaDelta(ColumnSchemaDelta* col_delta) const {
-  if (data_->has_type) {
+  if (data_->type) {
     return Status::InvalidArgument("type provided for column schema delta", data_->name);
   }
-  if (data_->has_nullable) {
+  if (data_->nullable) {
     return Status::InvalidArgument("nullability provided for column schema delta", data_->name);
   }
   if (data_->primary_key) {
     return Status::InvalidArgument("primary key set for column schema delta", data_->name);
   }
 
-  if (data_->has_rename_to) {
-    col_delta->new_name = boost::optional<string>(std::move(data_->rename_to));
+  if (data_->remove_default && data_->default_val) {
+    return Status::InvalidArgument("new default set but default also removed", data_->name);
   }
 
-  if (data_->has_default) {
-    col_delta->default_value = boost::optional<Slice>(DefaultValueAsSlice());
+  if (data_->default_val) {
+    col_delta->default_value = DefaultValueAsSlice();
   }
 
   if (data_->remove_default) {
     col_delta->remove_default = true;
   }
 
-  if (col_delta->remove_default && col_delta->default_value) {
-    return Status::InvalidArgument("new default set but default also removed", data_->name);
+  if (data_->encoding) {
+    col_delta->encoding = ToInternalEncodingType(data_->encoding.value());
   }
 
-  if (data_->has_encoding) {
-    col_delta->encoding =
-        boost::optional<EncodingType>(ToInternalEncodingType(data_->encoding));
+  if (data_->compression) {
+    col_delta->compression = ToInternalCompressionType(data_->compression.value());
   }
 
-  if (data_->has_compression) {
-    col_delta->compression =
-        boost::optional<CompressionType>(ToInternalCompressionType(data_->compression));
-  }
-
-  if (data_->has_block_size) {
-    col_delta->cfile_block_size = boost::optional<int32_t>(data_->block_size);
-  }
-
+  col_delta->new_name = std::move(data_->rename_to);
+  col_delta->cfile_block_size = std::move(data_->block_size);
+  col_delta->new_comment = std::move(data_->comment);
   return Status::OK();
 }
 
 Slice KuduColumnSpec::DefaultValueAsSlice() const {
-  if (!data_->has_default) {
+  if (!data_->default_val) {
     return Slice();
   }
-  return data_->default_val->data_->GetSlice();
+  return data_->default_val.value()->data_->GetSlice();
 }
 
 ////////////////////////////////////////////////////////////
@@ -432,7 +533,7 @@ Slice KuduColumnSpec::DefaultValueAsSlice() const {
 
 class KuduSchemaBuilder::Data {
  public:
-  Data() : has_key_col_names(false) {
+  Data() {
   }
 
   ~Data() {
@@ -441,9 +542,7 @@ class KuduSchemaBuilder::Data {
     // headers declaring friend classes with nested classes.
   }
 
-  bool has_key_col_names;
-  vector<string> key_col_names;
-
+  boost::optional<vector<string>> key_col_names;
   vector<KuduColumnSpec*> specs;
 };
 
@@ -461,15 +560,14 @@ KuduSchemaBuilder::~KuduSchemaBuilder() {
   delete data_;
 }
 
-KuduColumnSpec* KuduSchemaBuilder::AddColumn(const std::string& name) {
+KuduColumnSpec* KuduSchemaBuilder::AddColumn(const string& name) {
   auto c = new KuduColumnSpec(name);
   data_->specs.push_back(c);
   return c;
 }
 
 KuduSchemaBuilder* KuduSchemaBuilder::SetPrimaryKey(
-    const std::vector<std::string>& key_col_names) {
-  data_->has_key_col_names = true;
+    const vector<string>& key_col_names) {
   data_->key_col_names = key_col_names;
   return this;
 }
@@ -483,7 +581,7 @@ Status KuduSchemaBuilder::Build(KuduSchema* schema) {
 
   int num_key_cols;
 
-  if (!data_->has_key_col_names) {
+  if (!data_->key_col_names) {
     // If they didn't explicitly pass the column names for key,
     // then they should have set it on exactly one column.
     int single_key_col_idx = -1;
@@ -527,7 +625,7 @@ Status KuduSchemaBuilder::Build(KuduSchema* schema) {
 
     // Convert the key column names to a set of indexes.
     vector<int> key_col_indexes;
-    for (const string& key_col_name : data_->key_col_names) {
+    for (const string& key_col_name : data_->key_col_names.value()) {
       int idx;
       if (!FindCopy(name_to_idx_map, key_col_name, &idx)) {
         return Status::InvalidArgument("primary key column not defined", key_col_name);
@@ -541,14 +639,17 @@ Status KuduSchemaBuilder::Build(KuduSchema* schema) {
     for (int i = 0; i < key_col_indexes.size(); i++) {
       if (key_col_indexes[i] != i) {
         return Status::InvalidArgument("primary key columns must be listed first in the schema",
-                                       data_->key_col_names[i]);
+                                       data_->key_col_names.value()[i]);
       }
     }
 
     num_key_cols = key_col_indexes.size();
   }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   RETURN_NOT_OK(schema->Reset(cols, num_key_cols));
+#pragma GCC diagnostic pop
 
   return Status::OK();
 }
@@ -558,7 +659,7 @@ Status KuduSchemaBuilder::Build(KuduSchema* schema) {
 // KuduColumnSchema
 ////////////////////////////////////////////////////////////
 
-std::string KuduColumnSchema::DataTypeToString(DataType type) {
+string KuduColumnSchema::DataTypeToString(DataType type) {
   switch (type) {
     case INT8:
       return "INT8";
@@ -580,18 +681,57 @@ std::string KuduColumnSchema::DataTypeToString(DataType type) {
       return "BINARY";
     case UNIXTIME_MICROS:
       return "UNIXTIME_MICROS";
+    case DATE:
+      return "DATE";
     case DECIMAL:
       return "DECIMAL";
+    case VARCHAR:
+      return "VARCHAR";
   }
   LOG(FATAL) << "Unhandled type " << type;
 }
 
-KuduColumnSchema::KuduColumnSchema(const std::string &name,
+ Status KuduColumnSchema::StringToDataType(
+      const string& type_str, KuduColumnSchema::DataType* type) {
+  Status s;
+  string type_uc;
+  ToUpperCase(type_str, &type_uc);
+  if (type_uc == "INT8") {
+    *type = INT8;
+  } else if (type_uc == "INT16") {
+    *type = INT16;
+  } else if (type_uc == "INT32") {
+    *type = INT32;
+  } else if (type_uc == "INT64") {
+    *type = INT64;
+  } else if (type_uc == "STRING") {
+    *type = STRING;
+  } else if (type_uc == "BOOL") {
+    *type = BOOL;
+  } else if (type_uc == "FLOAT") {
+    *type = FLOAT;
+  } else if (type_uc == "DOUBLE") {
+    *type = DOUBLE;
+  } else if (type_uc == "BINARY") {
+    *type = BINARY;
+  } else if (type_uc == "UNIXTIME_MICROS") {
+    *type = UNIXTIME_MICROS;
+  } else if (type_uc == "DECIMAL") {
+    *type = DECIMAL;
+  } else {
+    s = Status::InvalidArgument(Substitute(
+        "data type $0 is not supported", type_str));
+  }
+  return s;
+}
+
+KuduColumnSchema::KuduColumnSchema(const string &name,
                                    DataType type,
                                    bool is_nullable,
                                    const void* default_value,
                                    const KuduColumnStorageAttributes& storage_attributes,
-                                   const KuduColumnTypeAttributes& type_attributes) {
+                                   const KuduColumnTypeAttributes& type_attributes,
+                                   const string& comment) {
   ColumnStorageAttributes attr_private;
   attr_private.encoding = ToInternalEncodingType(storage_attributes.encoding());
   attr_private.compression = ToInternalCompressionType(
@@ -599,10 +739,11 @@ KuduColumnSchema::KuduColumnSchema(const std::string &name,
   ColumnTypeAttributes type_attr_private;
   type_attr_private.precision = type_attributes.precision();
   type_attr_private.scale = type_attributes.scale();
+  type_attr_private.length = type_attributes.length();
   col_ = new ColumnSchema(name, ToInternalDataType(type, type_attributes),
                           is_nullable,
                           default_value, default_value, attr_private,
-                          type_attr_private);
+                          type_attr_private, comment);
 }
 
 KuduColumnSchema::KuduColumnSchema(const KuduColumnSchema& other)
@@ -636,10 +777,10 @@ void KuduColumnSchema::CopyFrom(const KuduColumnSchema& other) {
 bool KuduColumnSchema::Equals(const KuduColumnSchema& other) const {
   return this == &other ||
     col_ == other.col_ ||
-    (col_ != nullptr && col_->Equals(*other.col_, true));
+    (col_ != nullptr && col_->Equals(*other.col_, ColumnSchema::COMPARE_ALL));
 }
 
-const std::string& KuduColumnSchema::name() const {
+const string& KuduColumnSchema::name() const {
   return DCHECK_NOTNULL(col_)->name();
 }
 
@@ -653,7 +794,12 @@ KuduColumnSchema::DataType KuduColumnSchema::type() const {
 
 KuduColumnTypeAttributes KuduColumnSchema::type_attributes() const {
   ColumnTypeAttributes type_attributes = DCHECK_NOTNULL(col_)->type_attributes();
-  return KuduColumnTypeAttributes(type_attributes.precision, type_attributes.scale);
+  return KuduColumnTypeAttributes(type_attributes.precision, type_attributes.scale,
+                                  type_attributes.length);
+}
+
+const string& KuduColumnSchema::comment() const {
+  return DCHECK_NOTNULL(col_)->comment();
 }
 
 ////////////////////////////////////////////////////////////
@@ -709,12 +855,25 @@ bool KuduSchema::Equals(const KuduSchema& other) const {
 
 KuduColumnSchema KuduSchema::Column(size_t idx) const {
   ColumnSchema col(schema_->column(idx));
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   KuduColumnStorageAttributes attrs(FromInternalEncodingType(col.attributes().encoding),
                                     FromInternalCompressionType(col.attributes().compression));
-  KuduColumnTypeAttributes type_attrs(col.type_attributes().precision, col.type_attributes().scale);
+#pragma GCC diagnostic pop
+  KuduColumnTypeAttributes type_attrs(col.type_attributes().precision, col.type_attributes().scale,
+                                      col.type_attributes().length);
   return KuduColumnSchema(col.name(), FromInternalDataType(col.type_info()->type()),
                           col.is_nullable(), col.read_default_value(),
-                          attrs, type_attrs);
+                          attrs, type_attrs, col.comment());
+}
+
+bool KuduSchema::HasColumn(const std::string& col_name, KuduColumnSchema* col_schema) const {
+  int idx = schema_->find_column(col_name);
+  if (idx == Schema::kColumnNotFound) {
+    return false;
+  }
+  *col_schema = Column(idx);
+  return true;
 }
 
 KuduPartialRow* KuduSchema::NewRow() const {
@@ -738,12 +897,14 @@ void KuduSchema::GetPrimaryKeyColumnIndexes(vector<int>* indexes) const {
 }
 
 string KuduSchema::ToString() const {
-  return schema_ ? schema_->ToString(Schema::ToStringMode::WITHOUT_COLUMN_IDS)
+  return schema_ ? schema_->ToString(FLAGS_show_attributes ?
+                                     Schema::ToStringMode::WITH_COLUMN_ATTRIBUTES
+                                     : Schema::ToStringMode::BASE_INFO)
                  : "()";
 }
 
 KuduSchema KuduSchema::FromSchema(const Schema& schema) {
-  return KuduSchema(schema);
+  return KuduSchema(schema.CopyWithoutColumnIds());
 }
 
 Schema KuduSchema::ToSchema(const KuduSchema& kudu_schema) {

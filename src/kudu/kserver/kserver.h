@@ -17,9 +17,9 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/server/server_base.h"
 #include "kudu/util/threadpool.h"
@@ -63,13 +63,13 @@ class KuduServer : public server::ServerBase {
  private:
 
   // Thread pool for preparing transactions, shared between all tablets.
-  gscoped_ptr<ThreadPool> tablet_prepare_pool_;
+  std::unique_ptr<ThreadPool> tablet_prepare_pool_;
 
   // Thread pool for applying transactions, shared between all tablets.
-  gscoped_ptr<ThreadPool> tablet_apply_pool_;
+  std::unique_ptr<ThreadPool> tablet_apply_pool_;
 
   // Thread pool for Raft-related operations, shared between all tablets.
-  gscoped_ptr<ThreadPool> raft_pool_;
+  std::unique_ptr<ThreadPool> raft_pool_;
 
   DISALLOW_COPY_AND_ASSIGN(KuduServer);
 };

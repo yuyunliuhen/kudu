@@ -19,12 +19,14 @@
 
 #include <algorithm>
 #include <exception>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <glog/logging.h>
+#include <thrift/TApplicationException.h>
 #include <thrift/Thrift.h>
 #include <thrift/protocol/TJSONProtocol.h>
 #include <thrift/protocol/TProtocol.h>
@@ -32,6 +34,7 @@
 #include <thrift/transport/TTransport.h>
 #include <thrift/transport/TTransportException.h>
 
+#include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/strip.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -42,6 +45,7 @@
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
 
+using apache::thrift::TApplicationException;
 using apache::thrift::TException;
 using apache::thrift::protocol::TJSONProtocol;
 using apache::thrift::transport::TMemoryBuffer;
@@ -79,6 +83,12 @@ namespace hms {
     return Status::RemoteError((msg), e.what()); \
   } catch (const SaslException& e) { \
     return e.status().CloneAndPrepend((msg)); \
+  } catch (const TApplicationException& e) { \
+    switch (e.getType()) { \
+      case TApplicationException::UNKNOWN_METHOD: \
+        return Status::NotSupported((msg), e.what()); \
+      default: return Status::RemoteError((msg), e.what()); \
+    } \
   } catch (const TTransportException& e) { \
     switch (e.getType()) { \
       case TTransportException::TIMED_OUT: return Status::TimedOut((msg), e.what()); \
@@ -94,12 +104,14 @@ namespace hms {
 
 const char* const HmsClient::kLegacyKuduStorageHandler =
   "com.cloudera.kudu.hive.KuduStorageHandler";
-const char* const HmsClient::kLegacyKuduTableNameKey = "kudu.table_name";
 const char* const HmsClient::kLegacyTablePrefix = "impala::";
 const char* const HmsClient::kKuduTableIdKey = "kudu.table_id";
+const char* const HmsClient::kKuduTableNameKey = "kudu.table_name";
 const char* const HmsClient::kKuduMasterAddrsKey = "kudu.master_addresses";
 const char* const HmsClient::kKuduMasterEventKey = "kudu.master_event";
-const char* const HmsClient::kKuduStorageHandler = "org.apache.kudu.hive.KuduStorageHandler";
+const char* const HmsClient::kKuduCheckIdKey = "kudu.check_id";
+const char* const HmsClient::kKuduStorageHandler =
+    "org.apache.hadoop.hive.kudu.KuduStorageHandler";
 
 const char* const HmsClient::kTransactionalEventListeners =
   "hive.metastore.transactional.event.listeners";
@@ -108,6 +120,7 @@ const char* const HmsClient::kDisallowIncompatibleColTypeChanges =
 const char* const HmsClient::kDbNotificationListener =
   "org.apache.hive.hcatalog.listener.DbNotificationListener";
 const char* const HmsClient::kExternalTableKey = "EXTERNAL";
+const char* const HmsClient::kExternalPurgeKey = "external.table.purge";
 const char* const HmsClient::kStorageHandlerKey = "storage_handler";
 const char* const HmsClient::kKuduMetastorePlugin =
   "org.apache.kudu.hive.metastore.KuduMetastorePlugin";
@@ -125,7 +138,8 @@ const int kSlowExecutionWarningThresholdMs = 1000;
 const char* const HmsClient::kServiceName = "Hive Metastore";
 
 HmsClient::HmsClient(const HostPort& address, const ClientOptions& options)
-      : client_(hive::ThriftHiveMetastoreClient(CreateClientProtocol(address, options))) {
+      : verify_kudu_sync_config_(options.verify_service_config),
+        client_(hive::ThriftHiveMetastoreClient(CreateClientProtocol(address, options))) {
 }
 
 HmsClient::~HmsClient() {
@@ -136,6 +150,10 @@ Status HmsClient::Start() {
   SCOPED_LOG_SLOW_EXECUTION(WARNING, kSlowExecutionWarningThresholdMs, "starting HMS client");
   HMS_RET_NOT_OK(client_.getOutputProtocol()->getTransport()->open(),
                  "failed to open Hive Metastore connection");
+
+  if (!verify_kudu_sync_config_) {
+    return Status::OK();
+  }
 
   // Immediately after connecting to the HMS, check that it is configured with
   // the required event listeners.
@@ -336,6 +354,15 @@ Status HmsClient::GetNotificationEvents(int64_t last_event_id,
   return Status::OK();
 }
 
+Status HmsClient::GetUuid(string* uuid) {
+  DCHECK(uuid);
+  SCOPED_LOG_SLOW_EXECUTION(WARNING, kSlowExecutionWarningThresholdMs,
+                            "get HMS database UUID");
+  HMS_RET_NOT_OK(client_.get_metastore_db_uuid(*uuid),
+                 "failed to get HMS DB UUID");
+  return Status::OK();
+}
+
 Status HmsClient::AddPartitions(const string& database_name,
                                 const string& table_name,
                                 vector<hive::Partition> partitions) {
@@ -368,6 +395,23 @@ Status HmsClient::DeserializeJsonTable(Slice json, hive::Table* table)  {
   TJSONProtocol protocol(membuffer);
   HMS_RET_NOT_OK(table->read(&protocol), "failed to deserialize JSON table");
   return Status::OK();
+}
+
+bool HmsClient::IsKuduTable(const hive::Table& table) {
+  const string* storage_handler =
+      FindOrNull(table.parameters, hms::HmsClient::kStorageHandlerKey);
+  if (!storage_handler) {
+    return false;
+  }
+  return *storage_handler == hms::HmsClient::kKuduStorageHandler;
+}
+
+bool HmsClient::IsSynchronized(const hive::Table& table) {
+  const string externalPurge =
+      FindWithDefault(table.parameters, hms::HmsClient::kExternalPurgeKey, "false");
+  return table.tableType == hms::HmsClient::kManagedTable ||
+         (table.tableType == hms::HmsClient::kExternalTable &&
+          boost::iequals(externalPurge, "true"));
 }
 
 } // namespace hms

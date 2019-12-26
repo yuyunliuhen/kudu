@@ -81,6 +81,9 @@ message MasterErrorPB {
 
     // An operation involving the Hive Metastore failed.
     HIVE_METASTORE_ERROR = 13;
+
+    // The caller is not authorized to perform the attempted operation.
+    NOT_AUTHORIZED = 14;
   }
 
   // The error code.
@@ -139,6 +142,10 @@ message SysTabletsEntryPB {
 
   // The table id for the tablet.
   required bytes table_id = 6;
+
+  // The dimension label for the tablet. Used for dimension-specific
+  // placement of the tablet's replicas.
+  optional string dimension_label = 8;
 }
 
 // The on-disk entry in the sys.catalog table ("metadata" column) for
@@ -181,6 +188,13 @@ message SysTablesEntryPB {
   // Debug state for the table.
   optional State state = 6 [ default = UNKNOWN ];
   optional bytes state_msg = 7;
+
+  // The create time of the table, in seconds since the epoch.
+  optional int64 create_timestamp = 10;
+  // The last alter time of the table, in seconds since the epoch.
+  optional int64 alter_timestamp = 11;
+  // The table's extra configuration properties.
+  optional TableExtraConfigPB extra_config = 12;
 }
 
 // The on-disk entry in the sys.catalog table ("metadata" column) to represent
@@ -210,6 +224,15 @@ message SysNotificationLogEventIdPB {
   optional int64 latest_notification_log_event_id = 1;
 }
 
+// The on-disk entry in the sys.catalog table to represent the existence of
+// on-going tserver state (e.g. maintenance mode).
+message SysTServerStateEntryPB {
+  optional TServerStatePB state = 1;
+
+  // Timestamp, in seconds since the epoch, at which this state was set.
+  optional int64 timestamp_secs = 2;
+}
+
 ////////////////////////////////////////////////////////////
 // RPCs
 ////////////////////////////////////////////////////////////
@@ -232,6 +255,10 @@ message ReportedTabletPB {
 
   optional AppStatusPB error = 4;
   optional uint32 schema_version = 5;
+
+  // Tablet statistics.
+  // This is only included in the report if the replica is a LEADER.
+  optional tablet.ReportedTabletStatsPB stats = 7;
 }
 
 // Sent by the tablet server to report the set of tablets hosted by that TS.
@@ -301,6 +328,11 @@ message TSHeartbeatRequestPB {
   // Replica management parameters that the tablet server is running with.
   // This field is set only if the registration field is present.
   optional consensus.ReplicaManagementInfoPB replica_management_info = 7;
+
+  // The number of tablets that are BOOTSTRAPPING or RUNNING in each dimension.
+  // Used by the master to determine load when creating new tablet replicas
+  // based on dimension.
+  map<string, int32> num_live_tablets_by_dimension = 8;
 }
 
 message TSHeartbeatResponsePB {
@@ -349,9 +381,20 @@ message TSHeartbeatResponsePB {
 //////////////////////////////
 
 message TabletLocationsPB {
-  message ReplicaPB {
+  // DEPRECATED.
+  // TODO: new clients should prefer the 'Interned' type below.
+  // Remove 'ReplicaPB' when we stop using it internally.
+  message DEPRECATED_ReplicaPB {
     required TSInfoPB ts_info = 1;
     required consensus.RaftPeerPB.Role role = 2;
+    optional string dimension_label = 3;
+  }
+
+  message InternedReplicaPB {
+    // Index into the 'ts_infos' list in the top-level RPC response.
+    required uint32 ts_info_idx = 1;
+    required consensus.RaftPeerPB.Role role = 2;
+    optional string dimension_label = 3;
   }
 
   required bytes tablet_id = 1;
@@ -362,7 +405,16 @@ message TabletLocationsPB {
 
   optional PartitionPB partition = 6;
 
-  repeated ReplicaPB replicas = 4;
+  // DEPRECATED.
+  // Used only if interned replicas are not supported by client.
+  repeated DEPRECATED_ReplicaPB DEPRECATED_replicas = 4;
+
+  // More efficient representation of replicas: instead of duplicating the TSInfoPB
+  // in each tablet location, instead we just encode indexes into a list of TSInfoPB
+  // which is serialized in the top-level response.
+  //
+  // Used when supported by client.
+  repeated InternedReplicaPB interned_replicas = 7;
 
   // DEPRECATED. Still set by servers, but should be ignored by clients.
   optional bool DEPRECATED_stale = 5;
@@ -396,12 +448,19 @@ message GetTabletLocationsRequestPB {
 
   // What type of tablet replicas to include in the response.
   optional ReplicaTypeFilter replica_type_filter = 2 [ default = VOTER_REPLICA ];
+
+  // Whether the response should use the 'interned_replicas' field.
+  optional bool intern_ts_infos_in_response = 3 [ default = false ];
 }
 
 message GetTabletLocationsResponsePB {
   optional MasterErrorPB error = 1;
 
   repeated TabletLocationsPB tablet_locations = 2;
+
+  // Used if 'intern_ts_infos_in_response' was requested.
+  // See InternedReplicaPB above.
+  repeated TSInfoPB ts_infos = 4;
 
   message Error {
     required bytes tablet_id = 1;
@@ -426,6 +485,14 @@ message CreateTableRequestPB {
   // If set, uses the provided value as the table owner when creating the table
   // in external catalogs such as the Hive Metastore.
   optional string owner = 8;
+
+  // The table's extra configuration properties.
+  map<string, string> extra_configs = 9;
+
+  // The dimension label for tablets that were created during table creation. Used for
+  // dimension-specific placement of tablet replicas corresponding to the partitions of
+  // the newly created table.
+  optional string dimension_label = 10;
 }
 
 message CreateTableResponsePB {
@@ -477,6 +544,19 @@ message ListTablesResponsePB {
   repeated TableInfo tables = 2;
 }
 
+message GetTableStatisticsRequestPB {
+  required TableIdentifierPB table = 1;
+}
+
+message GetTableStatisticsResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+
+  // The table statistics from table metrics.
+  optional int64 on_disk_size = 2;
+  optional int64 live_row_count = 3;
+}
+
 message GetTableLocationsRequestPB {
   required TableIdentifierPB table = 1;
 
@@ -489,6 +569,9 @@ message GetTableLocationsRequestPB {
   // What type of tablet replicas to include in the
   // 'GetTableLocationsResponsePB::tablet_locations' response field.
   optional ReplicaTypeFilter replica_type_filter = 6 [ default = VOTER_REPLICA ];
+
+  // Whether the response should use the 'interned_replicas' field.
+  optional bool intern_ts_infos_in_response = 7 [ default = false ];
 }
 
 // The response to a GetTableLocations RPC. The master guarantees that:
@@ -509,6 +592,10 @@ message GetTableLocationsResponsePB {
   optional MasterErrorPB error = 1;
 
   repeated TabletLocationsPB tablet_locations = 2;
+
+  // Used if 'intern_ts_infos_in_response' was requested.
+  // See InternedReplicaPB above.
+  repeated TSInfoPB ts_infos = 4;
 
   // If the client caches table locations, the entries should not live longer
   // than this timeout. Defaults to one hour.
@@ -548,6 +635,10 @@ message AlterTableRequestPB {
     // A set of row operations containing the lower and upper range bound for
     // the range partition to add or drop.
     optional RowOperationsPB range_bounds = 1;
+
+    // The dimension label for the tablet. Used for dimension-specific placement
+    // of the tablet's replicas.
+    optional string dimension_label = 2;
   }
   message DropRangePartition {
     // A set of row operations containing the lower and upper range bound for
@@ -578,6 +669,8 @@ message AlterTableRequestPB {
   // Whether to apply the alteration to external catalogs, such as the Hive Metastore,
   // which the Kudu master has been configured to integrate with.
   optional bool modify_external_catalogs = 5 [default = true];
+
+  map<string, string> new_extra_configs = 6;
 }
 
 message AlterTableResponsePB {
@@ -633,13 +726,21 @@ message GetTableSchemaResponsePB {
 
   // The table name.
   optional string table_name = 7;
+
+  // A token that the client can use to authorize further access to the table.
+  // A token can always be expected with this response, unless the response is
+  // from an older version of Kudu or unless the request resulted in an error.
+  optional security.SignedTokenPB authz_token = 8;
+
+  // The table's extra configuration properties.
+  map<string, string> extra_configs = 9;
 }
 
 message ConnectToMasterRequestPB {
 }
 
 message ConnectToMasterResponsePB {
-  // Set if there an error.
+  // Set if there is an error.
   optional MasterErrorPB error = 1;
 
   // The current role of the master.
@@ -673,6 +774,9 @@ message ConnectToMasterResponsePB {
   // If the master is configured with the Hive Metastore integration enabled,
   // this field will include the configuration options.
   optional HiveMetastoreConfig hms_config = 6;
+
+  // The location of the client assigned by the master.
+  optional string client_location = 7;
 }
 
 // Hive Metastore integration options and configuration.
@@ -703,6 +807,11 @@ message HiveMetastoreConfig {
 // ============================================================================
 
 message ListTabletServersRequestPB {
+  // Whether or not to include the tserver states.
+  // Note: this may include states of tservers that haven't been registered and
+  // thus don't have a complete response Entries. In such cases, the Entries
+  // will be returned with bogus info w.r.t registration and heartbeating.
+  optional bool include_states = 1;
 }
 
 message ListTabletServersResponsePB {
@@ -713,8 +822,64 @@ message ListTabletServersResponsePB {
     optional ServerRegistrationPB registration = 2;
     optional int32 millis_since_heartbeat = 3;
     optional string location = 4;
+    optional TServerStatePB state = 5;
   }
   repeated Entry servers = 2;
+}
+
+// Representation of the state of a tablet server.
+// TODO(KUDU-1827): add state for decommissioning.
+enum TServerStatePB {
+  // Default value for backwards compatibility.
+  UNKNOWN_STATE = 0;
+
+  // No state for the tserver.
+  NONE = 1;
+
+  // New replicas are not added to the tserver, and failed replicas on the
+  // tserver are not re-replicated.
+  MAINTENANCE_MODE = 2;
+}
+
+message TServerStateChangePB {
+  // Representation of a change in tserver state.
+  enum StateChange {
+    // Default value for backwards compatibility.
+    UNKNOWN_STATE_CHANGE = 0;
+
+    // Transitions from having no state to being in maintenance mode. If the
+    // tserver is already in maintenance mode, this is a no-op.
+    ENTER_MAINTENANCE_MODE = 1;
+
+    // Transitions from being in maintenance mode to having no tserver state. If
+    // the tserver already has no state, this is a no-op.
+    EXIT_MAINTENANCE_MODE = 2;
+  }
+
+  // The tserver UUID on which to apply the state change.
+  optional string uuid = 1;
+
+  // The change in tserver state.
+  optional StateChange change = 2;
+}
+
+message ChangeTServerStateRequestPB {
+  // TODO(awong): consider setting tserver state in batches.
+  optional TServerStateChangePB change = 1;
+
+  enum HandleMissingTS {
+    UNKNOWN_HANDLING = 0;
+    ALLOW_MISSING_TSERVER = 1;
+    DONT_ALLOW_MISSING_TSERVER = 2;
+  }
+  // If set to ALLOW_MISSING_TSERVER, will allow setting the state of the
+  // tserver even if it hasn't been registered with the master and there is no
+  // existing state associated with that server.
+  optional HandleMissingTS handle_missing_tserver = 2 [default = DONT_ALLOW_MISSING_TSERVER];
+}
+
+message ChangeTServerStateResponsePB {
+  optional MasterErrorPB error = 1;
 }
 
 // GetMasterRegistrationRequest/Response: get the instance id and
@@ -767,6 +932,15 @@ message ReplaceTabletResponsePB {
   optional bytes replacement_tablet_id = 2;
 }
 
+// ResetAuthzCache{Request/Result}PB: reset the authz privileges cache,
+// clearing it of all existing entries.
+message ResetAuthzCacheRequestPB {
+}
+
+message ResetAuthzCacheResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
 enum MasterFeatures {
   UNKNOWN_FEATURE = 0;
   // The master supports creating tables with non-covering range partitions.
@@ -780,6 +954,8 @@ enum MasterFeatures {
   // EVICT_FIRST (a.k.a. 3-2-3) and the PREPARE_REPLACEMENT_BEFORE_EVICTION
   // (a.k.a. 3-4-3) schemes.
   REPLICA_MANAGEMENT = 4;
+  // The master supports generating and dispensing authz tokens.
+  GENERATE_AUTHZ_TOKEN = 5;
 }
 
 service MasterService {
@@ -826,6 +1002,11 @@ service MasterService {
   rpc ListTables(ListTablesRequestPB) returns (ListTablesResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeClient";
   }
+
+  rpc GetTableStatistics(GetTableStatisticsRequestPB) returns (GetTableStatisticsResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
+
   rpc GetTableLocations(GetTableLocationsRequestPB) returns (GetTableLocationsResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeClient";
   }
@@ -845,6 +1026,14 @@ service MasterService {
     option (kudu.rpc.authz_method) = "AuthorizeClientOrServiceUser";
   }
   rpc ReplaceTablet(ReplaceTabletRequestPB) returns (ReplaceTabletResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
+  }
+  rpc ResetAuthzCache(ResetAuthzCacheRequestPB) returns
+      (ResetAuthzCacheResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
+  }
+  rpc ChangeTServerState(ChangeTServerStateRequestPB) returns
+      (ChangeTServerStateResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
   }
 

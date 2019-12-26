@@ -29,7 +29,6 @@ import com.google.common.primitives.Shorts;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
 
-import org.apache.kudu.ColumnTypeAttributes;
 import org.apache.kudu.util.DecimalUtil;
 
 /**
@@ -49,7 +48,8 @@ public enum Type {
   FLOAT(DataType.FLOAT, "float"),
   DOUBLE(DataType.DOUBLE, "double"),
   UNIXTIME_MICROS(DataType.UNIXTIME_MICROS, "unixtime_micros"),
-  DECIMAL(Arrays.asList(DataType.DECIMAL32, DataType.DECIMAL64, DataType.DECIMAL128), "decimal");
+  DECIMAL(Arrays.asList(DataType.DECIMAL32, DataType.DECIMAL64, DataType.DECIMAL128), "decimal"),
+  VARCHAR(DataType.VARCHAR, "varchar");
 
   private final ImmutableList<DataType> dataTypes;
   private final String name;
@@ -60,13 +60,13 @@ public enum Type {
    * @param dataType DataType from the common's pb
    * @param name string representation of the type
    */
-  private Type(DataType dataType, String name) {
+  Type(DataType dataType, String name) {
     this.dataTypes = ImmutableList.of(dataType);
     this.name = name;
     this.size = getTypeSize(dataType);
   }
 
-  private Type(List<DataType> dataTypes, String name) {
+  Type(List<DataType> dataTypes, String name) {
     this.dataTypes = ImmutableList.copyOf(dataTypes);
     this.name = name;
     this.size = -1;
@@ -144,9 +144,11 @@ public enum Type {
     switch (type) {
       case STRING:
       case BINARY:
+      case VARCHAR:
         return 8 + 8; // offset then string length
       case BOOL:
       case INT8:
+      case IS_DELETED:
         return 1;
       case INT16:
         return Shorts.BYTES;
@@ -169,16 +171,29 @@ public enum Type {
    */
   public static Type getTypeForDataType(DataType type) {
     switch (type) {
-      case STRING: return STRING;
-      case BINARY: return BINARY;
-      case BOOL: return BOOL;
-      case INT8: return INT8;
-      case INT16: return INT16;
-      case INT32: return INT32;
-      case INT64: return INT64;
-      case UNIXTIME_MICROS: return UNIXTIME_MICROS;
-      case FLOAT: return FLOAT;
-      case DOUBLE: return DOUBLE;
+      case STRING:
+        return STRING;
+      case BINARY:
+        return BINARY;
+      case VARCHAR:
+        return VARCHAR;
+      case BOOL:
+      case IS_DELETED:
+        return BOOL;
+      case INT8:
+        return INT8;
+      case INT16:
+        return INT16;
+      case INT32:
+        return INT32;
+      case INT64:
+        return INT64;
+      case UNIXTIME_MICROS:
+        return UNIXTIME_MICROS;
+      case FLOAT:
+        return FLOAT;
+      case DOUBLE:
+        return DOUBLE;
       case DECIMAL32:
       case DECIMAL64:
       case DECIMAL128:
@@ -190,9 +205,17 @@ public enum Type {
     }
   }
 
+  /**
+   * Create a Type from its name
+   * @param name The DataType name. It accepts Type name (from the getName()
+   * method) and ENUM name (from the name() method).
+   * @throws IllegalArgumentException if the provided name doesn't map to any
+   * known type.
+   * @return a matching Type.
+   */
   public static Type getTypeForName(String name) {
     for (Type t : values()) {
-      if (t.name().equals(name)) {
+      if (t.name().equals(name) || t.getName().equals(name)) {
         return t;
       }
     }

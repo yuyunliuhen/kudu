@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/fs/log_block_manager.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <initializer_list>
 #include <memory>
 #include <ostream>
 #include <set>
@@ -31,22 +34,20 @@
 
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/data_dirs.h"
+#include "kudu/fs/dir_manager.h"
 #include "kudu/fs/error_manager.h"
 #include "kudu/fs/fs.pb.h"
 #include "kudu/fs/fs_report.h"
 #include "kudu/fs/log_block_manager-test-util.h"
-#include "kudu/fs/log_block_manager.h"
 #include "kudu/gutil/bind.h"
 #include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/casts.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/strip.h"
@@ -79,12 +80,17 @@ DECLARE_bool(crash_on_eio);
 DECLARE_double(env_inject_eio);
 DECLARE_double(log_container_excess_space_before_cleanup_fraction);
 DECLARE_double(log_container_live_metadata_before_compact_ratio);
+DECLARE_int32(fs_target_data_dirs_per_tablet);
 DECLARE_int64(block_manager_max_open_files);
 DECLARE_int64(log_container_max_blocks);
 DECLARE_string(block_manager_preflush_control);
 DECLARE_string(env_inject_eio_globs);
 DECLARE_uint64(log_container_preallocate_bytes);
 DECLARE_uint64(log_container_max_size);
+DEFINE_int32(startup_benchmark_block_count_for_testing, 1000000,
+             "Block count to do startup benchmark.");
+DEFINE_int32(startup_benchmark_data_dir_count_for_testing, 8,
+             "Data directories to do startup benchmark.");
 
 // Block manager metrics.
 METRIC_DECLARE_counter(block_manager_total_blocks_deleted);
@@ -95,6 +101,7 @@ METRIC_DECLARE_gauge_uint64(log_block_manager_blocks_under_management);
 METRIC_DECLARE_counter(log_block_manager_holes_punched);
 METRIC_DECLARE_gauge_uint64(log_block_manager_containers);
 METRIC_DECLARE_gauge_uint64(log_block_manager_full_containers);
+METRIC_DECLARE_gauge_uint64(log_block_manager_dead_containers_deleted);
 
 namespace kudu {
 namespace fs {
@@ -121,10 +128,13 @@ class LogBlockManagerTest : public KuduTest {
   }
 
  protected:
-  LogBlockManager* CreateBlockManager(const scoped_refptr<MetricEntity>& metric_entity) {
+  LogBlockManager* CreateBlockManager(const scoped_refptr<MetricEntity>& metric_entity,
+                                      std::vector<std::string> test_data_dirs = {}) {
+    PrepareDataDirs(&test_data_dirs);
+
     if (!dd_manager_) {
       // Ensure the directory manager is initialized.
-      CHECK_OK(DataDirManager::CreateNewForTests(env_, { test_dir_ },
+      CHECK_OK(DataDirManager::CreateNewForTests(env_, test_data_dirs,
           DataDirManagerOptions(), &dd_manager_));
     }
     BlockManagerOptions opts;
@@ -134,18 +144,30 @@ class LogBlockManagerTest : public KuduTest {
   }
 
   Status ReopenBlockManager(const scoped_refptr<MetricEntity>& metric_entity = nullptr,
-                            FsReport* report = nullptr) {
+                            FsReport* report = nullptr,
+                            std::vector<std::string> test_data_dirs = {},
+                            bool force = false) {
+    PrepareDataDirs(&test_data_dirs);
+
     // The directory manager must outlive the block manager. Destroy the block
     // manager first to enforce this.
     bm_.reset();
 
-    // Re-open the directory manager first to clear any in-memory maps.
-    RETURN_NOT_OK(DataDirManager::OpenExistingForTests(env_, { test_dir_ },
-        DataDirManagerOptions(), &dd_manager_));
+    if (force) {
+      // Ensure the directory manager is initialized.
+      CHECK_OK(DataDirManager::CreateNewForTests(env_, test_data_dirs,
+          DataDirManagerOptions(), &dd_manager_));
+      RETURN_NOT_OK(dd_manager_->CreateDataDirGroup(test_tablet_name_));
+      RETURN_NOT_OK(dd_manager_->GetDataDirGroupPB(test_tablet_name_, &test_group_pb_));
+    } else {
+      // Re-open the directory manager first to clear any in-memory maps.
+      RETURN_NOT_OK(DataDirManager::OpenExistingForTests(env_, test_data_dirs,
+                                                         DataDirManagerOptions(), &dd_manager_));
+      RETURN_NOT_OK(dd_manager_->LoadDataDirGroupFromPB(test_tablet_name_, test_group_pb_));
+    }
 
-    bm_.reset(CreateBlockManager(metric_entity));
+    bm_.reset(CreateBlockManager(metric_entity, test_data_dirs));
     RETURN_NOT_OK(bm_->Open(report));
-    RETURN_NOT_OK(dd_manager_->LoadDataDirGroupFromPB(test_tablet_name_, test_group_pb_));
     return Status::OK();
   }
 
@@ -215,7 +237,7 @@ class LogBlockManagerTest : public KuduTest {
     // Populate 'data_files' and 'metadata_files'.
     vector<string> data_files;
     vector<string> metadata_files;
-    for (const string& data_dir : dd_manager_->GetDataDirs()) {
+    for (const string& data_dir : dd_manager_->GetDirs()) {
       vector<string> children;
       ASSERT_OK(env_->GetChildren(data_dir, &children));
       for (const string& child : children) {
@@ -254,6 +276,16 @@ class LogBlockManagerTest : public KuduTest {
         break;
     }
   }
+  void PrepareDataDirs(std::vector<std::string>* test_data_dirs) {
+    if (test_data_dirs->empty()) {
+      *test_data_dirs = { test_dir_ };
+    }
+    for (const auto& test_data_dir : *test_data_dirs) {
+      Status s = Env::Default()->CreateDir(test_data_dir);
+      CHECK(s.IsAlreadyPresent() || s.ok())
+          << "Could not create directory " << test_data_dir << ": " << s.ToString();
+    }
+  }
 };
 
 static void CheckGaugeMetric(const scoped_refptr<MetricEntity>& entity,
@@ -261,24 +293,24 @@ static void CheckGaugeMetric(const scoped_refptr<MetricEntity>& entity,
   AtomicGauge<uint64_t>* gauge = down_cast<AtomicGauge<uint64_t>*>(
       entity->FindOrNull(*prototype).get());
   DCHECK(gauge);
-  ASSERT_EQ(expected_value, gauge->value());
+  ASSERT_EQ(expected_value, gauge->value()) << prototype->name();
 }
 
 static void CheckCounterMetric(const scoped_refptr<MetricEntity>& entity,
                                int expected_value, const MetricPrototype* prototype) {
   Counter* counter = down_cast<Counter*>(entity->FindOrNull(*prototype).get());
   DCHECK(counter);
-  ASSERT_EQ(expected_value, counter->value());
+  ASSERT_EQ(expected_value, counter->value()) << prototype->name();
 }
 
 static void CheckLogMetrics(const scoped_refptr<MetricEntity>& entity,
                             const vector<std::pair<int, const MetricPrototype*>> gauge_values,
                             const vector<std::pair<int, const MetricPrototype*>> counter_values) {
   for (const auto& gauge_value : gauge_values) {
-    CheckGaugeMetric(entity, gauge_value.first, gauge_value.second);
+    NO_FATALS(CheckGaugeMetric(entity, gauge_value.first, gauge_value.second));
   }
   for (const auto& counter_value: counter_values) {
-    CheckCounterMetric(entity, counter_value.first, counter_value.second);
+    NO_FATALS(CheckCounterMetric(entity, counter_value.first, counter_value.second));
   }
 }
 
@@ -292,7 +324,8 @@ TEST_F(LogBlockManagerTest, MetricsTest) {
         {0, &METRIC_log_block_manager_containers},
         {0, &METRIC_log_block_manager_full_containers} },
       { {0, &METRIC_log_block_manager_holes_punched},
-        {0, &METRIC_block_manager_total_blocks_deleted} }));
+        {0, &METRIC_block_manager_total_blocks_deleted},
+        {0, &METRIC_log_block_manager_dead_containers_deleted} }));
 
   // Lower the max container size so that we can more easily test full
   // container metrics.
@@ -307,7 +340,8 @@ TEST_F(LogBlockManagerTest, MetricsTest) {
         {1, &METRIC_log_block_manager_containers},
         {0, &METRIC_log_block_manager_full_containers} },
       { {0, &METRIC_log_block_manager_holes_punched},
-        {0, &METRIC_block_manager_total_blocks_deleted} }));
+        {0, &METRIC_block_manager_total_blocks_deleted},
+        {0, &METRIC_log_block_manager_dead_containers_deleted} }));
 
   // And when the block is closed, it becomes "under management".
   ASSERT_OK(writer->Close());
@@ -317,12 +351,14 @@ TEST_F(LogBlockManagerTest, MetricsTest) {
         {1, &METRIC_log_block_manager_containers},
         {0, &METRIC_log_block_manager_full_containers} },
       { {0, &METRIC_log_block_manager_holes_punched},
-        {0, &METRIC_block_manager_total_blocks_deleted} }));
+        {0, &METRIC_block_manager_total_blocks_deleted},
+        {0, &METRIC_log_block_manager_dead_containers_deleted} }));
 
   // Create 10 blocks concurrently. We reuse the existing container and
   // create 9 new ones. All of them get filled.
   BlockId saved_id;
   {
+    uint8_t data[1024];
     Random rand(SeedRandom());
     unique_ptr<BlockCreationTransaction> transaction = bm_->NewCreationTransaction();
     for (int i = 0; i < 10; i++) {
@@ -331,9 +367,8 @@ TEST_F(LogBlockManagerTest, MetricsTest) {
       if (saved_id.IsNull()) {
         saved_id = b->id();
       }
-      uint8_t data[1024];
-      for (int i = 0; i < sizeof(data); i += sizeof(uint32_t)) {
-        data[i] = rand.Next();
+      for (int j = 0; j < sizeof(data); j += sizeof(uint32_t)) {
+        data[j] = rand.Next();
       }
       b->Append(Slice(data, sizeof(data)));
       ASSERT_OK(b->Finalize());
@@ -346,7 +381,8 @@ TEST_F(LogBlockManagerTest, MetricsTest) {
           {10, &METRIC_log_block_manager_containers},
           {10, &METRIC_log_block_manager_full_containers} },
         { {0, &METRIC_log_block_manager_holes_punched},
-          {0, &METRIC_block_manager_total_blocks_deleted} }));
+          {0, &METRIC_block_manager_total_blocks_deleted},
+          {0, &METRIC_log_block_manager_dead_containers_deleted} }));
 
     ASSERT_OK(transaction->CommitCreatedBlocks());
     NO_FATALS(CheckLogMetrics(entity,
@@ -355,7 +391,8 @@ TEST_F(LogBlockManagerTest, MetricsTest) {
           {10, &METRIC_log_block_manager_containers},
           {10, &METRIC_log_block_manager_full_containers} },
         { {0, &METRIC_log_block_manager_holes_punched},
-          {0, &METRIC_block_manager_total_blocks_deleted} }));
+          {0, &METRIC_block_manager_total_blocks_deleted},
+          {0, &METRIC_log_block_manager_dead_containers_deleted} }));
   }
 
   // Reopen the block manager and test the metrics. They're all based on
@@ -369,7 +406,8 @@ TEST_F(LogBlockManagerTest, MetricsTest) {
         {10, &METRIC_log_block_manager_containers},
         {10, &METRIC_log_block_manager_full_containers} },
       { {0, &METRIC_log_block_manager_holes_punched},
-        {0, &METRIC_block_manager_total_blocks_deleted} }));
+        {0, &METRIC_block_manager_total_blocks_deleted},
+        {0, &METRIC_log_block_manager_dead_containers_deleted} }));
 
   // Delete a block. Its contents should no longer be under management.
   {
@@ -384,10 +422,11 @@ TEST_F(LogBlockManagerTest, MetricsTest) {
           {10, &METRIC_log_block_manager_containers},
           {10, &METRIC_log_block_manager_full_containers} },
         { {0, &METRIC_log_block_manager_holes_punched},
-          {1, &METRIC_block_manager_total_blocks_deleted} }));
+          {1, &METRIC_block_manager_total_blocks_deleted},
+          {0, &METRIC_log_block_manager_dead_containers_deleted} }));
   }
   // Wait for the actual hole punching to take place.
-  for (const auto& data_dir : dd_manager_->data_dirs()) {
+  for (const auto& data_dir : dd_manager_->dirs()) {
     data_dir->WaitOnClosures();
   }
   NO_FATALS(CheckLogMetrics(new_entity,
@@ -396,7 +435,8 @@ TEST_F(LogBlockManagerTest, MetricsTest) {
         {10, &METRIC_log_block_manager_containers},
         {10, &METRIC_log_block_manager_full_containers} },
       { {1, &METRIC_log_block_manager_holes_punched},
-        {1, &METRIC_block_manager_total_blocks_deleted} }));
+        {1, &METRIC_block_manager_total_blocks_deleted},
+        {0, &METRIC_log_block_manager_dead_containers_deleted} }));
 
   // Set the max container size to default so that we can create a bunch of blocks
   // in the same container. Delete those created blocks afterwards to verify only
@@ -429,10 +469,11 @@ TEST_F(LogBlockManagerTest, MetricsTest) {
           {11, &METRIC_log_block_manager_containers},
           {10, &METRIC_log_block_manager_full_containers} },
         { {1, &METRIC_log_block_manager_holes_punched},
-          {11, &METRIC_block_manager_total_blocks_deleted} }));
+          {11, &METRIC_block_manager_total_blocks_deleted},
+          {0, &METRIC_log_block_manager_dead_containers_deleted} }));
   }
   // Wait for the actual hole punching to take place.
-  for (const auto& data_dir : dd_manager_->data_dirs()) {
+  for (const auto& data_dir : dd_manager_->dirs()) {
     data_dir->WaitOnClosures();
   }
   NO_FATALS(CheckLogMetrics(new_entity,
@@ -441,7 +482,8 @@ TEST_F(LogBlockManagerTest, MetricsTest) {
         {11, &METRIC_log_block_manager_containers},
         {10, &METRIC_log_block_manager_full_containers} },
       { {2, &METRIC_log_block_manager_holes_punched},
-        {11, &METRIC_block_manager_total_blocks_deleted} }));
+        {11, &METRIC_block_manager_total_blocks_deleted},
+        {0, &METRIC_log_block_manager_dead_containers_deleted} }));
 }
 
 TEST_F(LogBlockManagerTest, ContainerPreallocationTest) {
@@ -615,7 +657,7 @@ TEST_F(LogBlockManagerTest, TestMetadataTruncation) {
   // Start corrupting the metadata file in different ways.
 
   string path = LogBlockManager::ContainerPathForTests(
-      bm_->all_containers_by_name_.begin()->second);
+      bm_->all_containers_by_name_.begin()->second.get());
   string metadata_path = path + LogBlockManager::kContainerMetadataFileSuffix;
   string data_path = path + LogBlockManager::kContainerDataFileSuffix;
 
@@ -634,7 +676,7 @@ TEST_F(LogBlockManagerTest, TestMetadataTruncation) {
   for (const auto num_bytes : {1, 8, 128}) {
     {
       RWFileOptions opts;
-      opts.mode = Env::OPEN_EXISTING;
+      opts.mode = Env::MUST_EXIST;
       unique_ptr<RWFile> file;
       ASSERT_OK(env_->NewRWFile(opts, metadata_path, &file));
       ASSERT_OK(file->Truncate(good_meta_size + num_bytes));
@@ -692,7 +734,7 @@ TEST_F(LogBlockManagerTest, TestMetadataTruncation) {
   // data loss, however it will look like a failed partial write.
   {
     RWFileOptions opts;
-    opts.mode = Env::OPEN_EXISTING;
+    opts.mode = Env::MUST_EXIST;
     unique_ptr<RWFile> file;
     ASSERT_OK(env_->NewRWFile(opts, metadata_path, &file));
     ASSERT_OK(file->Truncate(good_meta_size - 1));
@@ -750,7 +792,7 @@ TEST_F(LogBlockManagerTest, TestMetadataTruncation) {
   uint64_t latest_meta_size;
   ASSERT_OK(env_->GetFileSize(metadata_path, &latest_meta_size));
   ASSERT_OK(env_->NewRandomAccessFile(metadata_path, &meta_file));
-  gscoped_ptr<uint8_t[]> scratch(new uint8_t[latest_meta_size]);
+  unique_ptr<uint8_t[]> scratch(new uint8_t[latest_meta_size]);
   Slice result(scratch.get(), latest_meta_size);
   ASSERT_OK(meta_file->Read(0, result));
   string data = result.ToString();
@@ -830,7 +872,7 @@ TEST_F(LogBlockManagerTest, TestPreallocationAndTruncation) {
     LOG(INFO) << "Pass " << mode;
     unique_ptr<RWFile> data_file;
     RWFileOptions opts;
-    opts.mode = Env::OPEN_EXISTING;
+    opts.mode = Env::MUST_EXIST;
     ASSERT_OK(env_->NewRWFile(opts, fname, &data_file));
     ASSERT_OK(data_file->PreAllocate(size_after_close, size_after_close, mode));
     uint64_t size_after_preallocate;
@@ -960,7 +1002,6 @@ TEST_F(LogBlockManagerTest, TestParseKernelRelease) {
 // times the startup of the LBM.
 //
 // This is simplistic in several ways compared to a typical workload:
-// - only one data directory (typical servers have several)
 // - minimal number of containers, each of which is entirely full
 //   (typical workloads end up writing to several containers at once
 //    due to concurrent write operations such as multiple MM threads
@@ -969,6 +1010,13 @@ TEST_F(LogBlockManagerTest, TestParseKernelRelease) {
 //
 // However it still can be used to micro-optimize the startup process.
 TEST_F(LogBlockManagerTest, StartupBenchmark) {
+  std::vector<std::string> test_dirs;
+  for (int i = 0; i < FLAGS_startup_benchmark_data_dir_count_for_testing; ++i) {
+    test_dirs.emplace_back(test_dir_ + "/" + std::to_string(i));
+  }
+  // Re-open block manager to place data on multiple data directories.
+  ASSERT_OK(ReopenBlockManager(nullptr, nullptr, test_dirs, /* force= */ true));
+
   // Disable preflushing since this can slow down our writes. In particular,
   // since we write such small blocks in this test, each block will likely
   // begin on the same 4KB page as the prior one we wrote, and due to the
@@ -978,7 +1026,7 @@ TEST_F(LogBlockManagerTest, StartupBenchmark) {
   // See http://yoshinorimatsunobu.blogspot.com/2014/03/how-syncfilerange-really-works.html
   // for details.
   FLAGS_block_manager_preflush_control = "never";
-  const int kNumBlocks = AllowSlowTests() ? 1000000 : 1000;
+  const int kNumBlocks = AllowSlowTests() ? FLAGS_startup_benchmark_block_count_for_testing : 1000;
   // Creates 'kNumBlocks' blocks with minimal data.
   {
     unique_ptr<BlockCreationTransaction> transaction = bm_->NewCreationTransaction();
@@ -993,7 +1041,7 @@ TEST_F(LogBlockManagerTest, StartupBenchmark) {
   }
   for (int i = 0; i < 10; i++) {
     LOG_TIMING(INFO, "reopening block manager") {
-      ASSERT_OK(ReopenBlockManager());
+      ASSERT_OK(ReopenBlockManager(nullptr, nullptr, test_dirs));
     }
   }
 }
@@ -1120,7 +1168,7 @@ TEST_F(LogBlockManagerTest, TestMisalignedBlocksFuzz) {
   NO_FATALS(GetOnlyContainer(&container_name));
 
   // Add a mixture of regular and misaligned blocks to it.
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   int num_misaligned_blocks = 0;
   for (int i = 0; i < kNumBlocks; i++) {
@@ -1238,7 +1286,7 @@ TEST_F(LogBlockManagerTest, TestRepairPreallocateExcessSpace) {
   NO_FATALS(GetContainerNames(&container_names));
 
   // Corrupt one container.
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   ASSERT_OK(corruptor.PreallocateFullContainer());
 
@@ -1283,7 +1331,7 @@ TEST_F(LogBlockManagerTest, TestRepairUnpunchedBlocks) {
   ASSERT_EQ(0, file_size_on_disk);
 
   // Add some "unpunched blocks" to the container.
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   for (int i = 0; i < kNumBlocks; i++) {
     ASSERT_OK(corruptor.AddUnpunchedBlockToFullContainer());
@@ -1324,7 +1372,7 @@ TEST_F(LogBlockManagerTest, TestRepairIncompleteContainer) {
   // Create some incomplete containers. The corruptor will select between
   // several variants of "incompleteness" at random (see
   // LBMCorruptor::CreateIncompleteContainer() for details).
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   for (int i = 0; i < kNumContainers; i++) {
     ASSERT_OK(corruptor.CreateIncompleteContainer());
@@ -1362,7 +1410,7 @@ TEST_F(LogBlockManagerTest, TestDetectMalformedRecords) {
   // Add some malformed records. The corruptor will select between
   // several variants of "malformedness" at random (see
   // LBMCorruptor::AddMalformedRecordToContainer for details).
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   for (int i = 0; i < kNumRecords; i++) {
     ASSERT_OK(corruptor.AddMalformedRecordToContainer());
@@ -1392,7 +1440,7 @@ TEST_F(LogBlockManagerTest, TestDetectMisalignedBlocks) {
   NO_FATALS(GetOnlyContainer(&container_name));
 
   // Add some misaligned blocks.
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   for (int i = 0; i < kNumBlocks; i++) {
     ASSERT_OK(corruptor.AddMisalignedBlockToContainer());
@@ -1431,7 +1479,7 @@ TEST_F(LogBlockManagerTest, TestRepairPartialRecords) {
   ASSERT_EQ(kNumContainers, container_names.size());
 
   // Add some partial records.
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   for (int i = 0; i < kNumRecords; i++) {
     ASSERT_OK(corruptor.AddPartialRecordToContainer());
@@ -1634,7 +1682,7 @@ TEST_F(LogBlockManagerTest, TestOpenWithFailedDirectories) {
 
   // Wire in a callback to fail data directories.
   test_error_manager_->SetErrorNotificationCb(ErrorHandlerType::DISK_ERROR,
-      Bind(&DataDirManager::MarkDataDirFailedByUuid, Unretained(dd_manager_.get())));
+      Bind(&DataDirManager::MarkDirFailedByUuid, Unretained(dd_manager_.get())));
   bm_.reset(CreateBlockManager(nullptr));
 
   // Fail one of the directories, chosen randomly.
@@ -1650,7 +1698,7 @@ TEST_F(LogBlockManagerTest, TestOpenWithFailedDirectories) {
   for (const string& data_dir : report.data_dirs) {
     ASSERT_NE(data_dir, test_dirs[failed_idx]);
   }
-  const set<int>& failed_dirs = dd_manager_->GetFailedDataDirs();
+  const set<int>& failed_dirs = dd_manager_->GetFailedDirs();
   ASSERT_EQ(1, failed_dirs.size());
 
   int uuid_idx;
@@ -1704,7 +1752,7 @@ TEST_F(LogBlockManagerTest, TestLIFOContainerSelection) {
   // Create some other blocks, and finalize each block after write.
   // The first available container in the queue will be reused every time.
   internal::LogBlockContainer* container =
-      bm_->available_containers_by_data_dir_.begin()->second.front();
+      bm_->available_containers_by_data_dir_.begin()->second.front().get();
   for (int i = 0; i < 4; i++) {
     unique_ptr<WritableBlock> writer;
     ASSERT_OK(bm_->CreateBlock(test_block_opts_, &writer));
@@ -1713,7 +1761,7 @@ TEST_F(LogBlockManagerTest, TestLIFOContainerSelection) {
     // After finalizing the written block, the used container will be
     // available again and can be reused for the following created block.
     ASSERT_EQ(container,
-              bm_->available_containers_by_data_dir_.begin()->second.front());
+              bm_->available_containers_by_data_dir_.begin()->second.front().get());
     blocks.emplace_back(std::move(writer));
   }
   for (const auto& block : blocks) {
@@ -1736,6 +1784,432 @@ TEST_F(LogBlockManagerTest, TestAbortBlock) {
   ASSERT_OK(writer->Abort());
   // Ensures the container is available after block's Abort().
   ASSERT_EQ(1, bm_->available_containers_by_data_dir_.begin()->second.size());
+}
+
+TEST_F(LogBlockManagerTest, TestDeleteDeadContainersByDeletionTransaction) {
+  const auto TestProcess = [&] (int block_num) {
+    ASSERT_GT(block_num, 0);
+    MetricRegistry registry;
+    scoped_refptr<MetricEntity> entity = METRIC_ENTITY_server.Instantiate(
+        &registry, Substitute("test-$0", block_num));
+
+    ASSERT_OK(ReopenBlockManager(entity));
+    NO_FATALS(CheckLogMetrics(entity,
+        { {0, &METRIC_log_block_manager_bytes_under_management},
+          {0, &METRIC_log_block_manager_blocks_under_management},
+          {0, &METRIC_log_block_manager_containers},
+          {0, &METRIC_log_block_manager_full_containers} },
+        { {0, &METRIC_log_block_manager_holes_punched},
+          {0, &METRIC_block_manager_total_blocks_deleted},
+          {0, &METRIC_log_block_manager_dead_containers_deleted} }));
+
+    // Create a bunch of blocks -> one container.
+    vector<BlockId> blocks;
+    for (int i = 0; i < block_num - 1; ++i) {
+      unique_ptr<WritableBlock> writer;
+      ASSERT_OK(bm_->CreateBlock(test_block_opts_, &writer));
+      blocks.emplace_back(writer->id());
+      ASSERT_OK(writer->Finalize());
+      ASSERT_OK(writer->Close());
+      NO_FATALS(CheckLogMetrics(entity,
+          { {0, &METRIC_log_block_manager_bytes_under_management},
+            {i + 1, &METRIC_log_block_manager_blocks_under_management},
+            {1, &METRIC_log_block_manager_containers},
+            {0, &METRIC_log_block_manager_full_containers} },
+          { {0, &METRIC_log_block_manager_holes_punched},
+            {0, &METRIC_block_manager_total_blocks_deleted},
+            {0, &METRIC_log_block_manager_dead_containers_deleted} }));
+    }
+    {
+      // The last block makes a full container.
+      FLAGS_log_container_max_size = 1;
+      unique_ptr<WritableBlock> writer;
+      ASSERT_OK(bm_->CreateBlock(test_block_opts_, &writer));
+      blocks.emplace_back(writer->id());
+      ASSERT_OK(writer->Append("a"));
+      ASSERT_OK(writer->Finalize());
+      ASSERT_OK(writer->Close());
+      NO_FATALS(CheckLogMetrics(entity,
+          { {1, &METRIC_log_block_manager_bytes_under_management},
+            {block_num, &METRIC_log_block_manager_blocks_under_management},
+            {1, &METRIC_log_block_manager_containers},
+            {1, &METRIC_log_block_manager_full_containers} },
+          { {0, &METRIC_log_block_manager_holes_punched},
+            {0, &METRIC_block_manager_total_blocks_deleted},
+            {0, &METRIC_log_block_manager_dead_containers_deleted} }));
+    }
+    ASSERT_EQ(block_num, blocks.size());
+
+    // Check the container files.
+    string data_file_name;
+    string metadata_file_name;
+    NO_FATALS(GetOnlyContainerDataFile(&data_file_name));
+    NO_FATALS(GetOnlyContainerMetadataFile(&metadata_file_name));
+
+    // Open the last block for reading.
+    unique_ptr<ReadableBlock> reader;
+    ASSERT_OK(bm_->OpenBlock(blocks[block_num-1], &reader));
+    uint64_t size;
+    ASSERT_OK(reader->Size(&size));
+    ASSERT_EQ(1, size);
+
+    // Delete all of the blocks, which makes a dead container.
+    {
+      vector<BlockId> deleted;
+      shared_ptr<BlockDeletionTransaction> deletion_transaction =
+        this->bm_->NewDeletionTransaction();
+      for (const auto& block : blocks) {
+        deletion_transaction->AddDeletedBlock(block);
+      }
+      ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+      ASSERT_EQ(block_num, deleted.size());
+      NO_FATALS(CheckLogMetrics(entity,
+          { {0, &METRIC_log_block_manager_bytes_under_management},
+            {0, &METRIC_log_block_manager_blocks_under_management},
+            {1, &METRIC_log_block_manager_containers},
+            {1, &METRIC_log_block_manager_full_containers} },
+          { {0, &METRIC_log_block_manager_holes_punched},
+            {block_num, &METRIC_block_manager_total_blocks_deleted},
+            {0, &METRIC_log_block_manager_dead_containers_deleted} }));
+    }
+    // The container is still alive, because there is a opened block previously.
+    NO_FATALS(CheckLogMetrics(entity,
+        { {0, &METRIC_log_block_manager_bytes_under_management},
+          {0, &METRIC_log_block_manager_blocks_under_management},
+          {1, &METRIC_log_block_manager_containers},
+          {1, &METRIC_log_block_manager_full_containers} },
+        { {0, &METRIC_log_block_manager_holes_punched},
+          {block_num, &METRIC_block_manager_total_blocks_deleted},
+          {0, &METRIC_log_block_manager_dead_containers_deleted} }));
+
+    // After the reader is closed, the container is actually deleted.
+    reader->Close();
+    NO_FATALS(CheckLogMetrics(entity,
+        { {0, &METRIC_log_block_manager_bytes_under_management},
+          {0, &METRIC_log_block_manager_blocks_under_management},
+          {0, &METRIC_log_block_manager_containers},
+          {0, &METRIC_log_block_manager_full_containers} },
+        { {0, &METRIC_log_block_manager_holes_punched},
+          {block_num, &METRIC_block_manager_total_blocks_deleted},
+          {1, &METRIC_log_block_manager_dead_containers_deleted} }));
+
+    // The container files should have been deleted.
+    ASSERT_FALSE(env_->FileExists(data_file_name));
+    ASSERT_FALSE(env_->FileExists(metadata_file_name));
+  };
+
+  for (int i = 1; i < 4; ++i) {
+    NO_FATALS(TestProcess(i));
+  }
+}
+
+// Test for KUDU-2665 to ensure that once the container is full and has no live
+// blocks but with a reference by WritableBlock, it will not be deleted.
+TEST_F(LogBlockManagerTest, TestDoNotDeleteFakeDeadContainer) {
+  // Lower the max container size.
+  FLAGS_log_container_max_size = 64 * 1024;
+
+  const auto Process = [&] (bool close_block) {
+    // Create a bunch of blocks on the same container.
+    vector<BlockId> blocks;
+    for (int i = 0; i < 10; ++i) {
+      unique_ptr<BlockCreationTransaction> transaction = bm_->NewCreationTransaction();
+      unique_ptr<WritableBlock> writer;
+      ASSERT_OK(bm_->CreateBlock(test_block_opts_, &writer));
+      blocks.emplace_back(writer->id());
+      ASSERT_OK(writer->Append("a"));
+      ASSERT_OK(writer->Finalize());
+      transaction->AddCreatedBlock(std::move(writer));
+      ASSERT_OK(transaction->CommitCreatedBlocks());
+    }
+
+    // Create a special block.
+    unique_ptr<WritableBlock> writer;
+    ASSERT_OK(bm_->CreateBlock(test_block_opts_, &writer));
+    BlockId block_id = writer->id();
+    unique_ptr<uint8_t[]> data(new uint8_t[FLAGS_log_container_max_size]);
+    ASSERT_OK(writer->Append({ data.get(), FLAGS_log_container_max_size }));
+    ASSERT_OK(writer->Finalize());
+    // Do not close and reset the writer.
+    // Now the container is full and has no live blocks.
+
+    // Delete the bunch of blocks.
+    {
+      vector<BlockId> deleted;
+      shared_ptr<BlockDeletionTransaction> transaction = bm_->NewDeletionTransaction();
+      for (const auto& e : blocks) {
+        transaction->AddDeletedBlock(e);
+      }
+      ASSERT_OK(transaction->CommitDeletedBlocks(&deleted));
+      transaction.reset();
+      for (const auto& data_dir : dd_manager_->dirs()) {
+        data_dir->WaitOnClosures();
+      }
+    }
+
+    // Close and reset the writer.
+    // It's going to test Abort() when 'close_block' is false.
+    if (close_block) {
+      ASSERT_OK(writer->Close());
+    }
+    writer.reset();
+
+    // Open the special block after restart.
+    ASSERT_OK(ReopenBlockManager());
+    unique_ptr<ReadableBlock> block;
+    if (close_block) {
+      ASSERT_OK(bm_->OpenBlock(block_id, &block));
+    } else {
+      ASSERT_TRUE(bm_->OpenBlock(block_id, &block).IsNotFound());
+    }
+  };
+
+  Process(true);
+  Process(false);
+}
+
+TEST_F(LogBlockManagerTest, TestHalfPresentContainer) {
+  BlockId block_id;
+  string data_file_name;
+  string metadata_file_name;
+  MetricRegistry registry;
+  scoped_refptr<MetricEntity> entity = METRIC_ENTITY_server.Instantiate(&registry, "test");
+
+  const auto CreateContainer = [&] (bool create_block = false) {
+    ASSERT_OK(ReopenBlockManager(entity));
+    unique_ptr<WritableBlock> writer;
+    ASSERT_OK(bm_->CreateBlock(test_block_opts_, &writer));
+    block_id = writer->id();
+    if (create_block) {
+      ASSERT_OK(writer->Append("a"));
+    }
+    ASSERT_OK(writer->Finalize());
+    ASSERT_OK(writer->Close());
+    NO_FATALS(GetOnlyContainerDataFile(&data_file_name));
+    NO_FATALS(GetOnlyContainerMetadataFile(&metadata_file_name));
+  };
+
+  const auto CreateMetadataFile = [&] () {
+    unique_ptr<WritableFile> metadata_file_writer;
+    ASSERT_OK(env_->NewWritableFile(metadata_file_name, &metadata_file_writer));
+    ASSERT_OK(metadata_file_writer->Append(Slice("a")));
+    metadata_file_writer->Close();
+  };
+
+  const auto CreateDataFile = [&] () {
+    unique_ptr<WritableFile> data_file_writer;
+    ASSERT_OK(env_->NewWritableFile(data_file_name, &data_file_writer));
+    data_file_writer->Close();
+  };
+
+  const auto DeleteBlock = [&] () {
+    vector<BlockId> deleted;
+    shared_ptr<BlockDeletionTransaction> transaction = bm_->NewDeletionTransaction();
+    transaction->AddDeletedBlock(block_id);
+    ASSERT_OK(transaction->CommitDeletedBlocks(&deleted));
+    transaction.reset();
+    for (const auto& data_dir : dd_manager_->dirs()) {
+      data_dir->WaitOnClosures();
+    }
+  };
+
+  const auto CheckOK = [&] () {
+    FsReport report;
+    ASSERT_OK(ReopenBlockManager(entity, &report));
+    ASSERT_FALSE(report.HasFatalErrors());
+    NO_FATALS(AssertEmptyReport(report));
+  };
+
+  const auto CheckFailed = [&] (const Status& expect) {
+    Status s = ReopenBlockManager(entity);
+    ASSERT_EQ(s.CodeAsString(), expect.CodeAsString());
+  };
+
+  const auto CheckRepaired = [&] () {
+    FsReport report;
+    ASSERT_OK(ReopenBlockManager(entity, &report));
+    ASSERT_FALSE(report.HasFatalErrors());
+    ASSERT_EQ(1, report.incomplete_container_check->entries.size());
+    report.incomplete_container_check->entries.clear();
+    NO_FATALS(AssertEmptyReport(report));
+  };
+
+  // Case1: the metadata file has gone missing and
+  //        the size of the existing data file is 0.
+  {
+    // Create a container.
+    NO_FATALS(CreateContainer());
+
+    // Delete the metadata file.
+    ASSERT_OK(env_->DeleteFile(metadata_file_name));
+
+    // The container has been repaired.
+    NO_FATALS(CheckRepaired());
+  }
+
+  // Case2: the metadata file has gone missing and
+  //        the size of the existing data file is >0.
+  {
+    // Create a container.
+    NO_FATALS(CreateContainer(true));
+
+    // Delete the metadata file.
+    ASSERT_OK(env_->DeleteFile(metadata_file_name));
+
+    // The metadata file has gone missing.
+    NO_FATALS(CheckFailed(Status::NotFound("")));
+
+    // Delete the data file to keep path clean.
+    ASSERT_OK(env_->DeleteFile(data_file_name));
+  }
+
+  // Case3: the size of the existing metadata file is <MIN and
+  //        the data file has gone missing.
+  {
+    // Create a container.
+    NO_FATALS(CreateContainer());
+
+    // Delete the data file&metadata file, and keep the path.
+    ASSERT_OK(env_->DeleteFile(data_file_name));
+    ASSERT_OK(env_->DeleteFile(metadata_file_name));
+
+    // Create a metadata file whose size is <MIN.
+    NO_FATALS(CreateMetadataFile());
+
+    // The container has been repaired.
+    NO_FATALS(CheckRepaired());
+  }
+
+  // Case4: the size of the existing metadata file is <MIN and
+  //        the size of the existing data file is 0.
+  {
+    // Create a container.
+    NO_FATALS(CreateContainer());
+
+    // Delete the metadata file.
+    ASSERT_OK(env_->DeleteFile(metadata_file_name));
+
+    // Create a metadata file whose size is <MIN.
+    NO_FATALS(CreateMetadataFile());
+
+    // The container has been repaired.
+    NO_FATALS(CheckRepaired());
+  }
+
+  // Case5: the size of the existing metadata file is <MIN and
+  //        the size of the existing data file is >0.
+  {
+    // Create a container.
+    NO_FATALS(CreateContainer(true));
+
+    // Delete the metadata file.
+    ASSERT_OK(env_->DeleteFile(metadata_file_name));
+
+    // Create a metadata file whose size is <MIN.
+    NO_FATALS(CreateMetadataFile());
+
+    // Check passed, but open metadata file failed at last.
+    NO_FATALS(CheckFailed(Status::Incomplete("")));
+
+    // Delete the data file and metadata file to keep path clean.
+    ASSERT_OK(env_->DeleteFile(data_file_name));
+    ASSERT_OK(env_->DeleteFile(metadata_file_name));
+  }
+
+  // Case6: the existing metadata file has no live blocks and
+  //        the data file has gone missing.
+  {
+    NO_FATALS(CreateContainer(true));
+
+    // Delete the only block.
+    NO_FATALS(DeleteBlock());
+
+    // Delete the data file.
+    ASSERT_OK(env_->DeleteFile(data_file_name));
+
+    // The container has been repaired.
+    NO_FATALS(CheckRepaired());
+  }
+
+  // Case7: the existing metadata file has no live blocks and
+  //        the size of the existing data file is 0.
+  {
+    NO_FATALS(CreateContainer(true));
+
+    // Delete the only block.
+    NO_FATALS(DeleteBlock());
+
+    // Delete the data file.
+    ASSERT_OK(env_->DeleteFile(data_file_name));
+
+    // Create an empty data file.
+    NO_FATALS(CreateDataFile());
+
+    // Check passed, but verify records failed at last(malformed records).
+    NO_FATALS(CheckFailed(Status::Corruption("")));
+
+    // Delete the data file and metadata file to keep path clean.
+    ASSERT_OK(env_->DeleteFile(data_file_name));
+    ASSERT_OK(env_->DeleteFile(metadata_file_name));
+  }
+
+  // Case8: the existing metadata file has no live blocks and
+  //        the size of the existing data file is >0.
+  {
+    NO_FATALS(CreateContainer(true));
+
+    // Delete the only block.
+    NO_FATALS(DeleteBlock());
+
+    // The container is ok.
+    NO_FATALS(CheckOK());
+  }
+
+  // Case9: the existing metadata file has live blocks and
+  //        the data file has gone missing.
+  {
+    // Create a container.
+    NO_FATALS(CreateContainer(true));
+
+    // Delete the data file.
+    ASSERT_OK(env_->DeleteFile(data_file_name));
+
+    // The data file has gone missing.
+    NO_FATALS(CheckFailed(Status::NotFound("")));
+
+    // Delete the metadata file to keep path clean.
+    ASSERT_OK(env_->DeleteFile(metadata_file_name));
+  }
+
+  // Case10: the existing metadata file has live blocks and
+  //         the size of the existing data file is 0.
+  {
+    // Create a container.
+    NO_FATALS(CreateContainer(true));
+
+    // Delete the data file.
+    ASSERT_OK(env_->DeleteFile(data_file_name));
+
+    // Create an empty data file.
+    NO_FATALS(CreateDataFile());
+
+    // Check passed, but verify records failed at last(malformed records).
+    NO_FATALS(CheckFailed(Status::Corruption("")));
+
+    // Delete the data file and metadata file to keep path clean.
+    ASSERT_OK(env_->DeleteFile(data_file_name));
+    ASSERT_OK(env_->DeleteFile(metadata_file_name));
+  }
+
+  // Case11: the existing metadata file has live blocks and
+  //         the size of the existing data file is >0.
+  {
+    // Create a container.
+    NO_FATALS(CreateContainer(true));
+
+    // The container is ok.
+    NO_FATALS(CheckOK());
+  }
 }
 
 } // namespace fs

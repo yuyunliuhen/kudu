@@ -57,7 +57,9 @@ class TabletCopyTest : public TabletServerTestBase {
   }
 
   virtual void TearDown() OVERRIDE {
-    ASSERT_OK(tablet_replica_->log_anchor_registry()->Unregister(&anchor_));
+    if (tablet_replica_) {
+      ASSERT_OK(tablet_replica_->log_anchor_registry()->Unregister(&anchor_));
+    }
     NO_FATALS(TabletServerTestBase::TearDown());
   }
 
@@ -108,13 +110,13 @@ class TabletCopyTest : public TabletServerTestBase {
 
   // Generate the test data for the tablet and do the flushing we assume will be
   // done in the unit tests for tablet copy.
-  void GenerateTestData() {
+  virtual void GenerateTestData() {
     const int kIncr = 50;
     LOG_TIMING(INFO, "Loading test data") {
       for (int row_id = 0; row_id < kNumLogRolls * kIncr; row_id += kIncr) {
         InsertTestRowsRemote(row_id, kIncr);
         ASSERT_OK(tablet_replica_->tablet()->Flush());
-        ASSERT_OK(tablet_replica_->log()->AllocateSegmentAndRollOver());
+        ASSERT_OK(tablet_replica_->log()->AllocateSegmentAndRollOverForTests());
       }
     }
   }

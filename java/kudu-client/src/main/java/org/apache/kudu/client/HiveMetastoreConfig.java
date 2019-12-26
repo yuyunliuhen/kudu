@@ -17,6 +17,8 @@
 
 package org.apache.kudu.client;
 
+import javax.annotation.CheckForNull;
+
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
 
@@ -25,7 +27,7 @@ import org.apache.yetus.audience.InterfaceStability;
  */
 @InterfaceAudience.LimitedPrivate("Impala")
 @InterfaceStability.Unstable
-class HiveMetastoreConfig {
+public class HiveMetastoreConfig {
   private final String hiveMetastoreUris;
   private final boolean hiveMetastoreSaslEnabled;
   private final String hiveMetastoreUuid;
@@ -46,6 +48,7 @@ class HiveMetastoreConfig {
     return hiveMetastoreSaslEnabled;
   }
 
+  @CheckForNull
   public String getHiveMetastoreUuid() {
     return hiveMetastoreUuid;
   }

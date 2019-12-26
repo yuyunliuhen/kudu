@@ -31,7 +31,6 @@
 #include <gtest/gtest_prod.h>
 
 #include "kudu/clock/clock.h"
-#include "kudu/common/common.pb.h"
 #include "kudu/common/iterator.h"
 #include "kudu/common/schema.h"
 #include "kudu/fs/io_context.h"
@@ -54,7 +53,7 @@
 #include "kudu/util/status.h"
 
 namespace kudu {
-
+class AlterTableTest;
 class ConstContiguousRow;
 class EncodedKey;
 class KeyRange;
@@ -67,6 +66,7 @@ class RowBlock;
 class ScanSpec;
 class Throttler;
 class Timestamp;
+struct IterWithBounds;
 struct IteratorStats;
 
 namespace log {
@@ -193,14 +193,22 @@ class Tablet {
   // Create a new row iterator which yields the rows as of the current MVCC
   // state of this tablet.
   // The returned iterator is not initialized.
-  Status NewRowIterator(const Schema &projection,
-                        gscoped_ptr<RowwiseIterator> *iter) const;
+  Status NewRowIterator(const Schema& projection,
+                        std::unique_ptr<RowwiseIterator>* iter) const;
 
-  // Create a new row iterator for some historical snapshot.
-  Status NewRowIterator(const Schema &projection,
-                        const MvccSnapshot &snap,
-                        const OrderMode order,
-                        gscoped_ptr<RowwiseIterator> *iter) const;
+  // Create a new row iterator using specific iterator options.
+  //
+  // 'opts' contains the options desired from the iterator.
+  //
+  // Note: the Schema pointed to by the 'projection' field of the 'opts' struct
+  // will be copied, so that pointer only needs to remain valid during the call
+  // to NewRowIterator() and not after that.
+  // Similarly, the 'io_context' field of the 'opts' struct will be ignored and
+  // overwritten in the copy of the 'opts' struct used by the returned iterator
+  // because the iterator constructs and holds the relevant instance of that
+  // object as a member variable.
+  Status NewRowIterator(RowIteratorOptions opts,
+                        std::unique_ptr<RowwiseIterator>* iter) const;
 
   // Flush the current MemRowSet for this tablet to disk. This swaps
   // in a new (initially empty) MemRowSet in its place.
@@ -339,6 +347,8 @@ class Tablet {
   // memrowset in the current implementation.
   Status CountRows(uint64_t *count) const;
 
+  // Count the number of live rows in this tablet.
+  Status CountLiveRows(uint64_t* count) const;
 
   // Verbosely dump this entire tablet to the logs. This is only
   // really useful when debugging unit tests failures where the tablet
@@ -378,7 +388,8 @@ class Tablet {
   //
   // Only used in tests.
   Status DoMajorDeltaCompaction(const std::vector<ColumnId>& col_ids,
-                                const std::shared_ptr<RowSet>& input_rs);
+                                const std::shared_ptr<RowSet>& input_rs,
+                                const fs::IOContext* io_context = nullptr);
 
   // Calculates the ancient history mark and returns true iff tablet history GC
   // is enabled, which requires the use of a HybridClock.
@@ -448,6 +459,7 @@ class Tablet {
                      std::vector<KeyRange>* ranges);
 
  private:
+  friend class kudu::AlterTableTest;
   friend class Iterator;
   friend class TabletReplicaTest;
   FRIEND_TEST(TestTablet, TestGetReplaySizeForIndex);
@@ -514,20 +526,17 @@ class Tablet {
   Status FlushUnlocked();
 
   // Validate the contents of 'op' and return a bad Status if it is invalid.
-  Status ValidateOp(const RowOp& op) const;
+  static Status ValidateOp(const RowOp& op);
 
   // Validate 'op' as in 'ValidateOp()' above. If it is invalid, marks the op as failed
-  // and returns false. If valid, marks the op as validated and returns true.
-  bool ValidateOpOrMarkFailed(RowOp* op) const;
+  // and returns false. If valid, marks the op as valid and returns true.
+  static bool ValidateOpOrMarkFailed(RowOp* op);
 
-  // Validate the given insert/upsert operation. In particular, checks that the size
-  // of any cells is not too large given the configured maximum on the server, and
-  // that the encoded key is not too large.
-  Status ValidateInsertOrUpsertUnlocked(const RowOp& op) const;
+  // Validate the given insert/upsert operation.
+  static Status ValidateInsertOrUpsertUnlocked(const RowOp& op);
 
-  // Validate the given update/delete operation. In particular, validates that no
-  // cell is being updated to an invalid (too large) value.
-  Status ValidateMutateUnlocked(const RowOp& op) const;
+  // Validate the given update/delete operation.
+  static Status ValidateMutateUnlocked(const RowOp& op);
 
   // Perform an INSERT or UPSERT operation, assuming that the transaction is already in
   // prepared state. This state ensures that:
@@ -571,13 +580,11 @@ class Tablet {
   // of creation, and potentially newer data.
   //
   // The returned iterators are not Init()ed.
-  // 'projection' must remain valid and unchanged for the lifetime of the returned iterators.
-  Status CaptureConsistentIterators(const Schema* projection,
-                                    const MvccSnapshot& snap,
+  // The pointer fields of 'opts' must remain valid and unchanged for the
+  // lifetime of the returned iterators.
+  Status CaptureConsistentIterators(const RowIteratorOptions& opts,
                                     const ScanSpec* spec,
-                                    OrderMode order,
-                                    const fs::IOContext* io_context,
-                                    std::vector<std::shared_ptr<RowwiseIterator> >* iters) const;
+                                    std::vector<IterWithBounds>* iters) const;
 
   Status PickRowSetsToCompact(RowSetsInCompaction *picked,
                               CompactFlags flags) const;
@@ -591,6 +598,10 @@ class Tablet {
   // metadata and flush it.
   Status HandleEmptyCompactionOrFlush(const RowSetVector& rowsets,
                                       int mrs_being_flushed);
+
+  // Updates the average rowset height metric. Acquires the tablet's
+  // compact_select_lock_.
+  void UpdateAverageRowsetHeight();
 
   Status FlushMetadata(const RowSetVector& to_remove,
                        const RowSetMetadataVector& to_add,
@@ -612,6 +623,11 @@ class Tablet {
                                  const RowSetVector &to_add);
 
   void GetComponents(scoped_refptr<TabletComponents>* comps) const {
+    shared_lock<rw_spinlock> l(component_lock_);
+    *comps = CHECK_NOTNULL(components_.get());
+  }
+
+  void GetComponentsOrNull(scoped_refptr<TabletComponents>* comps) const {
     shared_lock<rw_spinlock> l(component_lock_);
     *comps = components_;
   }
@@ -778,9 +794,7 @@ class Tablet::Iterator : public RowwiseIterator {
 
   std::string ToString() const OVERRIDE;
 
-  const Schema &schema() const OVERRIDE {
-    return projection_;
-  }
+  const Schema &schema() const OVERRIDE;
 
   virtual void GetIteratorStats(std::vector<IteratorStats>* stats) const OVERRIDE;
 
@@ -789,15 +803,23 @@ class Tablet::Iterator : public RowwiseIterator {
 
   DISALLOW_COPY_AND_ASSIGN(Iterator);
 
-  Iterator(const Tablet* tablet, const Schema& projection, MvccSnapshot snap,
-           OrderMode order, fs::IOContext io_context);
+  // Instantiate iterator with given projection and options.
+  //
+  // Note: the Schema pointed to by the 'projection' field of the 'opts' struct
+  // will be copied into projection_, so that pointer only needs to remain
+  // valid during the call to the constructor and not after that.
+  // Similarly, the 'io_context' field of the 'opts' struct will be ignored and
+  // overwritten in the copy of the 'opts' struct used by this class because
+  // this class constructs and holds the relevant instance of that object as a
+  // member variable.
+  Iterator(const Tablet* tablet,
+           RowIteratorOptions opts);
 
-  const Tablet *tablet_;
+  const Tablet* tablet_;
+  fs::IOContext io_context_;
   Schema projection_;
-  const MvccSnapshot snap_;
-  const OrderMode order_;
-  const fs::IOContext io_context_;
-  gscoped_ptr<RowwiseIterator> iter_;
+  RowIteratorOptions opts_;
+  std::unique_ptr<RowwiseIterator> iter_;
 };
 
 // Structure which represents the components of the tablet's storage.

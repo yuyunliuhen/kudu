@@ -21,7 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executor;
 
-import com.stumbleupon.async.Callback;
+import com.google.common.base.Preconditions;
 import com.stumbleupon.async.Deferred;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
@@ -82,6 +82,15 @@ public class KuduClient implements AutoCloseable {
     return asyncClient.hasLastPropagatedTimestamp();
   }
 
+  /**
+   * Returns a string representation of this client's location. If this
+   * client was not assigned a location, returns the empty string.
+   *
+   * @return a string representation of this client's location
+   */
+  public String getLocationString() {
+    return asyncClient.getLocationString();
+  }
 
   /**
    * Returns the Hive Metastore configuration of the cluster.
@@ -166,7 +175,8 @@ public class KuduClient implements AutoCloseable {
    */
   public boolean isAlterTableDone(String name) throws KuduException {
     TableIdentifierPB.Builder table = TableIdentifierPB.newBuilder().setTableName(name);
-    Deferred<AlterTableResponse> d = asyncClient.getDelayedIsAlterTableDoneDeferred(table, null, null);
+    Deferred<AlterTableResponse> d =
+        asyncClient.getDelayedIsAlterTableDoneDeferred(table, null, null);
     try {
       joinAndHandleException(d);
     } catch (KuduException e) {
@@ -210,6 +220,17 @@ public class KuduClient implements AutoCloseable {
   }
 
   /**
+   * Get table's statistics from master.
+   * @param name the table's name
+   * @return the statistics of table
+   * @throws KuduException if anything went wrong
+   */
+  public KuduTableStatistics getTableStatistics(String name) throws KuduException {
+    Deferred<KuduTableStatistics> d = asyncClient.getTableStatistics(name);
+    return joinAndHandleException(d);
+  }
+
+  /**
    * Test if a table exists.
    * @param name a non-null table name
    * @return true if the table exists, else false
@@ -217,6 +238,18 @@ public class KuduClient implements AutoCloseable {
    */
   public boolean tableExists(String name) throws KuduException {
     Deferred<Boolean> d = asyncClient.tableExists(name);
+    return joinAndHandleException(d);
+  }
+
+  /**
+   * Open the table with the given id.
+   *
+   * @param id the id of the table to open
+   * @return a KuduTable if the table exists
+   * @throws KuduException if anything went wrong
+   */
+  KuduTable openTableById(final String id) throws KuduException {
+    Deferred<KuduTable> d = asyncClient.openTableById(id);
     return joinAndHandleException(d);
   }
 
@@ -357,6 +390,33 @@ public class KuduClient implements AutoCloseable {
     return asyncClient.getMasterAddressesAsString();
   }
 
+  /**
+   * @return a HostAndPort describing the current leader master
+   * @throws KuduException if a leader master could not be found in time
+   */
+  @InterfaceAudience.LimitedPrivate("Test")
+  public HostAndPort findLeaderMasterServer() throws KuduException {
+    // Consult the cache to determine the current leader master.
+    //
+    // If one isn't found, issue an RPC that retries until the leader master
+    // is discovered. We don't need the RPC's results; it's just a simple way to
+    // wait until a leader master is elected.
+    TableLocationsCache.Entry entry = asyncClient.getTableLocationEntry(
+        AsyncKuduClient.MASTER_TABLE_NAME_PLACEHOLDER, null);
+    if (entry == null) {
+      // If there's no leader master, this will time out and throw an exception.
+      listTabletServers();
+
+      entry = asyncClient.getTableLocationEntry(
+          AsyncKuduClient.MASTER_TABLE_NAME_PLACEHOLDER, null);
+    }
+    Preconditions.checkNotNull(entry);
+    Preconditions.checkState(!entry.isNonCoveredRange());
+    ServerInfo info = entry.getTablet().getLeaderServerInfo();
+    Preconditions.checkNotNull(info);
+    return info.getHostAndPort();
+  }
+
   // Helper method to handle joining and transforming the Exception we receive.
   static <R> R joinAndHandleException(Deferred<R> deferred) throws KuduException {
     try {
@@ -431,15 +491,14 @@ public class KuduClient implements AutoCloseable {
     }
 
     /**
-     * Sets the default timeout to use when waiting on data from a socket.
-     * Optional.
-     * If not provided, defaults to 10s.
-     * A value of 0 disables the timeout.
+     * Socket read timeouts are no longer used in the Java client and have no effect.
+     * Setting this has no effect.
      * @param timeoutMs a timeout in milliseconds
      * @return this builder
+     * @deprecated socket read timeouts are no longer used
      */
-    public KuduClientBuilder defaultSocketReadTimeoutMs(long timeoutMs) {
-      clientBuilder.defaultSocketReadTimeoutMs(timeoutMs);
+    @Deprecated public KuduClientBuilder defaultSocketReadTimeoutMs(long timeoutMs) {
+      LOG.info("defaultSocketReadTimeoutMs is deprecated");
       return this;
     }
 

@@ -14,38 +14,47 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
 
 import java.util.List;
 
+import com.google.common.base.Ticker;
+import com.google.common.collect.ImmutableList;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
 import org.mockito.Mockito;
 
-import com.google.common.base.Ticker;
-import com.google.common.collect.ImmutableList;
+import org.apache.kudu.test.junit.RetryRule;
 
 public class TestTableLocationsCache {
   private TableLocationsCache cache = new TableLocationsCache();
+
+  @Rule
+  public RetryRule retryRule = new RetryRule();
 
   /**
    * Prevent time from advancing during the test by mocking the time.
    */
   @Before
+  @SuppressWarnings("unstable")
   public void mockTime() {
     TableLocationsCache.ticker = Mockito.mock(Ticker.class);
   }
+
   @After
+  @SuppressWarnings("unstable")
   public void unmockTime() {
     TableLocationsCache.ticker = Ticker.systemTicker();
   }
 
   @Test
   public void testToString() {
-    RemoteTablet tablet = TestRemoteTablet.getTablet(0, 1);
+    RemoteTablet tablet = TestRemoteTablet.getTablet(0, 1, -1);
     List<RemoteTablet> tablets = ImmutableList.of(tablet);
     cache.cacheTabletLocations(tablets,
         tablet.getPartition().getPartitionKeyStart(),

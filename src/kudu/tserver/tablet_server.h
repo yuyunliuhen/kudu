@@ -85,9 +85,13 @@ class TabletServer : public kserver::KuduServer {
  private:
   friend class TabletServerTestBase;
 
-  Status ValidateMasterAddressResolution() const;
+  enum TabletServerState {
+    kStopped,
+    kInitialized,
+    kRunning
+  };
 
-  bool initted_;
+  TabletServerState state_;
 
   // If true, all heartbeats will be seen as failed.
   Atomic32 fail_heartbeats_for_tests_;

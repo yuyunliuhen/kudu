@@ -119,7 +119,7 @@ class DeltaMemStore : public DeltaStore,
   // returns Status::NotFound if the mutations within this delta store
   // cannot include the snapshot.
   virtual Status NewDeltaIterator(const RowIteratorOptions& opts,
-                                  DeltaIterator** iterator) const OVERRIDE;
+                                  std::unique_ptr<DeltaIterator>* iterator) const OVERRIDE;
 
   virtual Status CheckRowDeleted(rowid_t row_idx, const fs::IOContext* io_context,
                                  bool* deleted) const OVERRIDE;
@@ -146,6 +146,9 @@ class DeltaMemStore : public DeltaStore,
   virtual const DeltaStats& delta_stats() const OVERRIDE {
     return delta_stats_;
   }
+
+  // Returns the number of deleted rows in this DMS.
+  int64_t deleted_row_count() const;
 
  private:
   friend class DMSIterator;
@@ -181,6 +184,9 @@ class DeltaMemStore : public DeltaStore,
   // number, and is only used in the case that such a collision occurs.
   AtomicInt<Atomic32> disambiguator_sequence_number_;
 
+  // Number of deleted rows in this DMS.
+  AtomicInt<int64_t> deleted_row_count_;
+
   DISALLOW_COPY_AND_ASSIGN(DeltaMemStore);
 };
 
@@ -206,7 +212,7 @@ class DMSIterator : public DeltaIterator {
 
   Status ApplyDeletes(SelectionVector* sel_vec) override;
 
-  Status SelectUpdates(SelectionVector* sel_vec) override;
+  Status SelectDeltas(SelectedDeltas* deltas) override;
 
   Status CollectMutations(std::vector<Mutation*>* dst, Arena* arena) override;
 

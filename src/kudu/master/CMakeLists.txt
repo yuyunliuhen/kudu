@@ -33,8 +33,10 @@ ADD_EXPORTABLE_LIBRARY(master_proto
   NONLINK_DEPS ${MASTER_KRPC_TGTS})
 
 set(MASTER_SRCS
+  authz_provider.cc
   catalog_manager.cc
   hms_notification_log_listener.cc
+  location_cache.cc
   master.cc
   master_cert_authority.cc
   master_options.cc
@@ -43,7 +45,11 @@ set(MASTER_SRCS
   mini_master.cc
   placement_policy.cc
   sentry_authz_provider.cc
+  sentry_client_metrics.cc
+  sentry_privileges_cache_metrics.cc
+  sentry_privileges_fetcher.cc
   sys_catalog.cc
+  table_metrics.cc
   ts_descriptor.cc
   ts_manager.cc)
 
@@ -64,8 +70,7 @@ target_link_libraries(master
   server_process
   tablet
   token_proto
-  tserver
-  tserver_service_proto)
+  tserver)
 
 # Tests
 SET_KUDU_TEST_LINK_LIBS(
@@ -79,17 +84,30 @@ SET_KUDU_TEST_LINK_LIBS(
 
 ADD_KUDU_TEST(catalog_manager-test)
 ADD_KUDU_TEST(hms_notification_log_listener-test)
-ADD_KUDU_TEST(master-test RESOURCE_LOCK "master-web-port")
+ADD_KUDU_TEST(location_cache-test DATA_FILES ../scripts/first_argument.sh)
+ADD_KUDU_TEST(master-test RESOURCE_LOCK "master-web-port"
+                          DATA_FILES ../scripts/first_argument.sh)
 ADD_KUDU_TEST(mini_master-test RESOURCE_LOCK "master-web-port")
 ADD_KUDU_TEST(placement_policy-test)
-ADD_KUDU_TEST(sentry_authz_provider-test)
+ADD_KUDU_TEST(sentry_authz_provider-test NUM_SHARDS 8)
 ADD_KUDU_TEST(sys_catalog-test RESOURCE_LOCK "master-web-port")
 ADD_KUDU_TEST(ts_descriptor-test DATA_FILES ../scripts/first_argument.sh)
+ADD_KUDU_TEST(ts_state-test)
 
-# Actual master executable
+#########################################
+# kudu-master
+#########################################
+
 add_executable(kudu-master master_main.cc)
 target_link_libraries(kudu-master
   ${SANITIZER_OPTIONS_OVERRIDE}
   ${KRB5_REALM_OVERRIDE}
   master
   ${KUDU_BASE_LIBS})
+
+option(KUDU_MASTER_INSTALL "Whether to install the Kudu Master executable" ON)
+if(KUDU_MASTER_INSTALL)
+  install(TARGETS kudu-master RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR})
+else()
+  message(STATUS "Skipping install rule for the Kudu Master executable")
+endif()

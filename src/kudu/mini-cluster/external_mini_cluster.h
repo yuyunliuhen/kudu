@@ -29,7 +29,6 @@
 
 #include <boost/optional/optional.hpp>
 #include <glog/logging.h>
-#include <gtest/gtest_prod.h>
 
 #include "kudu/client/shared_ptr.h"
 #include "kudu/common/common.pb.h"
@@ -54,6 +53,12 @@ class KuduClient;
 class KuduClientBuilder;
 } // namespace client
 
+#if !defined(NO_CHRONY)
+namespace clock {
+class MiniChronyd;
+} // namespace clock
+#endif
+
 namespace hms {
 class MiniHms;
 } // namespace hms
@@ -65,6 +70,10 @@ class MasterServiceProxy;
 namespace rpc {
 class Messenger;
 } // namespace rpc
+
+namespace sentry {
+class MiniSentry;
+} // namespace sentry
 
 namespace server {
 class ServerStatusPB;
@@ -106,7 +115,7 @@ struct ExternalMiniClusterOptions {
   // Default: "", which uses the current value of FLAGS_block_manager.
   std::string block_manager_type;
 
-  MiniCluster::BindMode bind_mode;
+  BindMode bind_mode;
 
   // The path where the kudu daemons should be run from.
   //
@@ -151,6 +160,11 @@ struct ExternalMiniClusterOptions {
   // Default: HmsMode::NONE.
   HmsMode hms_mode;
 
+  // If true, set up a Sentry service as part of this ExternalMiniCluster.
+  //
+  // Default: false.
+  bool enable_sentry;
+
   // If true, sends logging output to stderr instead of a log file.
   //
   // Default: true.
@@ -159,7 +173,7 @@ struct ExternalMiniClusterOptions {
   // Amount of time that may elapse between the creation of a daemon process
   // and the process writing out its info file.
   //
-  // Default: 30s.
+  // Default: 70s (just a bit more than --ntp_initial_wait_secs).
   MonoDelta start_process_timeout;
 
   // Parameter for the cluster's RPC messenger: timeout interval after which
@@ -174,6 +188,17 @@ struct ExternalMiniClusterOptions {
   //
   // Default: empty
   LocationInfo location_info;
+
+#if !defined(NO_CHRONY)
+  // Number of NTP servers to start as part of the cluster. The NTP servers are
+  // used as true time references for the NTP client built into masters and
+  // tablet servers. Specifying a value greater than 0 automatically enables
+  // the built-in NTP client, i.e. switches the clock source from the system
+  // wallclock to the wallclock tracked by the built-in NTP client.
+  //
+  // Default: 0
+  int num_ntp_servers;
+#endif // #if !defined(NO_CHRONY) ...
 };
 
 // A mini-cluster made up of subprocesses running each of the daemons
@@ -203,6 +228,12 @@ class ExternalMiniCluster : public MiniCluster {
   // Requires that the master is already running.
   Status AddTabletServer();
 
+#if !defined(NO_CHRONY)
+  // Add a new NTP server to the cluster. The new NTP server is started upon
+  // adding, bind to the address and port specified by 'addr'.
+  Status AddNtpServer(const Sockaddr& addr);
+#endif
+
   // Currently, this uses SIGKILL on each daemon for a non-graceful shutdown.
   void ShutdownNodes(ClusterNodes nodes) override;
 
@@ -213,6 +244,9 @@ class ExternalMiniCluster : public MiniCluster {
 
   // Same as above but for a master.
   std::string GetBindIpForMaster(int index) const;
+
+  // Same as above but for a external server, e.g. Sentry service or Hive Metastore.
+  std::string GetBindIpForExternalServer(int index) const;
 
   // Return a pointer to the running leader master. This may be NULL
   // if the cluster is not started.
@@ -262,12 +296,22 @@ class ExternalMiniCluster : public MiniCluster {
   // Return all tablet servers and masters.
   std::vector<ExternalDaemon*> daemons() const;
 
+  // Return all configured NTP servers used for the synchronisation of the
+  // built-in NTP client.
+#if !defined(NO_CHRONY)
+  std::vector<clock::MiniChronyd*> ntp_servers() const;
+#endif
+
   MiniKdc* kdc() const {
     return kdc_.get();
   }
 
   hms::MiniHms* hms() const {
     return hms_.get();
+  }
+
+  sentry::MiniSentry* sentry() const {
+    return sentry_.get();
   }
 
   const std::string& cluster_root() const {
@@ -381,19 +425,25 @@ class ExternalMiniCluster : public MiniCluster {
   std::string GetLogPath(const std::string& daemon_id) const;
 
  private:
-  FRIEND_TEST(MasterFailoverTest, TestKillAnyMaster);
-
   Status StartMasters();
+
+  Status StartSentry();
+  Status StopSentry();
 
   Status DeduceBinRoot(std::string* ret);
   Status HandleOptions();
+  Status AddTimeSourceFlags(std::vector<std::string>* flags);
 
   ExternalMiniClusterOptions opts_;
 
   std::vector<scoped_refptr<ExternalMaster>> masters_;
   std::vector<scoped_refptr<ExternalTabletServer>> tablet_servers_;
+#if !defined(NO_CHRONY)
+  std::vector<std::unique_ptr<clock::MiniChronyd>> ntp_servers_;
+#endif
   std::unique_ptr<MiniKdc> kdc_;
   std::unique_ptr<hms::MiniHms> hms_;
+  std::unique_ptr<sentry::MiniSentry> sentry_;
 
   std::shared_ptr<rpc::Messenger> messenger_;
 

@@ -38,14 +38,17 @@ import com.google.common.collect.ImmutableList;
 import com.google.protobuf.CodedOutputStream;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
-import com.google.protobuf.Message.Builder;
 import com.stumbleupon.async.Deferred;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.buffer.ChannelBuffers;
+import org.jboss.netty.util.Timeout;
+import org.jboss.netty.util.Timer;
+import org.jboss.netty.util.TimerTask;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.kudu.security.Token;
 import org.apache.kudu.util.Pair;
 import org.apache.kudu.util.Slice;
 
@@ -99,7 +102,7 @@ public abstract class KuduRpc<R> {
   private static final Logger LOG = LoggerFactory.getLogger(KuduRpc.class);
 
   private final List<RpcTraceFrame> traces =
-      Collections.synchronizedList(new ArrayList<RpcTraceFrame>());
+      Collections.synchronizedList(new ArrayList<>());
 
   private KuduRpc<?> parentRpc;
 
@@ -111,6 +114,19 @@ public abstract class KuduRpc<R> {
    */
   byte[] partitionKey() {
     return null;
+  }
+
+  /**
+   * Binds the given authorization token to the request.
+   */
+  void bindAuthzToken(Token.SignedTokenPB token) {
+  }
+
+  /**
+   * Whether the request needs to be authorized via authz token.
+   */
+  boolean needsAuthzToken() {
+    return false;
   }
 
   /**
@@ -127,10 +143,14 @@ public abstract class KuduRpc<R> {
 
   final KuduTable table;
 
-  final DeadlineTracker deadlineTracker;
+  final TimeoutTracker timeoutTracker;
 
-  protected long propagatedTimestamp = -1;
-  protected ExternalConsistencyMode externalConsistencyMode = CLIENT_PROPAGATED;
+  // 'timeoutTask' is a handle to the timer task that will time out the RPC. It is
+  // null if and only if the task has no timeout.
+  Timeout timeoutTask;
+
+  long propagatedTimestamp = -1;
+  ExternalConsistencyMode externalConsistencyMode = CLIENT_PROPAGATED;
 
   /**
    * How many times have we retried this RPC?.
@@ -146,9 +166,15 @@ public abstract class KuduRpc<R> {
    */
   private long sequenceId = RequestTracker.NO_SEQ_NO;
 
-  KuduRpc(KuduTable table) {
+  KuduRpc(KuduTable table, Timer timer, long timeoutMillis) {
     this.table = table;
-    this.deadlineTracker = new DeadlineTracker();
+    this.timeoutTracker = new TimeoutTracker();
+    timeoutTracker.setTimeout(timeoutMillis);
+    if (timer != null) {
+      this.timeoutTask = AsyncKuduClient.newTimeout(timer,
+                                                    new RpcTimeoutTask(),
+                                                    timeoutMillis);
+    }
   }
 
   /**
@@ -241,7 +267,10 @@ public abstract class KuduRpc<R> {
       table.getAsyncClient().getRequestTracker().rpcCompleted(sequenceId);
       sequenceId = RequestTracker.NO_SEQ_NO;
     }
-    deadlineTracker.reset();
+    if (timeoutTask != null) {
+      timeoutTask.cancel();
+    }
+    timeoutTracker.reset();
     traces.clear();
     parentRpc = null;
     d.callback(result);
@@ -277,7 +306,7 @@ public abstract class KuduRpc<R> {
    */
   void setParentRpc(KuduRpc<?> parentRpc) {
     assert (this.parentRpc == null);
-    assert (this.parentRpc != this);
+    assert (this != parentRpc);
     this.parentRpc = parentRpc;
   }
 
@@ -304,7 +333,7 @@ public abstract class KuduRpc<R> {
   /** Package private way of accessing / creating the Deferred of this RPC.  */
   final Deferred<R> getDeferred() {
     if (deferred == null) {
-      deferred = new Deferred<R>();
+      deferred = new Deferred<>();
     }
     return deferred;
   }
@@ -323,10 +352,6 @@ public abstract class KuduRpc<R> {
 
   public KuduTable getTable() {
     return table;
-  }
-
-  void setTimeoutMillis(long timeout) {
-    deadlineTracker.setDeadline(timeout);
   }
 
   /**
@@ -371,19 +396,21 @@ public abstract class KuduRpc<R> {
       buf.append(tablet.getTabletId());
     }
     buf.append(", attempt=").append(attempt);
-    buf.append(", ").append(deadlineTracker);
-    buf.append(", ").append(RpcTraceFrame.getHumanReadableStringForTraces(traces));
+    buf.append(", ").append(timeoutTracker);
     // Cheating a bit, we're not actually logging but we'll augment the information provided by
     // this method if DEBUG is enabled.
     if (LOG.isDebugEnabled()) {
-      buf.append(", ").append(deferred);
+      buf.append(", ").append(RpcTraceFrame.getHumanReadableStringForTraces(traces));
+      buf.append(", deferred=").append(deferred);
+    } else {
+      buf.append(", ").append(RpcTraceFrame.getHumanReadableSummaryStringForTraces(traces));
     }
     buf.append(')');
     return buf.toString();
   }
 
   static void readProtobuf(final Slice slice,
-      final Builder builder) {
+      final Message.Builder builder) {
     final int length = slice.length();
     final byte[] payload = slice.getRawArray();
     final int offset = slice.getRawOffset();
@@ -419,5 +446,16 @@ public abstract class KuduRpc<R> {
     }
     chanBuf.writerIndex(buf.length);
     return chanBuf;
+  }
+
+  /**
+   * A netty TimerTask for timing out a KuduRpc.
+   */
+  final class RpcTimeoutTask implements TimerTask {
+    @Override
+    public void run(final Timeout timeout) {
+      Status statusTimedOut = Status.TimedOut("cannot complete before timeout: " + KuduRpc.this);
+      KuduRpc.this.errback(new NonRecoverableException(statusTimedOut));
+    }
   }
 }

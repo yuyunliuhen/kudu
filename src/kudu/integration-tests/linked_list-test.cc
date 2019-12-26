@@ -176,8 +176,7 @@ TEST_F(LinkedListTest, TestLoadAndVerify) {
   MonoDelta check_freq = MonoDelta::FromSeconds(1);
 #endif
 
-  PeriodicWebUIChecker checker(*cluster_.get(), tablet_id,
-                               check_freq);
+  PeriodicWebUIChecker checker(*cluster_, check_freq, tablet_id);
 
   bool can_kill_ts = FLAGS_num_tablet_servers > 1 && FLAGS_num_replicas > 2;
 
@@ -215,14 +214,14 @@ TEST_F(LinkedListTest, TestLoadAndVerify) {
                                          this, _1)));
     LOG(INFO) << "Done with tserver kill test.";
     ASSERT_OK(CheckTabletServersAreAlive(tablet_servers_.size()-1));
-    ASSERT_NO_FATAL_FAILURE(RestartCluster());
+    NO_FATALS(RestartCluster());
     // Again wait for cluster to finish bootstrapping.
     WaitForTSAndReplicas();
 
     // Check in-memory state with a downed TS. Scans may try other replicas.
     string tablet = (*tablet_replicas_.begin()).first;
     TServerDetails* leader;
-    EXPECT_OK(GetLeaderReplicaWithRetries(tablet, &leader));
+    ASSERT_OK(GetLeaderReplicaWithRetries(tablet, &leader));
     LOG(INFO) << "Killing TS: " << leader->instance_id.permanent_uuid() << ", leader of tablet: "
         << tablet << " and verifying that we can still read all results";
     ASSERT_OK(ShutdownServerWithUUID(leader->uuid()));
@@ -231,7 +230,7 @@ TEST_F(LinkedListTest, TestLoadAndVerify) {
   }
 
   // Kill and restart the cluster, verify data remains.
-  ASSERT_NO_FATAL_FAILURE(RestartCluster());
+  NO_FATALS(RestartCluster());
 
   LOG(INFO) << "Verifying rows after restarting entire cluster.";
 
@@ -253,7 +252,7 @@ TEST_F(LinkedListTest, TestLoadAndVerify) {
   if (can_kill_ts) {
     string tablet = (*tablet_replicas_.begin()).first;
     TServerDetails* leader;
-    EXPECT_OK(GetLeaderReplicaWithRetries(tablet, &leader));
+    ASSERT_OK(GetLeaderReplicaWithRetries(tablet, &leader));
     LOG(INFO) << "Killing TS: " << leader->instance_id.permanent_uuid() << ", leader of tablet: "
         << tablet << " and verifying that we can still read all results";
     ASSERT_OK(ShutdownServerWithUUID(leader->uuid()));
@@ -261,13 +260,13 @@ TEST_F(LinkedListTest, TestLoadAndVerify) {
     ASSERT_OK(CheckTabletServersAreAlive(tablet_servers_.size() - 1));
   }
 
-  ASSERT_NO_FATAL_FAILURE(RestartCluster());
+  NO_FATALS(RestartCluster());
 
   // Sleep a little bit, so that the tablet is probably in bootstrapping state.
   SleepFor(MonoDelta::FromMilliseconds(100));
 
   // Restart while bootstrapping
-  ASSERT_NO_FATAL_FAILURE(RestartCluster());
+  NO_FATALS(RestartCluster());
 
   ASSERT_OK(tester_->WaitAndVerify(FLAGS_seconds_to_run, written));
   ASSERT_OK(CheckTabletServersAreAlive(tablet_servers_.size()));
@@ -321,7 +320,7 @@ TEST_F(LinkedListTest, TestLoadWhileOneServerDownAndVerify) {
   // index, let's first make sure that the replica at the restarted tserver
   // is a voter.
   bool has_leader;
-  master::TabletLocationsPB tablet_locations;
+  master::GetTabletLocationsResponsePB tablet_locations;
   ASSERT_OK(WaitForReplicasReportedToMaster(
       cluster_->master_proxy(), FLAGS_num_tablet_servers, tablet_id, wait_time,
       WAIT_FOR_LEADER, VOTER_REPLICA, &has_leader, &tablet_locations));

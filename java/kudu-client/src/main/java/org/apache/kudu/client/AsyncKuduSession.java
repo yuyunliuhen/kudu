@@ -35,7 +35,6 @@ import javax.annotation.concurrent.NotThreadSafe;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Range;
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -45,6 +44,7 @@ import org.jboss.netty.util.TimerTask;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.kudu.client.AsyncKuduClient.LookupType;
 import org.apache.kudu.util.AsyncUtil;
 import org.apache.kudu.util.Slice;
 
@@ -114,18 +114,15 @@ import org.apache.kudu.util.Slice;
 public class AsyncKuduSession implements SessionConfiguration {
 
   public static final Logger LOG = LoggerFactory.getLogger(AsyncKuduSession.class);
-  private static final Range<Float> PERCENTAGE_RANGE = Range.closed(0.0f, 1.0f);
 
   private final AsyncKuduClient client;
   private final Random randomizer = new Random();
   private final ErrorCollector errorCollector;
-  private int interval = 1000;
-  private int mutationBufferSpace = 1000; // TODO express this in terms of data size.
-  private float mutationBufferLowWatermarkPercentage = 0.5f;
-  private int mutationBufferLowWatermark;
+  private int flushIntervalMillis = 1000;
+  private int mutationBufferMaxOps = 1000; // TODO express this in terms of data size.
   private FlushMode flushMode;
   private ExternalConsistencyMode consistencyMode;
-  private long timeoutMs;
+  private long timeoutMillis;
 
   /**
    * Protects internal state from concurrent access. {@code AsyncKuduSession} is not threadsafe
@@ -170,7 +167,7 @@ public class AsyncKuduSession implements SessionConfiguration {
    * capacity may be available in the active buffer.
    */
   private final AtomicReference<Deferred<Void>> flushNotification =
-      new AtomicReference<>(new Deferred<Void>());
+      new AtomicReference<>(new Deferred<>());
 
   /**
    * Tracks whether the session has been closed.
@@ -178,6 +175,7 @@ public class AsyncKuduSession implements SessionConfiguration {
   private volatile boolean closed = false;
 
   private boolean ignoreAllDuplicateRows = false;
+  private boolean ignoreAllNotFoundRows = false;
 
   /**
    * Package-private constructor meant to be used via AsyncKuduClient
@@ -187,11 +185,10 @@ public class AsyncKuduSession implements SessionConfiguration {
     this.client = client;
     flushMode = FlushMode.AUTO_FLUSH_SYNC;
     consistencyMode = CLIENT_PROPAGATED;
-    timeoutMs = client.getDefaultOperationTimeoutMs();
+    timeoutMillis = client.getDefaultOperationTimeoutMs();
     inactiveBuffers.add(bufferA);
     inactiveBuffers.add(bufferB);
-    errorCollector = new ErrorCollector(mutationBufferSpace);
-    setMutationBufferLowWatermark(this.mutationBufferLowWatermarkPercentage);
+    errorCollector = new ErrorCollector(mutationBufferMaxOps);
   }
 
   @Override
@@ -199,6 +196,7 @@ public class AsyncKuduSession implements SessionConfiguration {
     return this.flushMode;
   }
 
+  // TODO(wdberkeley): KUDU-1944. Don't let applications change the flush mode. Use a new session.
   @Override
   public void setFlushMode(FlushMode flushMode) {
     if (hasPendingOperations()) {
@@ -217,32 +215,23 @@ public class AsyncKuduSession implements SessionConfiguration {
   }
 
   @Override
-  public void setMutationBufferSpace(int size) {
+  public void setMutationBufferSpace(int numOps) {
     if (hasPendingOperations()) {
       throw new IllegalArgumentException("Cannot change the buffer" +
           " size when operations are buffered");
     }
-    this.mutationBufferSpace = size;
-    // Reset the low watermark, using the same percentage as before.
-    setMutationBufferLowWatermark(mutationBufferLowWatermarkPercentage);
+    this.mutationBufferMaxOps = numOps;
   }
 
+  @Deprecated
   @Override
   public void setMutationBufferLowWatermark(float mutationBufferLowWatermarkPercentage) {
-    if (hasPendingOperations()) {
-      throw new IllegalArgumentException("Cannot change the buffer" +
-          " low watermark when operations are buffered");
-    } else if (!PERCENTAGE_RANGE.contains(mutationBufferLowWatermarkPercentage)) {
-      throw new IllegalArgumentException("The low watermark must be between 0 and 1 inclusively");
-    }
-    this.mutationBufferLowWatermarkPercentage = mutationBufferLowWatermarkPercentage;
-    this.mutationBufferLowWatermark =
-        (int)(this.mutationBufferLowWatermarkPercentage * mutationBufferSpace);
+    LOG.warn("setMutationBufferLowWatermark is deprecated");
   }
 
   /**
    * Lets us set a specific seed for tests
-   * @param seed
+   * @param seed the seed to use
    */
   @InterfaceAudience.LimitedPrivate("Test")
   void setRandomSeed(long seed) {
@@ -250,18 +239,18 @@ public class AsyncKuduSession implements SessionConfiguration {
   }
 
   @Override
-  public void setFlushInterval(int interval) {
-    this.interval = interval;
+  public void setFlushInterval(int flushIntervalMillis) {
+    this.flushIntervalMillis = flushIntervalMillis;
   }
 
   @Override
   public void setTimeoutMillis(long timeout) {
-    this.timeoutMs = timeout;
+    this.timeoutMillis = timeout;
   }
 
   @Override
   public long getTimeoutMillis() {
-    return this.timeoutMs;
+    return this.timeoutMillis;
   }
 
   @Override
@@ -277,6 +266,16 @@ public class AsyncKuduSession implements SessionConfiguration {
   @Override
   public void setIgnoreAllDuplicateRows(boolean ignoreAllDuplicateRows) {
     this.ignoreAllDuplicateRows = ignoreAllDuplicateRows;
+  }
+
+  @Override
+  public boolean isIgnoreAllNotFoundRows() {
+    return ignoreAllNotFoundRows;
+  }
+
+  @Override
+  public void setIgnoreAllNotFoundRows(boolean ignoreAllNotFoundRows) {
+    this.ignoreAllNotFoundRows = ignoreAllNotFoundRows;
   }
 
   @Override
@@ -308,9 +307,9 @@ public class AsyncKuduSession implements SessionConfiguration {
    * @param buffer the buffer to return to the inactive queue.
    */
   private void queueBuffer(Buffer buffer) {
-    buffer.callbackFlushNotification();
-    Deferred<Void> localFlushNotification = flushNotification.getAndSet(new Deferred<Void>());
     inactiveBuffers.add(buffer);
+    buffer.callbackFlushNotification();
+    Deferred<Void> localFlushNotification = flushNotification.getAndSet(new Deferred<>());
     localFlushNotification.callback(null);
   }
 
@@ -376,7 +375,8 @@ public class AsyncKuduSession implements SessionConfiguration {
 
         Batch batch = batches.get(tabletId);
         if (batch == null) {
-          batch = new Batch(operation.getTable(), tablet, ignoreAllDuplicateRows);
+          batch = new Batch(operation.getTable(), tablet, ignoreAllDuplicateRows,
+              ignoreAllNotFoundRows);
           batches.put(tabletId, batch);
         }
         batch.add(operation, currentIndex++);
@@ -389,9 +389,8 @@ public class AsyncKuduSession implements SessionConfiguration {
       }
 
       for (Batch batch : batches.values()) {
-        if (timeoutMs != 0) {
-          batch.deadlineTracker.reset();
-          batch.setTimeoutMillis(timeoutMs);
+        if (timeoutMillis != 0) {
+          batch.resetTimeoutMillis(client.getTimer(), timeoutMillis);
         }
         addBatchCallbacks(batch);
         batchResponses.add(client.sendRpcToTablet(batch));
@@ -423,37 +422,29 @@ public class AsyncKuduSession implements SessionConfiguration {
     Buffer buffer;
     Deferred<Void> nonActiveBufferFlush;
     synchronized (monitor) {
-      nonActiveBufferFlush = getNonActiveFlushNotification();
-      buffer = activeBuffer;
-      activeBuffer = null;
+      nonActiveBufferFlush = getNonActiveFlushNotificationUnlocked();
+      buffer = retireActiveBufferUnlocked();
     }
 
-    final Deferred<List<OperationResponse>> activeBufferFlush = buffer == null ?
-        Deferred.<List<OperationResponse>>fromResult(ImmutableList.<OperationResponse>of()) :
-        doFlush(buffer);
-
-    return AsyncUtil.addBothDeferring(nonActiveBufferFlush,
-        new Callback<Deferred<List<OperationResponse>>, Object>() {
-          @Override
-          public Deferred<List<OperationResponse>> call(Object arg) {
-            return activeBufferFlush;
-          }
-        });
+    // TODO(wdb): If there is a buffer flushing already, this code will wait for it to finish before
+    //            flushing 'buffer'. This is less performant but has less surprising semantics than
+    //            simultaneously flushing two buffers. Even though we don't promise those semantics,
+    //            I'm going to leave it this way for now because it's never caused any trouble.
+    return AsyncUtil.addBothDeferring(nonActiveBufferFlush, unused -> doFlush(buffer));
   }
 
   /**
-   * Flushes a write buffer. This method takes ownership of the buffer, no other concurrent access
-   * is allowed.
+   * Flushes a write buffer. This method takes ownership of 'buffer', no other concurrent access
+   * is allowed. 'buffer' is allowed to be null.
    *
    * @param buffer the buffer to flush, must not be modified once passed to this method
    * @return the operation responses
    */
   private Deferred<List<OperationResponse>> doFlush(Buffer buffer) {
-    LOG.debug("flushing buffer: {}", buffer);
-    if (buffer.getOperations().isEmpty()) {
-      // no-op.
-      return Deferred.<List<OperationResponse>>fromResult(ImmutableList.<OperationResponse>of());
+    if (buffer == null || buffer.getOperations().isEmpty()) {
+      return Deferred.fromResult(ImmutableList.of());
     }
+    LOG.debug("flushing buffer: {}", buffer);
 
     Deferred<List<BatchResponse>> batchResponses = new Deferred<>();
     Callback<Void, Object> tabletLookupCB = new TabletLookupCB(buffer, batchResponses);
@@ -515,6 +506,24 @@ public class AsyncKuduSession implements SessionConfiguration {
     }
   }
 
+  // TODO(wdberkeley): Get rid of the idea of an Operation as a distinct way to do a write. Replace
+  //                   it with a single-operation Batch.
+  private Deferred<OperationResponse> doAutoFlushSync(final Operation operation) {
+    if (timeoutMillis != 0) {
+      operation.resetTimeoutMillis(client.getTimer(), timeoutMillis);
+    }
+    operation.setExternalConsistencyMode(consistencyMode);
+    operation.setIgnoreAllDuplicateRows(ignoreAllDuplicateRows);
+    operation.setIgnoreAllNotFoundRows(ignoreAllNotFoundRows);
+
+    return client.sendRpcToTablet(operation)
+        .addCallbackDeferring(resp -> {
+          client.updateLastPropagatedTimestamp(resp.getWriteTimestampRaw());
+          return Deferred.fromResult(resp);
+        })
+        .addErrback(new SingleOperationErrCallback(operation));
+  }
+
   /**
    * Apply the given operation.
    * <p>
@@ -528,40 +537,29 @@ public class AsyncKuduSession implements SessionConfiguration {
    * @see SessionConfiguration.FlushMode FlushMode
    */
   public Deferred<OperationResponse> apply(final Operation operation) throws KuduException {
-    Preconditions.checkNotNull(operation, "Can not apply a null operation");
+    Preconditions.checkNotNull(operation, "Cannot apply a null operation");
     Preconditions.checkArgument(operation.getTable().getAsyncClient() == client,
         "Applied operations must be created from a KuduTable instance opened " +
         "from the same client that opened this KuduSession");
+    if (closed) {
+      // Ideally this would be a precondition, but that may break existing
+      // clients who have grown to rely on this unsafe behavior.
+      LOG.warn("Applying an operation in a closed session; this is unsafe");
+    }
 
-    // Freeze the row so that the client can not concurrently modify it while it is in flight.
+    // Freeze the row so that the client cannot concurrently modify it while it is in flight.
     operation.getRow().freeze();
 
     // If immediate flush mode, send the operation directly.
     if (flushMode == FlushMode.AUTO_FLUSH_SYNC) {
-      if (timeoutMs != 0) {
-        operation.setTimeoutMillis(timeoutMs);
-      }
-      operation.setExternalConsistencyMode(this.consistencyMode);
-      operation.setIgnoreAllDuplicateRows(ignoreAllDuplicateRows);
-
-      // Add a callback to update the propagated timestamp returned from the server.
-      Callback<Deferred<OperationResponse>, OperationResponse> cb =
-        new Callback<Deferred<OperationResponse>, OperationResponse>() {
-          @Override
-          public Deferred<OperationResponse> call(OperationResponse resp) throws Exception {
-            client.updateLastPropagatedTimestamp(resp.getWriteTimestampRaw());
-            return Deferred.fromResult(resp);
-          }
-        };
-      return client.sendRpcToTablet(operation)
-          .addCallbackDeferring(cb)
-          .addErrback(new SingleOperationErrCallback(operation));
+      return doAutoFlushSync(operation);
     }
 
     // Kick off a location lookup.
     Deferred<LocatedTablet> tablet = client.getTabletLocation(operation.getTable(),
                                                               operation.partitionKey(),
-                                                              timeoutMs);
+                                                              LookupType.POINT,
+                                                              timeoutMillis);
 
     // Holds a buffer that should be flushed outside the synchronized block, if necessary.
     Buffer fullBuffer = null;
@@ -572,10 +570,10 @@ public class AsyncKuduSession implements SessionConfiguration {
           // If the active buffer is null then we recently flushed. Check if there
           // is an inactive buffer available to replace as the active.
           if (inactiveBufferAvailable()) {
-            refreshActiveBuffer();
+            refreshActiveBufferUnlocked();
           } else {
             Status statusServiceUnavailable =
-                Status.ServiceUnavailable("All buffers are currently flushing");
+                Status.ServiceUnavailable("all buffers are currently flushing");
             // This can happen if the user writes into a buffer, flushes it, writes
             // into the second, flushes it, and immediately tries to write again.
             throw new PleaseThrottleException(statusServiceUnavailable,
@@ -583,71 +581,58 @@ public class AsyncKuduSession implements SessionConfiguration {
           }
         }
 
-        if (flushMode == FlushMode.MANUAL_FLUSH) {
-          if (activeBuffer.getOperations().size() < mutationBufferSpace) {
+        int activeBufferSize = activeBuffer.getOperations().size();
+        switch (flushMode) {
+          case AUTO_FLUSH_SYNC: {
+            // This case is handled above and is impossible here.
+            // TODO(wdberkeley): Handle AUTO_FLUSH_SYNC just like other flush modes.
+            assert false;
+            break;
+          }
+          case MANUAL_FLUSH: {
+            if (activeBufferSize >= mutationBufferMaxOps) {
+              Status statusIllegalState =
+                  Status.IllegalState("MANUAL_FLUSH is enabled but the buffer is too big");
+              throw new NonRecoverableException(statusIllegalState);
+            }
             activeBuffer.getOperations().add(new BufferedOperation(tablet, operation));
-          } else {
-            Status statusIllegalState =
-                Status.IllegalState("MANUAL_FLUSH is enabled but the buffer is too big");
-            throw new NonRecoverableException(statusIllegalState);
+            break;
           }
-        } else {
-          assert flushMode == FlushMode.AUTO_FLUSH_BACKGROUND;
-          int activeBufferSize = activeBuffer.getOperations().size();
+          case AUTO_FLUSH_BACKGROUND: {
+            if (activeBufferSize >= mutationBufferMaxOps) {
+              // If the active buffer is full or overflowing, be sure to kick off a flush.
+              fullBuffer = retireActiveBufferUnlocked();
+              activeBufferSize = 0;
 
-          if (activeBufferSize >= mutationBufferSpace) {
-            // Save the active buffer into fullBuffer so that it gets flushed when we leave this
-            // synchronized block.
-            fullBuffer = activeBuffer;
-            activeBuffer = null;
-            activeBufferSize = 0;
-            if (inactiveBufferAvailable()) {
-              refreshActiveBuffer();
-            } else {
-              Status statusServiceUnavailable =
-                  Status.ServiceUnavailable("All buffers are currently flushing");
-              throw new PleaseThrottleException(statusServiceUnavailable,
-                                                null, operation, notification);
+              if (!inactiveBufferAvailable()) {
+                Status statusServiceUnavailable =
+                    Status.ServiceUnavailable("All buffers are currently flushing");
+                throw new PleaseThrottleException(statusServiceUnavailable,
+                    null, operation, notification);
+              }
+              refreshActiveBufferUnlocked();
             }
-          }
 
-          if (mutationBufferLowWatermark < mutationBufferSpace && // low watermark is enabled
-              activeBufferSize >= mutationBufferLowWatermark &&   // buffer is over low water mark
-              !inactiveBufferAvailable()) {                       // no inactive buffers
-
-            // Check if we are over the low water mark.
-            int randomWatermark = activeBufferSize + 1 +
-                                  randomizer.nextInt(mutationBufferSpace -
-                                                     mutationBufferLowWatermark);
-
-            if (randomWatermark > mutationBufferSpace) {
-              Status statusServiceUnavailable =
-                  Status.ServiceUnavailable("The previous buffer hasn't been flushed and the " +
-                      "current buffer is over the low watermark, please retry later");
-              throw new PleaseThrottleException(statusServiceUnavailable,
-                                                null, operation, notification);
+            // Add the operation to the active buffer, and:
+            // 1. If it's the first operation in the buffer, start a background flush timer.
+            // 2. If it filled or overflowed the buffer, kick off a flush.
+            activeBuffer.getOperations().add(new BufferedOperation(tablet, operation));
+            if (activeBufferSize == 0) {
+              AsyncKuduClient.newTimeout(client.getTimer(), activeBuffer.getFlusherTask(),
+                  flushIntervalMillis);
             }
+            if (activeBufferSize + 1 >= mutationBufferMaxOps && inactiveBufferAvailable()) {
+              fullBuffer = retireActiveBufferUnlocked();
+            }
+            break;
           }
-
-          activeBuffer.getOperations().add(new BufferedOperation(tablet, operation));
-
-          if (activeBufferSize + 1 >= mutationBufferSpace && inactiveBufferAvailable()) {
-            // If the operation filled the buffer, then flush it.
-            Preconditions.checkState(fullBuffer == null);
-            fullBuffer = activeBuffer;
-            activeBuffer = null;
-            activeBufferSize = 0;
-          } else if (activeBufferSize == 0) {
-            // If this is the first operation in the buffer, start a background flush timer.
-            client.newTimeout(activeBuffer.getFlusherTask(), interval);
-          }
+          default:
+            throw new IllegalArgumentException("Unexpected flushMode: " + flushMode);
         }
       }
     } finally {
       // Flush the buffer outside of the synchronized block, if required.
-      if (fullBuffer != null) {
-        doFlush(fullBuffer);
-      }
+      doFlush(fullBuffer);
     }
     return operation.getDeferred();
   }
@@ -667,10 +652,21 @@ public class AsyncKuduSession implements SessionConfiguration {
    * {@link #monitor} is locked.
    */
   @GuardedBy("monitor")
-  private void refreshActiveBuffer() {
+  private void refreshActiveBufferUnlocked() {
     Preconditions.checkState(activeBuffer == null);
     activeBuffer = inactiveBuffers.remove();
-    activeBuffer.reset();
+    activeBuffer.resetUnlocked();
+  }
+
+  /**
+   * Retires the active buffer and returns it. Returns null if there is no active buffer.
+   * This should only be called if {@link #monitor} is locked.
+   */
+  @GuardedBy("monitor")
+  private Buffer retireActiveBufferUnlocked() {
+    Buffer buffer = activeBuffer;
+    activeBuffer = null;
+    return buffer;
   }
 
   /**
@@ -679,17 +675,12 @@ public class AsyncKuduSession implements SessionConfiguration {
    * buffer) are fully flushed before completing.
    */
   @GuardedBy("monitor")
-  private Deferred<Void> getNonActiveFlushNotification() {
+  private Deferred<Void> getNonActiveFlushNotificationUnlocked() {
     final Deferred<Void> notificationA = bufferA.getFlushNotification();
     final Deferred<Void> notificationB = bufferB.getFlushNotification();
     if (activeBuffer == null) {
       // Both buffers are either flushing or inactive.
-      return AsyncUtil.addBothDeferring(notificationA, new Callback<Deferred<Void>, Object>() {
-        @Override
-        public Deferred<Void> call(Object obj) throws Exception {
-          return notificationB;
-        }
-      });
+      return AsyncUtil.addBothDeferring(notificationA, unused -> notificationB);
     } else if (activeBuffer == bufferA) {
       return notificationB;
     } else {
@@ -706,9 +697,7 @@ public class AsyncKuduSession implements SessionConfiguration {
       @Override
       public BatchResponse call(final BatchResponse response) {
         LOG.trace("Got a Batch response for {} rows", request.operations.size());
-        if (response.getWriteTimestamp() != 0) {
-          AsyncKuduSession.this.client.updateLastPropagatedTimestamp(response.getWriteTimestamp());
-        }
+        AsyncKuduSession.this.client.updateLastPropagatedTimestamp(response.getWriteTimestamp());
 
         // Send individualized responses to all the operations in this batch.
         for (OperationResponse operationResponse : response.getIndividualResponses()) {
@@ -716,7 +705,7 @@ public class AsyncKuduSession implements SessionConfiguration {
             errorCollector.addError(operationResponse.getRowError());
           }
 
-          // Fire the callback after collecting the error so that the error is visible should the
+          // Fire the callback after collecting the errors so that the errors are visible should the
           // callback interrogate the error collector.
           operationResponse.getOperation().callback(operationResponse);
         }
@@ -808,14 +797,11 @@ public class AsyncKuduSession implements SessionConfiguration {
           return;
         }
         if (activeBuffer.getFlusherTask() == this) {
-          buffer = activeBuffer;
-          activeBuffer = null;
+          buffer = retireActiveBufferUnlocked();
         }
       }
 
-      if (buffer != null) {
-        doFlush(buffer);
-      }
+      doFlush(buffer);
     }
   }
 
@@ -850,7 +836,7 @@ public class AsyncKuduSession implements SessionConfiguration {
     }
 
     @GuardedBy("monitor")
-    public FlusherTask getFlusherTask() {
+    FlusherTask getFlusherTask() {
       if (flusherTask == null) {
         flusherTask = new FlusherTask();
       }
@@ -862,7 +848,7 @@ public class AsyncKuduSession implements SessionConfiguration {
      * is inactive (its flush is complete and it has been enqueued into {@link #inactiveBuffers}),
      * then the deferred will already be complete.
      */
-    public Deferred<Void> getFlushNotification() {
+    Deferred<Void> getFlushNotification() {
       return flushNotification;
     }
 
@@ -870,7 +856,7 @@ public class AsyncKuduSession implements SessionConfiguration {
      * Completes the buffer's flush notification. Should be called when the buffer has been
      * successfully flushed.
      */
-    public void callbackFlushNotification() {
+    void callbackFlushNotification() {
       LOG.trace("buffer flush notification fired: {}", this);
       flushNotification.callback(null);
     }
@@ -880,8 +866,8 @@ public class AsyncKuduSession implements SessionConfiguration {
      * inactive to active.
      */
     @GuardedBy("monitor")
-    public void reset() {
-      LOG.trace("buffer reset: {}", this);
+    void resetUnlocked() {
+      LOG.trace("buffer resetUnlocked: {}", this);
       operations.clear();
       flushNotification = new Deferred<>();
       flusherTask = null;

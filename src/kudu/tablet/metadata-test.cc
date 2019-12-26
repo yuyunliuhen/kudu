@@ -46,7 +46,7 @@ class MetadataTest : public KuduTest {
     tablet_meta_ = new TabletMetadata(nullptr, "fake-tablet");
     CHECK_OK(RowSetMetadata::CreateNew(tablet_meta_.get(), 0, &meta_));
     for (int i = 0; i < all_blocks_.size(); i++) {
-      CHECK_OK(meta_->CommitRedoDeltaDataBlock(i, all_blocks_[i]));
+      CHECK_OK(meta_->CommitRedoDeltaDataBlock(i, 0, all_blocks_[i]));
     }
     CHECK_EQ(4, meta_->redo_delta_blocks().size());
   }
@@ -63,13 +63,13 @@ TEST_F(MetadataTest, RSMD_TestReplaceDeltas_1) {
   to_replace.emplace_back(2);
   to_replace.emplace_back(3);
 
-  vector<BlockId> removed;
+  BlockIdContainer removed;
   meta_->CommitUpdate(
       RowSetMetadataUpdate()
       .ReplaceRedoDeltaBlocks(to_replace, { BlockId(123) }), &removed);
   ASSERT_EQ(vector<BlockId>({ BlockId(1), BlockId(123), BlockId(4) }),
             meta_->redo_delta_blocks());
-  ASSERT_EQ(vector<BlockId>({ BlockId(2), BlockId(3) }),
+  ASSERT_EQ(BlockIdContainer({ BlockId(2), BlockId(3) }),
             removed);
 }
 
@@ -79,13 +79,13 @@ TEST_F(MetadataTest, RSMD_TestReplaceDeltas_2) {
   to_replace.emplace_back(1);
   to_replace.emplace_back(2);
 
-  vector<BlockId> removed;
+  BlockIdContainer removed;
   meta_->CommitUpdate(
       RowSetMetadataUpdate()
       .ReplaceRedoDeltaBlocks(to_replace, { BlockId(123) }), &removed);
   ASSERT_EQ(vector<BlockId>({ BlockId(123), BlockId(3), BlockId(4) }),
             meta_->redo_delta_blocks());
-  ASSERT_EQ(vector<BlockId>({ BlockId(1), BlockId(2) }),
+  ASSERT_EQ(BlockIdContainer({ BlockId(1), BlockId(2) }),
             removed);
 }
 
@@ -95,13 +95,13 @@ TEST_F(MetadataTest, RSMD_TestReplaceDeltas_3) {
   to_replace.emplace_back(3);
   to_replace.emplace_back(4);
 
-  vector<BlockId> removed;
+  BlockIdContainer removed;
   meta_->CommitUpdate(
       RowSetMetadataUpdate()
       .ReplaceRedoDeltaBlocks(to_replace, { BlockId(123) }), &removed);
   ASSERT_EQ(vector<BlockId>({ BlockId(1), BlockId(2), BlockId(123) }),
             meta_->redo_delta_blocks());
-  ASSERT_EQ(vector<BlockId>({ BlockId(3), BlockId(4) }),
+  ASSERT_EQ(BlockIdContainer({ BlockId(3), BlockId(4) }),
             removed);
 }
 
@@ -112,7 +112,7 @@ TEST_F(MetadataTest, RSMD_TestReplaceDeltas_Bad_NonContiguous) {
   to_replace.emplace_back(4);
 
   EXPECT_DEATH({
-    vector<BlockId> removed;
+    BlockIdContainer removed;
     meta_->CommitUpdate(
         RowSetMetadataUpdate().ReplaceRedoDeltaBlocks(to_replace, { BlockId(123) }),
         &removed);
@@ -127,7 +127,7 @@ TEST_F(MetadataTest, RSMD_TestReplaceDeltas_Bad_DoesntExist) {
   to_replace.emplace_back(555);
 
   EXPECT_DEATH({
-    vector<BlockId> removed;
+    BlockIdContainer removed;
     meta_->CommitUpdate(
         RowSetMetadataUpdate().ReplaceRedoDeltaBlocks(to_replace, { BlockId(123) }),
         &removed);

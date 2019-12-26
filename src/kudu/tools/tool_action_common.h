@@ -24,9 +24,9 @@
 #include <vector>
 
 #include "kudu/client/shared_ptr.h"
-#include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/rpc/response_callback.h"
 #include "kudu/util/status.h"
 
 namespace boost {
@@ -37,7 +37,6 @@ class function;
 namespace kudu {
 
 class MonoDelta;
-class faststring; // NOLINT
 
 namespace client {
 class KuduClient;
@@ -67,6 +66,9 @@ struct RunnerContext;
 // Constants for parameters and descriptions.
 extern const char* const kMasterAddressesArg;
 extern const char* const kMasterAddressesArgDesc;
+extern const char* const kDestMasterAddressesArg;
+extern const char* const kDestMasterAddressesArgDesc;
+extern const char* const kTableNameArg;
 extern const char* const kTabletIdArg;
 extern const char* const kTabletIdArgDesc;
 
@@ -142,6 +144,52 @@ Status DumpMemTrackers(const std::string& address, uint16_t default_port);
 // 'patterns' is empty.
 bool MatchesAnyPattern(const std::vector<std::string>& patterns, const std::string& str);
 
+// Creates a Kudu client connected to the cluster whose master addresses are specified by
+// 'master_addresses_arg'
+Status CreateKuduClient(const RunnerContext& context,
+                        const char* master_addresses_arg,
+                        client::sp::shared_ptr<client::KuduClient>* client);
+
+// Creates a Kudu client connected to the cluster whose master addresses are specified by
+// the kMasterAddressesArg argument in 'context'.
+Status CreateKuduClient(const RunnerContext& context,
+                        client::sp::shared_ptr<client::KuduClient>* client);
+
+// Parses 'master_addresses_arg' from 'context' into 'master_addresses_str', a
+// comma-separated string of host/port pairs.
+//
+// If 'master_addresses_arg' starts with a '@' it is interpreted as a cluster name and
+// resolved against a config file in ${KUDU_CONFIG}/kudurc with content like:
+//
+// clusters_info:
+//   cluster1:
+//     master_addresses: ip1:port1,ip2:port2,ip3:port3
+//   cluster2:
+//     master_addresses: ip4:port4
+Status ParseMasterAddressesStr(
+    const RunnerContext& context,
+    const char* master_addresses_arg,
+    std::string* master_addresses_str);
+
+// Like above, but parse Kudu master addresses into a string according to the
+// kMasterAddressesArg argument in 'context'.
+Status ParseMasterAddressesStr(
+    const RunnerContext& context,
+    std::string* master_addresses_str);
+
+// Like above, but parse Kudu master addresses into a string vector according to the
+// 'master_addresses_arg' argument in 'context'.
+Status ParseMasterAddresses(
+    const RunnerContext& context,
+    const char* master_addresses_arg,
+    std::vector<std::string>* master_addresses);
+
+// Like above, but parse Kudu master addresses into a string vector according to the
+// kMasterAddressesArg argument in 'context'.
+Status ParseMasterAddresses(
+    const RunnerContext& context,
+    std::vector<std::string>* master_addresses);
+
 // A table of data to present to the user.
 //
 // Supports formatting based on the --format flag.
@@ -198,76 +246,15 @@ class LeaderMasterProxy {
   template<typename Req, typename Resp>
   Status SyncRpc(const Req& req,
                  Resp* resp,
-                 const char* func_name,
-                 const boost::function<Status(master::MasterServiceProxy*,
-                                              const Req&, Resp*,
-                                              rpc::RpcController*)>& func);
+                 std::string func_name,
+                 const boost::function<void(master::MasterServiceProxy*,
+                                            const Req&, Resp*,
+                                            rpc::RpcController*,
+                                            const rpc::ResponseCallback&)>& func)
+      WARN_UNUSED_RESULT;
 
  private:
   client::sp::shared_ptr<client::KuduClient> client_;
-};
-
-// Facilitates sending and receiving messages with the tool control shell.
-//
-// May be used by a subprocess communicating with the shell via pipe, or by the
-// shell itself to read/write messages via stdin/stdout respectively.
-class ControlShellProtocol {
- public:
-  enum class SerializationMode {
-    // Each message is serialized as a four byte big-endian size followed by
-    // the protobuf-encoded message itself.
-    PB,
-
-    // Each message is serialized into a protobuf-like JSON representation
-    // terminated with a newline character.
-    JSON,
-  };
-
-  // Whether the provided fds are closed at class destruction time.
-  enum class CloseMode {
-    CLOSE_ON_DESTROY,
-    NO_CLOSE_ON_DESTROY,
-  };
-
-  // Constructs a new protocol instance.
-  //
-  // If 'close_mode' is CLOSE_ON_DESTROY, the instance has effectively taken
-  // control of 'read_fd' and 'write_fd' and the caller shouldn't use them.
-  ControlShellProtocol(SerializationMode serialization_mode,
-                       CloseMode close_mode,
-                       int read_fd,
-                       int write_fd);
-
-  ~ControlShellProtocol();
-
-  // Receives a protobuf message, blocking if the pipe is empty.
-  //
-  // Returns EndOfFile if the writer on the other end of the pipe was closed.
-  //
-  // Returns an error if serialization_mode_ is PB and the received message
-  // sizes exceeds kMaxMessageBytes.
-  template <class M>
-  Status ReceiveMessage(M* message);
-
-  // Sends a protobuf message, blocking if the pipe is full.
-  //
-  // Returns EndOfFile if the reader on the other end of the pipe was closed.
-  template <class M>
-  Status SendMessage(const M& message);
-
- private:
-  // Private helpers to drive actual pipe reading and writing.
-  Status DoRead(faststring* buf);
-  Status DoWrite(const faststring& buf);
-
-  static const int kMaxMessageBytes;
-
-  const SerializationMode serialization_mode_;
-  const CloseMode close_mode_;
-  const int read_fd_;
-  const int write_fd_;
-
-  DISALLOW_COPY_AND_ASSIGN(ControlShellProtocol);
 };
 
 } // namespace tools

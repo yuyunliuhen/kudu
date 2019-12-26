@@ -17,6 +17,8 @@
 
 #include "kudu/tserver/tserver_path_handlers.h"
 
+#include <stdint.h>
+
 #include <algorithm>
 #include <iosfwd>
 #include <map>
@@ -64,6 +66,7 @@
 #include "kudu/util/maintenance_manager.pb.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/stopwatch.h"
 #include "kudu/util/url-coding.h"
 #include "kudu/util/web_callback_registry.h"
 
@@ -99,12 +102,6 @@ bool CompareByMemberType(const RaftPeerPB& a, const RaftPeerPB& b) {
   if (!a.has_member_type()) return false;
   if (!b.has_member_type()) return true;
   return a.member_type() < b.member_type();
-}
-
-string TabletLink(const string& id) {
-  return Substitute("<a href=\"/tablet?id=$0\">$1</a>",
-                    UrlEncodeToString(id),
-                    EscapeForHtmlToString(id));
 }
 
 bool IsTombstoned(const scoped_refptr<TabletReplica>& replica) {
@@ -145,7 +142,7 @@ bool GetTabletID(const Webserver::WebRequest& req,
                  Webserver::WebResponse* resp) {
   if (!FindCopy(req.parsed_args, "id", id)) {
     resp->status_code = HttpStatusCode::BadRequest;
-    resp->output->Set("error", "Request missing 'id' argument");
+    resp->output.Set("error", "Request missing 'id' argument");
     return false;
   }
   return true;
@@ -158,8 +155,8 @@ bool GetTabletReplica(TabletServer* tserver,
                       Webserver::WebResponse* resp) {
   if (!tserver->tablet_manager()->LookupTablet(tablet_id, replica)) {
     resp->status_code = HttpStatusCode::NotFound;
-    resp->output->Set("error",
-                      Substitute("Tablet $0 not found", tablet_id));
+    resp->output.Set("error",
+                     Substitute("Tablet $0 not found", tablet_id));
     return false;
   }
   return true;
@@ -170,8 +167,8 @@ bool TabletBootstrapping(const scoped_refptr<TabletReplica>& replica,
                          Webserver::WebResponse* resp) {
   if (replica->state() == tablet::BOOTSTRAPPING) {
     resp->status_code = HttpStatusCode::ServiceUnavailable;
-    resp->output->Set("error",
-                      Substitute("Tablet $0 is still bootstrapping", tablet_id));
+    resp->output.Set("error",
+                     Substitute("Tablet $0 is still bootstrapping", tablet_id));
     return true;
   }
   return false;
@@ -222,7 +219,7 @@ Status TabletServerPathHandlers::Register(Webserver* server) {
     "/log-anchors", "",
     boost::bind(&TabletServerPathHandlers::HandleLogAnchorsPage, this, _1, _2),
     true /* styled */, false /* is_on_nav_bar */);
-  server->RegisterPrerenderedPathHandler(
+  server->RegisterPathHandler(
     "/dashboards", "Dashboards",
     boost::bind(&TabletServerPathHandlers::HandleDashboardsPage, this, _1, _2),
     true /* styled */, true /* is_on_nav_bar */);
@@ -236,7 +233,7 @@ Status TabletServerPathHandlers::Register(Webserver* server) {
 
 void TabletServerPathHandlers::HandleTransactionsPage(const Webserver::WebRequest& req,
                                                       Webserver::PrerenderedWebResponse* resp) {
-  ostringstream* output = resp->output;
+  ostringstream* output = &resp->output;
   bool as_text = ContainsKey(req.parsed_args, "raw");
 
   vector<scoped_refptr<TabletReplica> > replicas;
@@ -299,7 +296,7 @@ void TabletServerPathHandlers::HandleTransactionsPage(const Webserver::WebReques
 
 void TabletServerPathHandlers::HandleTabletsPage(const Webserver::WebRequest& /*req*/,
                                                  Webserver::WebResponse* resp) {
-  EasyJson* output = resp->output;
+  EasyJson* output = &resp->output;
   vector<scoped_refptr<TabletReplica>> replicas;
   tserver_->tablet_manager()->GetTabletReplicas(&replicas);
 
@@ -339,15 +336,14 @@ void TabletServerPathHandlers::HandleTabletsPage(const Webserver::WebRequest& /*
     EasyJson details_json = replicas_json->Set("replicas", EasyJson::kArray);
     for (const scoped_refptr<TabletReplica>& replica : replicas) {
       EasyJson replica_json = details_json.PushBack(EasyJson::kObject);
-      const auto* tablet = replica->tablet();
       const auto& tmeta = replica->tablet_metadata();
       TabletStatusPB status;
       replica->GetTabletStatusPB(&status);
       replica_json["table_name"] = status.table_name();
-      if (tablet != nullptr) {
-        replica_json["id_or_link"] = TabletLink(status.tablet_id());
-      } else {
-        replica_json["id_or_link"] = status.tablet_id();
+      replica_json["id"] = status.tablet_id();
+      if (replica->tablet() != nullptr) {
+        EasyJson link_json = replica_json.Set("link", EasyJson::kObject);
+        link_json["url"] = Substitute("/tablet?id=$0", status.tablet_id());
       }
       replica_json["partition"] =
           tmeta->partition_schema().PartitionDebugString(tmeta->partition(),
@@ -403,7 +399,7 @@ void TabletServerPathHandlers::HandleTabletPage(const Webserver::WebRequest& req
     role = consensus->role();
   }
 
-  EasyJson* output = resp->output;
+  EasyJson* output = &resp->output;
   output->Set("tablet_id", tablet_id);
   output->Set("state", replica->HumanReadableState());
   output->Set("role", RaftPeerPB::Role_Name(role));
@@ -414,6 +410,13 @@ void TabletServerPathHandlers::HandleTabletPage(const Webserver::WebRequest& req
   output->Set("partition",
               tmeta->partition_schema().PartitionDebugString(tmeta->partition(), schema));
   output->Set("on_disk_size", HumanReadableNumBytes::ToString(replica->OnDiskSize()));
+  uint64_t live_row_count;
+  Status s = replica->CountLiveRows(&live_row_count);
+  if (s.ok()) {
+    output->Set("tablet_live_row_count", live_row_count);
+  } else {
+    output->Set("tablet_live_row_count", "N/A");
+  }
 
   SchemaToJson(schema, output);
 }
@@ -424,7 +427,7 @@ void TabletServerPathHandlers::HandleTabletSVGPage(const Webserver::WebRequest& 
   scoped_refptr<TabletReplica> replica;
   if (!LoadTablet(tserver_, req, &tablet_id, &replica, resp)) return;
   shared_ptr<Tablet> tablet = replica->shared_tablet();
-  auto* output = resp->output;
+  auto* output = &resp->output;
   if (!tablet) {
     output->Set("error", Substitute("Tablet $0 is not running", tablet_id));
     return;
@@ -442,7 +445,7 @@ void TabletServerPathHandlers::HandleLogAnchorsPage(const Webserver::WebRequest&
   scoped_refptr<TabletReplica> replica;
   if (!LoadTablet(tserver_, req, &tablet_id, &replica, resp)) return;
 
-  auto* output = resp->output;
+  auto* output = &resp->output;
   output->Set("tablet_id", tablet_id);
   output->Set("log_anchors", replica->log_anchor_registry()->DumpAnchorInfo());
 }
@@ -453,7 +456,7 @@ void TabletServerPathHandlers::HandleConsensusStatusPage(const Webserver::WebReq
   scoped_refptr<TabletReplica> replica;
   if (!LoadTablet(tserver_, req, &tablet_id, &replica, resp)) return;
   shared_ptr<consensus::RaftConsensus> consensus = replica->shared_consensus();
-  auto* output = resp->output;
+  auto* output = &resp->output;
   if (!consensus) {
     output->Set("error", Substitute("Tablet $0 not initialized", tablet_id));
     return;
@@ -540,8 +543,17 @@ void ScanToJson(const ScanDescriptor& scan, EasyJson* json) {
   json->Set("requestor", scan.remote_user.username());
 
   json->Set("duration", HumanReadableElapsedTime::ToShortString(duration.ToSeconds()));
+  json->Set("num_round_trips", scan.last_call_seq_id);
   json->Set("time_since_start",
             HumanReadableElapsedTime::ToShortString(time_since_start.ToSeconds()));
+
+  const auto& cpu_times = scan.cpu_times;
+  json->Set("wall_secs",
+            HumanReadableElapsedTime::ToShortString(cpu_times.wall_seconds()));
+  json->Set("user_secs",
+            HumanReadableElapsedTime::ToShortString(cpu_times.user_cpu_seconds()));
+  json->Set("sys_secs",
+            HumanReadableElapsedTime::ToShortString(cpu_times.system_cpu_seconds()));
 
   json->Set("duration_title", duration.ToSeconds());
   json->Set("time_since_start_title", time_since_start.ToSeconds());
@@ -551,9 +563,17 @@ void ScanToJson(const ScanDescriptor& scan, EasyJson* json) {
 }
 } // anonymous namespace
 
+const char* kLongTimingTitle = "wall time, user cpu time, and system cpu time "
+    "spent processing the scan: the wall time differs from the duration in that "
+    "it counts the amount of time the server spent (or has spent so far) "
+    "processing the scan, whereas the duration measures the amount of time "
+    "the scanner was (or is so far) open, but possibly dormant waiting for the "
+    "client to request to continue the scan.";
+
 void TabletServerPathHandlers::HandleScansPage(const Webserver::WebRequest& /*req*/,
                                                Webserver::WebResponse* resp) {
-  EasyJson scans = resp->output->Set("scans", EasyJson::kArray);
+  resp->output.Set("timing_title", kLongTimingTitle);
+  EasyJson scans = resp->output.Set("scans", EasyJson::kArray);
   vector<ScanDescriptor> descriptors = tserver_->scanner_manager()->ListScans();
 
   for (const auto& descriptor : descriptors) {
@@ -563,34 +583,12 @@ void TabletServerPathHandlers::HandleScansPage(const Webserver::WebRequest& /*re
 }
 
 void TabletServerPathHandlers::HandleDashboardsPage(const Webserver::WebRequest& /*req*/,
-                                                    Webserver::PrerenderedWebResponse* resp) {
-  ostringstream* output = resp->output;
-  *output << "<h3>Dashboards</h3>\n";
-  *output << "<table class='table table-striped'>\n";
-  *output << "  <thead><tr><th>Dashboard</th><th>Description</th></tr></thead>\n";
-  *output << "  <tbody\n";
-  *output << GetDashboardLine("scans", "Scans", "List of currently running and recently "
-                                                "completed scans.");
-  *output << GetDashboardLine("transactions", "Transactions", "List of transactions that are "
-                                                              "currently running.");
-  *output << GetDashboardLine("maintenance-manager", "Maintenance Manager",
-                              "List of operations that are currently running and those "
-                              "that are registered.");
-  *output << "</tbody></table>\n";
-}
-
-string TabletServerPathHandlers::GetDashboardLine(const std::string& link,
-                                                  const std::string& text,
-                                                  const std::string& desc) {
-  return Substitute("  <tr><td><a href=\"$0\">$1</a></td><td>$2</td></tr>\n",
-                    EscapeForHtmlToString(link),
-                    EscapeForHtmlToString(text),
-                    EscapeForHtmlToString(desc));
+                                                    Webserver::WebResponse* /*resp*/) {
 }
 
 void TabletServerPathHandlers::HandleMaintenanceManagerPage(const Webserver::WebRequest& req,
                                                             Webserver::WebResponse* resp) {
-  EasyJson* output = resp->output;
+  EasyJson* output = &resp->output;
   MaintenanceManager* manager = tserver_->maintenance_manager();
   MaintenanceManagerStatusPB pb;
   manager->GetMaintenanceManagerStatusDump(&pb);

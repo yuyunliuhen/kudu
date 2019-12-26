@@ -66,13 +66,12 @@ class HmsClientTest : public KuduTest,
     hive::Table table;
     table.dbName = database_name;
     table.tableName = table_name;
-    table.tableType = HmsClient::kExternalTable;
-
+    table.tableType = HmsClient::kManagedTable;
     table.__set_parameters({
         make_pair(HmsClient::kKuduTableIdKey, table_id),
+        make_pair(HmsClient::kKuduTableNameKey, table_name),
         make_pair(HmsClient::kKuduMasterAddrsKey, string("TODO")),
-        make_pair(HmsClient::kStorageHandlerKey, HmsClient::kKuduStorageHandler),
-        make_pair(HmsClient::kExternalTableKey, "TRUE")
+        make_pair(HmsClient::kStorageHandlerKey, HmsClient::kKuduStorageHandler)
     });
 
     hive::EnvironmentContext env_ctx;
@@ -105,7 +104,9 @@ INSTANTIATE_TEST_CASE_P(ProtectionTypes,
                                           ));
 
 TEST_P(HmsClientTest, TestHmsOperations) {
-  optional<SaslProtection::Type> protection = GetParam();
+  auto protection = boost::make_optional<SaslProtection::Type>(false, SaslProtection::kIntegrity);
+  protection = GetParam();
+
   MiniKdc kdc;
   MiniHms hms;
   thrift::ClientOptions hms_client_opts;
@@ -173,7 +174,7 @@ TEST_P(HmsClientTest, TestHmsOperations) {
   EXPECT_EQ(table_name, my_table.tableName);
   EXPECT_EQ(table_id, my_table.parameters[HmsClient::kKuduTableIdKey]);
   EXPECT_EQ(HmsClient::kKuduStorageHandler, my_table.parameters[HmsClient::kStorageHandlerKey]);
-  EXPECT_EQ(HmsClient::kExternalTable, my_table.tableType);
+  EXPECT_EQ(HmsClient::kManagedTable, my_table.tableType);
 
   string new_table_name = "my_altered_table";
 
@@ -198,7 +199,7 @@ TEST_P(HmsClientTest, TestHmsOperations) {
   EXPECT_EQ(table_id, renamed_table.parameters[HmsClient::kKuduTableIdKey]);
   EXPECT_EQ(HmsClient::kKuduStorageHandler,
             renamed_table.parameters[HmsClient::kStorageHandlerKey]);
-  EXPECT_EQ(HmsClient::kExternalTable, renamed_table.tableType);
+  EXPECT_EQ(HmsClient::kManagedTable, renamed_table.tableType);
 
   // Create a table with an uppercase name.
   string uppercase_table_name = "my_UPPERCASE_Table";
@@ -222,11 +223,12 @@ TEST_P(HmsClientTest, TestHmsOperations) {
       << "table names: " << table_names;
 
   // Get filtered table names.
+  // NOTE: LIKE filters are used instead of = filters due to HIVE-21614
   table_names.clear();
   string filter = Substitute(
-      "$0$1 = \"$2\"", HmsClient::kHiveFilterFieldParams,
+      "$0$1 LIKE \"$2\"", HmsClient::kHiveFilterFieldParams,
       HmsClient::kStorageHandlerKey, HmsClient::kKuduStorageHandler);
-  ASSERT_OK(client.GetTableNames(database_name, filter, &table_names))
+  ASSERT_OK(client.GetTableNames(database_name, filter, &table_names));
   std::sort(table_names.begin(), table_names.end());
   EXPECT_EQ(vector<string>({ new_table_name, "my_uppercase_table" }), table_names)
       << "table names: " << table_names;
@@ -280,7 +282,8 @@ TEST_P(HmsClientTest, TestHmsOperations) {
 }
 
 TEST_P(HmsClientTest, TestLargeObjects) {
-  optional<SaslProtection::Type> protection = GetParam();
+  auto protection = boost::make_optional<SaslProtection::Type>(false, SaslProtection::kIntegrity);
+  protection = GetParam();
 
   MiniKdc kdc;
   MiniHms hms;
@@ -318,7 +321,7 @@ TEST_P(HmsClientTest, TestLargeObjects) {
   hive::Table table;
   table.dbName = database_name;
   table.tableName = table_name;
-  table.tableType = HmsClient::kExternalTable;
+  table.tableType = HmsClient::kManagedTable;
   hive::FieldSchema partition_key;
   partition_key.name = "c1";
   partition_key.type = "int";
@@ -394,6 +397,10 @@ TEST_F(HmsClientTest, TestHmsConnect) {
   options.recv_timeout = MonoDelta::FromMilliseconds(100),
   options.send_timeout = MonoDelta::FromMilliseconds(100);
   options.conn_timeout = MonoDelta::FromMilliseconds(100);
+
+  // This test will attempt to connect and transfer data upon starting the
+  // client.
+  options.verify_service_config = true;
 
   auto start_client = [&options] (Sockaddr addr) -> Status {
     HmsClient client(HostPort(addr), options);

@@ -90,7 +90,6 @@ else
       "libunwind")    F_LIBUNWIND=1 ;;
       "llvm")         F_LLVM=1 ;;
       "trace-viewer") F_TRACE_VIEWER=1 ;;
-      "nvml")         F_NVML=1 ;;
       "boost")        F_BOOST=1 ;;
       "breakpad")     F_BREAKPAD=1 ;;
       "sparsehash")   F_SPARSEHASH=1 ;;
@@ -100,6 +99,10 @@ else
       "hadoop")       F_HADOOP=1 ;;
       "hive")         F_HIVE=1 ;;
       "sentry")       F_SENTRY=1 ;;
+      "yaml")         F_YAML=1 ;;
+      "chrony")       F_CHRONY=1 ;;
+      "gumbo-parser") F_GUMBO_PARSER=1 ;;
+      "gumbo-query")  F_GUMBO_QUERY=1 ;;
       *)              echo "Unknown module: $arg"; exit 1 ;;
     esac
   done
@@ -245,6 +248,10 @@ if [ -n "$F_COMMON" -o -n "$F_BISON" ]; then
   build_bison
 fi
 
+if [ -n "$F_COMMON" -o -n "$F_CHRONY" ]; then
+  build_chrony
+fi
+
 # Install Hadoop, Hive, and Sentry by symlinking their source directories (which
 # are pre-built) into $PREFIX/opt.
 if [ -n "$F_COMMON" -o -n "$F_HADOOP" ]; then
@@ -259,6 +266,10 @@ fi
 
 if [ -n "$F_COMMON" -o -n "$F_SENTRY" ]; then
   mkdir -p $PREFIX/opt
+  # Remove any hadoop jars included in the Sentry package to avoid unexpected
+  # runtime behavior, due to different versions of hadoop jars are loaded
+  # (one from Kudu's third-party dependency, the other from the Sentry package).
+  rm -rf $SENTRY_SOURCE/lib/hadoop-[a-z-]*.jar
   ln -nsf $SENTRY_SOURCE $PREFIX/opt/sentry
 fi
 
@@ -299,10 +310,6 @@ fi
 
 if [ -n "$F_UNINSTRUMENTED" -o -n "$F_CURL" ]; then
   build_curl
-fi
-
-if [ -n "$OS_LINUX" ] && [ -n "$F_UNINSTRUMENTED" -o -n "$F_NVML" ]; then
-  build_nvml
 fi
 
 restore_env
@@ -365,6 +372,19 @@ fi
 
 if [ -n "$F_UNINSTRUMENTED" -o -n "$F_THRIFT" ]; then
   build_thrift
+fi
+
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_YAML" ]; then
+  build_yaml
+fi
+
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_GUMBO_PARSER" ]; then
+  # Although it's a C library its tests are written in C++.
+  build_gumbo_parser
+fi
+
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_GUMBO_QUERY" ]; then
+  build_gumbo_query
 fi
 
 restore_env
@@ -450,10 +470,6 @@ fi
 
 if [ -n "$F_TSAN" -o -n "$F_CURL" ]; then
   build_curl
-fi
-
-if [ -n "$OS_LINUX" ] && [ -n "$F_TSAN" -o -n "$F_NVML" ]; then
-  build_nvml
 fi
 
 restore_env
@@ -545,6 +561,19 @@ fi
 
 if [ -n "$F_TSAN" -o -n "$F_THRIFT" ]; then
   build_thrift
+fi
+
+if [ -n "$F_TSAN" -o -n "$F_YAML" ]; then
+  build_yaml
+fi
+
+if [ -n "$F_TSAN" -o -n "$F_GUMBO_PARSER" ]; then
+  # Although it's a C library its tests are written in C++.
+  build_gumbo_parser
+fi
+
+if [ -n "$F_TSAN" -o -n "$F_GUMBO_QUERY" ]; then
+  build_gumbo_query
 fi
 
 restore_env

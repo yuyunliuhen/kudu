@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -28,10 +29,10 @@
 #include <gtest/gtest_prod.h>
 
 #include "kudu/consensus/metadata.pb.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/tablet_copy_client.h"
 #include "kudu/tserver/tablet_replica_lookup.h"
 #include "kudu/tserver/tserver.pb.h"
@@ -46,6 +47,10 @@ namespace boost {
 template <class T>
 class optional;
 }
+
+namespace kudu {
+class TableExtraConfigPB;
+}  // namespace kudu
 
 namespace kudu {
 
@@ -69,7 +74,6 @@ class TabletReportPB;
 
 namespace tablet {
 class TabletMetadata;
-class TabletReplica;
 }
 
 namespace tserver {
@@ -77,6 +81,9 @@ class TabletServer;
 
 // Map of tablet id -> transition reason string.
 typedef std::unordered_map<std::string, std::string> TransitionInProgressMap;
+
+// Map of dimension -> tablets number.
+typedef std::unordered_map<std::string, int32_t> TabletNumByDimensionMap;
 
 class TransitionInProgressDeleter;
 
@@ -120,6 +127,8 @@ class TSTabletManager : public tserver::TabletReplicaLookupIf {
                          const Schema& schema,
                          const PartitionSchema& partition_schema,
                          consensus::RaftConfigPB config,
+                         boost::optional<TableExtraConfigPB> extra_config,
+                         boost::optional<std::string> dimension_label,
                          scoped_refptr<tablet::TabletReplica>* replica);
 
   // Delete the specified tablet asynchronously with callback 'cb'.
@@ -189,8 +198,14 @@ class TSTabletManager : public tserver::TabletReplicaLookupIf {
   // TsTabletManager, such as consensus role changes.
   void MarkTabletDirty(const std::string& tablet_id, const std::string& reason);
 
+  // Marks tablets as dirty in batch.
+  void MarkTabletsDirty(const std::vector<std::string>& tablet_ids, const std::string& reason);
+
   // Return the number of tablets in RUNNING or BOOTSTRAPPING state.
   int GetNumLiveTablets() const;
+
+  // Get the number of tablets in RUNNING or BOOTSTRAPPING state in each dimension.
+  TabletNumByDimensionMap GetNumLiveTabletsByDimension() const;
 
   Status RunAllLogGC();
 
@@ -223,8 +238,14 @@ class TSTabletManager : public tserver::TabletReplicaLookupIf {
   // This method is for use in tests only. See KUDU-2444.
   Status WaitForNoTransitionsForTests(const MonoDelta& timeout) const;
 
+  // Update the tablet statistics if necessary.
+  void UpdateTabletStatsIfNecessary();
+
  private:
+  FRIEND_TEST(LeadershipChangeReportingTest, TestReportStatsDuringLeadershipChange);
   FRIEND_TEST(TsTabletManagerTest, TestPersistBlocks);
+  FRIEND_TEST(TsTabletManagerTest, TestTabletStatsReports);
+  FRIEND_TEST(TsTabletManagerITest, TestTableStats);
 
   // Flag specified when registering a TabletReplica.
   enum RegisterTabletReplicaMode {
@@ -328,6 +349,9 @@ class TSTabletManager : public tserver::TabletReplicaLookupIf {
   // running state.
   void InitLocalRaftPeerPB();
 
+  // Just for tests.
+  void SetNextUpdateTimeForTests();
+
   FsManager* const fs_manager_;
 
   const scoped_refptr<consensus::ConsensusMetadataManager> cmeta_manager_;
@@ -369,15 +393,19 @@ class TSTabletManager : public tserver::TabletReplicaLookupIf {
   TSTabletManagerStatePB state_;
 
   // Thread pool used to run tablet copy operations.
-  gscoped_ptr<ThreadPool> tablet_copy_pool_;
+  std::unique_ptr<ThreadPool> tablet_copy_pool_;
 
   // Thread pool used to open the tablets async, whether bootstrap is required or not.
-  gscoped_ptr<ThreadPool> open_tablet_pool_;
+  std::unique_ptr<ThreadPool> open_tablet_pool_;
 
   // Thread pool used to delete tablets asynchronously.
-  gscoped_ptr<ThreadPool> delete_tablet_pool_;
+  std::unique_ptr<ThreadPool> delete_tablet_pool_;
 
   FunctionGaugeDetacher metric_detacher_;
+
+  // Ensures that we only update stats from a single thread at a time.
+  mutable rw_spinlock lock_update_;
+  MonoTime next_update_time_;
 
   DISALLOW_COPY_AND_ASSIGN(TSTabletManager);
 };

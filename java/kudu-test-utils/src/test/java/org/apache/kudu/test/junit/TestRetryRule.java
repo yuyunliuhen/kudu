@@ -14,12 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.test.junit;
+
+import static org.junit.Assert.fail;
 
 import org.junit.Rule;
 import org.junit.Test;
-
-import static org.junit.Assert.fail;
 
 public class TestRetryRule {
   private static final int MAX_FAILURES = 2;
@@ -29,8 +30,9 @@ public class TestRetryRule {
   // an assertion exception.
   private int failures = 0;
 
+  // We skip flaky test reporting for this test because it is designed to fail.
   @Rule
-  public RetryRule retryRule = new RetryRule(MAX_FAILURES);
+  public RetryRule retryRule = new RetryRule(MAX_FAILURES, /*skipReporting=*/ true);
 
   // Ensure that the RetryRule prevents test failures as long as we don't exceed MAX_FAILURES
   // failures.

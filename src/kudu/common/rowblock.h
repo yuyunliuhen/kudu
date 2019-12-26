@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <glog/logging.h>
@@ -31,6 +32,7 @@
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/util/bitmap.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 
@@ -91,6 +93,20 @@ class SelectionVector {
     BitmapClear(&bitmap_[0], row);
   }
 
+  // Finds the first selected row beginning at 'row_offset'.
+  //
+  // Returns true if at least one row is selected and writes its index to 'row';
+  // returns false otherwise.
+  bool FindFirstRowSelected(size_t row_offset, size_t* row) {
+    DCHECK_LT(row_offset, n_rows_);
+    DCHECK(row);
+    return BitmapFindFirstSet(&bitmap_[0], row_offset, n_rows_, row);
+  }
+
+  // Sets '*selected' to the indices of all rows marked as selected
+  // in this selection vector.
+  void GetSelectedRows(std::vector<int>* selected) const;
+
   uint8_t *mutable_bitmap() {
     return &bitmap_[0];
   }
@@ -101,15 +117,8 @@ class SelectionVector {
 
   // Set all bits in the bitmap to 1
   void SetAllTrue() {
-    // Initially all rows should be selected.
     memset(&bitmap_[0], 0xff, n_bytes_);
-    // the last byte in the bitmap may have a few extra bits - need to
-    // clear those
-
-    int trailer_bits = 8 - (n_rows_ % 8);
-    if (trailer_bits != 8) {
-      bitmap_[n_bytes_ - 1] >>= trailer_bits;
-    }
+    PadExtraBitsWithZeroes();
   }
 
   // Set all bits in the bitmap to 0
@@ -119,7 +128,50 @@ class SelectionVector {
 
   size_t nrows() const { return n_rows_; }
 
+  // Copies a range of bits between two SelectionVectors.
+  //
+  // The extent of the range is designated by 'src_row_off' and 'num_rows'. It
+  // is copied to 'dst' at 'dst_row_off'.
+  //
+  // Note: 'dst' will be resized if the copy causes it to grow (though this is
+  // just a "logical" resize; no reallocation takes place).
+  void CopyTo(SelectionVector* dst, size_t src_row_off,
+              size_t dst_row_off, size_t num_rows) const {
+    DCHECK_GE(n_rows_, src_row_off + num_rows);
+
+    size_t new_num_rows = dst_row_off + num_rows;
+    if (new_num_rows > dst->nrows()) {
+      // This will crash if 'dst' lacks adequate capacity.
+      dst->Resize(new_num_rows);
+    }
+
+    BitmapCopy(dst->mutable_bitmap(), dst_row_off,
+               bitmap_.get(), src_row_off, num_rows);
+  }
+
+  std::string ToString() const {
+    return BitmapToString(&bitmap_[0], n_rows_);
+  }
+
  private:
+
+  // Pads any non-byte-aligned bits at the end of the SelectionVector with zeroes.
+  //
+  // To improve performance, CountSelected() and AnySelected() evaluate the
+  // SelectionVector's bitmap in terms of bytes. As such, they consider all of
+  // the trailing bits, even if the bitmap's bit length is not byte-aligned and
+  // some trailing bits aren't part of the bitmap.
+  //
+  // To address this without sacrificing performance, we need to zero out all
+  // trailing bits at construction time, or after any operation that sets all
+  // bytes in bulk.
+  void PadExtraBitsWithZeroes() {
+    size_t bits_in_last_byte = n_rows_ & 7;
+    if (bits_in_last_byte > 0) {
+      BitmapChangeBits(&bitmap_[0], n_rows_, 8 - bits_in_last_byte, false);
+    }
+  }
+
   // The number of allocated bytes in bitmap_
   size_t bytes_capacity_;
 
@@ -140,6 +192,9 @@ bool operator!=(const SelectionVector& a, const SelectionVector& b);
 // underlying selection vector can easily be updated batch-by-batch.
 class SelectionVectorView {
  public:
+  // Constructs a new SelectionVectorView.
+  //
+  // The 'sel_vec' object must outlive this SelectionVectorView.
   explicit SelectionVectorView(SelectionVector *sel_vec)
     : sel_vec_(sel_vec), row_offset_(0) {
   }
@@ -159,9 +214,10 @@ class SelectionVectorView {
     DCHECK_LE(row_idx, sel_vec_->nrows() - row_offset_);
     return BitmapTest(sel_vec_->bitmap(), row_offset_ + row_idx);
   }
-  void ClearBits(size_t nrows) {
-    DCHECK_LE(nrows, sel_vec_->nrows() - row_offset_);
-    BitmapChangeBits(sel_vec_->mutable_bitmap(), row_offset_, nrows, false);
+  // Clear "nrows" bits from the supplied "offset" in the current view.
+  void ClearBits(size_t nrows, size_t offset = 0) {
+    DCHECK_LE(offset + nrows, sel_vec_->nrows() - row_offset_);
+    BitmapChangeBits(sel_vec_->mutable_bitmap(), row_offset_ + offset, nrows, false);
   }
  private:
   SelectionVector* sel_vec_;
@@ -183,9 +239,12 @@ class SelectionVectorView {
 // of the latter doesn't mean you _should_.
 class RowBlock {
  public:
-  RowBlock(const Schema &schema,
+  // Constructs a new RowBlock.
+  //
+  // The 'schema' and 'arena' objects must outlive this RowBlock.
+  RowBlock(const Schema* schema,
            size_t nrows,
-           Arena *arena);
+           Arena* arena);
   ~RowBlock();
 
   // Resize the block to the given number of rows.
@@ -200,8 +259,8 @@ class RowBlock {
 
   RowBlockRow row(size_t idx) const;
 
-  const Schema &schema() const { return schema_; }
-  Arena *arena() const { return arena_; }
+  const Schema* schema() const { return schema_; }
+  Arena* arena() const { return arena_; }
 
   ColumnBlock column_block(size_t col_idx) const {
     return column_block(col_idx, nrows_);
@@ -210,9 +269,9 @@ class RowBlock {
   ColumnBlock column_block(size_t col_idx, size_t nrows) const {
     DCHECK_LE(nrows, nrows_);
 
-    const ColumnSchema& col_schema = schema_.column(col_idx);
-    uint8_t *col_data = columns_data_[col_idx];
-    uint8_t *nulls_bitmap = column_null_bitmaps_[col_idx];
+    const ColumnSchema& col_schema = schema_->column(col_idx);
+    uint8_t* col_data = columns_data_[col_idx];
+    uint8_t* nulls_bitmap = column_null_bitmaps_[col_idx];
 
     return ColumnBlock(col_schema.type_info(), nulls_bitmap, col_data, nrows, arena_);
   }
@@ -236,8 +295,8 @@ class RowBlock {
   // from unit tests.
   void ZeroMemory() {
     size_t bitmap_size = BitmapSize(row_capacity_);
-    for (size_t i = 0; i < schema_.num_columns(); ++i) {
-      const ColumnSchema& col_schema = schema_.column(i);
+    for (size_t i = 0; i < schema_->num_columns(); ++i) {
+      const ColumnSchema& col_schema = schema_->column(i);
       size_t col_size = col_schema.type_info()->size() * row_capacity_;
       memset(columns_data_[i], '\0', col_size);
 
@@ -254,12 +313,41 @@ class RowBlock {
   // as predicates or deletions make rows invalid, they are set to 0s.
   // After a batch has completed, only those rows with associated true
   // bits in the selection vector are valid results for the scan.
-  SelectionVector *selection_vector() {
+  SelectionVector* selection_vector() {
     return &sel_vec_;
   }
 
-  const SelectionVector *selection_vector() const {
+  const SelectionVector* selection_vector() const {
     return &sel_vec_;
+  }
+
+  // Copies a range of rows between two RowBlocks.
+  //
+  // The extent of the range is designated by 'src_row_off' and 'num_rows'. It
+  // is copied to 'dst' at 'dst_row_off'.
+  //
+  // Note: 'dst' will be resized if the copy causes it to grow (though this is
+  // just a "logical" resize; no reallocation takes place).
+  Status CopyTo(RowBlock* dst, size_t src_row_off,
+                size_t dst_row_off, size_t num_rows) const {
+    DCHECK_SCHEMA_EQ(*schema_, *dst->schema());
+    DCHECK_GE(nrows_, src_row_off + num_rows);
+
+    size_t new_num_rows = dst_row_off + num_rows;
+    if (new_num_rows > dst->nrows()) {
+      // This will crash if 'dst' lacks adequate capacity.
+      dst->Resize(new_num_rows);
+    }
+
+    for (size_t col_idx = 0; col_idx < schema_->num_columns(); col_idx++) {
+      ColumnBlock src_cb(column_block(col_idx));
+      ColumnBlock dst_cb(dst->column_block(col_idx));
+      RETURN_NOT_OK(src_cb.CopyTo(sel_vec_, &dst_cb,
+                                  src_row_off, dst_row_off, num_rows));
+    }
+
+    sel_vec_.CopyTo(&dst->sel_vec_, src_row_off, dst_row_off, num_rows);
+    return Status::OK();
   }
 
  private:
@@ -277,9 +365,9 @@ class RowBlock {
     return block_size;
   }
 
-  Schema schema_;
-  std::vector<uint8_t *> columns_data_;
-  std::vector<uint8_t *> column_null_bitmaps_;
+  const Schema* schema_;
+  std::vector<uint8_t*> columns_data_;
+  std::vector<uint8_t*> column_null_bitmaps_;
 
   // The maximum number of rows that can be stored in our allocated buffer.
   size_t row_capacity_;
@@ -288,7 +376,7 @@ class RowBlock {
   // nrows_ <= row_capacity_
   size_t nrows_;
 
-  Arena *arena_;
+  Arena* arena_;
 
   // The bitmap indicating which rows are valid in this block.
   // Deleted rows or rows which have failed to pass predicates will be zeroed
@@ -306,11 +394,15 @@ class RowBlockRow {
  public:
   typedef ColumnBlock::Cell Cell;
 
-  explicit RowBlockRow(const RowBlock *row_block = NULL, size_t row_index = 0)
+  // Constructs a new RowBlockRow.
+  //
+  // The 'row_block' object must outlive this RowBlockRow.
+  explicit RowBlockRow(const RowBlock* row_block = nullptr,
+                       size_t row_index = 0)
     : row_block_(row_block), row_index_(row_index) {
   }
 
-  RowBlockRow *Reset(const RowBlock *row_block, size_t row_index) {
+  RowBlockRow* Reset(const RowBlock* row_block, size_t row_index) {
     row_block_ = row_block;
     row_index_ = row_index;
     return this;
@@ -325,22 +417,22 @@ class RowBlockRow {
   }
 
   const Schema* schema() const {
-    return &row_block_->schema();
+    return row_block_->schema();
   }
 
   bool is_null(size_t col_idx) const {
     return column_block(col_idx).is_null(row_index_);
   }
 
-  uint8_t *mutable_cell_ptr(size_t col_idx) const {
+  uint8_t* mutable_cell_ptr(size_t col_idx) const {
     return const_cast<uint8_t*>(cell_ptr(col_idx));
   }
 
-  const uint8_t *cell_ptr(size_t col_idx) const {
+  const uint8_t* cell_ptr(size_t col_idx) const {
     return column_block(col_idx).cell_ptr(row_index_);
   }
 
-  const uint8_t *nullable_cell_ptr(size_t col_idx) const {
+  const uint8_t* nullable_cell_ptr(size_t col_idx) const {
     return column_block(col_idx).nullable_cell_ptr(row_index_);
   }
 
@@ -354,23 +446,23 @@ class RowBlockRow {
 
   // Mark this row as unselected in the selection vector.
   void SetRowUnselected() {
-    // TODO: const-ness issues since this class holds a const RowBlock *.
+    // TODO(todd): const-ness issues since this class holds a const RowBlock*.
     // hack around this for now
-    SelectionVector *vec = const_cast<SelectionVector *>(row_block_->selection_vector());
+    SelectionVector* vec = const_cast<SelectionVector*>(row_block_->selection_vector());
     vec->SetRowUnselected(row_index_);
   }
 
 #ifndef NDEBUG
   void OverwriteWithPattern(StringPiece pattern) {
-    const Schema& schema = row_block_->schema();
-    for (size_t col = 0; col < schema.num_columns(); col++) {
+    const Schema* schema = row_block_->schema();
+    for (size_t col = 0; col < schema->num_columns(); col++) {
       row_block_->column_block(col).OverwriteWithPattern(row_index_, pattern);
     }
   }
 #endif
 
  private:
-  const RowBlock *row_block_;
+  const RowBlock* row_block_;
   size_t row_index_;
 };
 

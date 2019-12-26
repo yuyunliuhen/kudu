@@ -23,24 +23,21 @@
 #include <glog/logging.h>
 
 #include "kudu/common/wire_protocol.h"
-#include "kudu/tablet/rowset.h"
 #include "kudu/tablet/tablet.pb.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/status.h"
 
 using kudu::pb_util::SecureDebugString;
 
 namespace kudu {
 
-class Status;
-
 namespace tablet {
 
-RowOp::RowOp(DecodedRowOperation decoded_op)
-    : decoded_op(std::move(decoded_op)),
-      orig_result_from_log_(nullptr) {
-}
-
-RowOp::~RowOp() {
+RowOp::RowOp(DecodedRowOperation op)
+    : decoded_op(std::move(op)) {
+  if (!decoded_op.result.ok()) {
+    SetFailed(decoded_op.result);
+  }
 }
 
 void RowOp::SetFailed(const Status& s) {
@@ -65,7 +62,6 @@ std::string RowOp::ToString(const Schema& schema) const {
 }
 
 void RowOp::SetSkippedResult(const OperationResultPB& result) {
-  DCHECK(!this->result) << SecureDebugString(*this->result);
   DCHECK(result.skip_on_replay());
   this->result.reset(new OperationResultPB(result));
 }

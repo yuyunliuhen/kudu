@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import time
 
+from dep_extract import DependencyExtractor
 from kudu_util import init_logging
 
 TEST_TIMEOUT_SECS = int(os.environ.get('TEST_TIMEOUT_SECS', '900'))
@@ -58,6 +59,9 @@ MAX_TASKS_PER_JOB=10000
 # of retries, so we have to subtract 1.
 FLAKY_TEST_RETRIES = int(os.environ.get('KUDU_FLAKY_TEST_ATTEMPTS', 1)) - 1
 
+# Whether to only run flaky tests or to run all tests.
+RUN_FLAKY_ONLY = int(os.environ.get('RUN_FLAKY_ONLY', 0))
+
 # Whether to retry all failed C++ tests, rather than just known flaky tests.
 # Since Java flaky tests are not reported by the test server, Java tests are
 # always retried, regardless of this value.
@@ -69,19 +73,20 @@ GRADLE_FLAGS = os.environ.get('EXTRA_GRADLE_FLAGS', "")
 PATH_TO_REPO = "../"
 
 # Matches the command line listings in 'ctest -V -N'. For example:
-#   262: Test command: /src/kudu/build-support/run-test.sh "/src/kudu/build/debug/bin/jsonwriter-test"
+#  262: Test command: /src/kudu/build-support/run-test.sh "/src/kudu/build/debug/bin/jsonwriter-test"
 TEST_COMMAND_RE = re.compile('Test command: (.+)$')
 
 # Matches the environment variable listings in 'ctest -V -N'. For example:
 #  262:  GTEST_TOTAL_SHARDS=1
 TEST_ENV_RE = re.compile('^\d+:  (\S+)=(.+)')
 
-# Matches the output lines of 'ldd'. For example:
-#   libcrypto.so.10 => /path/to/usr/lib64/libcrypto.so.10 (0x00007fb0cb0a5000)
-LDD_RE = re.compile(r'^\s+.+? => (\S+) \(0x.+\)')
+# Matches test names that have a shard suffix. For example:
+#  master-stress-test.8
+TEST_SHARD_RE = re.compile("\.\d+$")
 
 DEPS_FOR_ALL = \
     ["build-support/stacktrace_addr2line.pl",
+     "build-support/report-test.sh",
      "build-support/run-test.sh",
      "build-support/run_dist_test.py",
      "build-support/java-home-candidates.txt",
@@ -107,6 +112,10 @@ DEPS_FOR_ALL = \
 
      # Add the Kudu HMS plugin.
      "build/latest/bin/hms-plugin.jar",
+
+     # Add chrony binaries.
+     "build/latest/bin/chronyc",
+     "build/latest/bin/chronyd",
      ]
 
 class StagingDir(object):
@@ -219,14 +228,21 @@ def get_test_executions(tests_regex, extra_args=None):
   return execs
 
 
-def is_lib_blacklisted(lib):
+def is_lib_whitelisted(lib):
   # No need to ship things like libc, libstdcxx, etc.
   if lib.startswith("/lib") or lib.startswith("/usr"):
-    return True
-  return False
+    return False
+  return True
 
 
-def get_base_deps():
+def create_dependency_extractor():
+  dep_extractor = DependencyExtractor()
+  dep_extractor.set_library_filter(is_lib_whitelisted)
+  dep_extractor.set_expand_symlinks(True)
+  return dep_extractor
+
+
+def get_base_deps(dep_extractor):
   deps = []
   for d in DEPS_FOR_ALL:
     d = os.path.realpath(rel_to_abs(d))
@@ -236,7 +252,7 @@ def get_base_deps():
     # DEPS_FOR_ALL may include binaries whose dependencies are not dependencies
     # of the test executable. We must include those dependencies in the archive
     # for the binaries to be usable.
-    deps.extend(ldd_deps(d))
+    deps.extend(dep_extractor.extract_deps(d))
   return deps
 
 
@@ -265,51 +281,21 @@ def copy_system_library(lib):
     shutil.copy2(rel_to_abs(lib), dst)
   return dst
 
-LDD_CACHE={}
-def ldd_deps(exe):
+def forward_env_var(command_list, var_name, is_required=True):
   """
-  Runs 'ldd' on the provided 'exe' path, returning a list of
-  any libraries it depends on. Blacklisted libraries are
-  removed from this list.
+  Extends 'command_list' with the name and value of the environment variable
+  given by 'var_name'.
 
-  If the provided 'exe' is not a binary executable, returns
-  an empty list.
+  Does nothing if the environment variable isn't set or is empty, unless
+  'is_required' is True, in which case an exception is raised.
   """
-  if (exe.endswith(".jar") or
-      exe.endswith(".pl") or
-      exe.endswith(".py") or
-      exe.endswith(".sh") or
-      exe.endswith(".txt") or
-      os.path.isdir(exe)):
-    return []
-  if exe not in LDD_CACHE:
-    p = subprocess.Popen(["ldd", exe], stdout=subprocess.PIPE)
-    out, err = p.communicate()
-    LDD_CACHE[exe] = (out, err, p.returncode)
-  out, err, rc = LDD_CACHE[exe]
-  if rc != 0:
-    logging.warning("failed to run ldd on %s", exe)
-    return []
-  ret = []
-  for l in out.splitlines():
-    m = LDD_RE.match(l)
-    if not m:
-      continue
-    lib = m.group(1)
-    if is_lib_blacklisted(lib):
-      continue
-    path = m.group(1)
-    ret.append(m.group(1))
+  if not var_name in os.environ or not os.environ.get(var_name):
+    if is_required:
+      raise Exception("required env variable %s is missing" % (var_name,))
+    return
+  command_list.extend(["-e", "%s=%s" % (var_name, os.environ.get(var_name))])
 
-    # ldd will often point to symlinks. We need to upload the symlink
-    # as well as whatever it's pointing to, recursively.
-    while os.path.islink(path):
-      path = os.path.join(os.path.dirname(path), os.readlink(path))
-      ret.append(path)
-  return ret
-
-
-def create_archive_input(staging, execution,
+def create_archive_input(staging, execution, dep_extractor,
                          collect_tmpdir=False):
   """
   Generates .gen.json and .isolate files corresponding to the
@@ -325,8 +311,8 @@ def create_archive_input(staging, execution,
   argv[1] = rel_test_exe
   files = []
   files.append(rel_test_exe)
-  deps = ldd_deps(abs_test_exe)
-  deps.extend(get_base_deps())
+  deps = dep_extractor.extract_deps(abs_test_exe)
+  deps.extend(get_base_deps(dep_extractor))
 
   # Deduplicate dependencies included via DEPS_FOR_ALL.
   for d in set(deps):
@@ -360,6 +346,15 @@ def create_archive_input(staging, execution,
       continue
     command.extend(['-e', '%s=%s' % (k, v)])
 
+  # If test result reporting was requested, forward all relevant environment
+  # variables into the test process so as to enable reporting.
+  if os.environ.get('KUDU_REPORT_TEST_RESULTS', 0):
+    forward_env_var(command, 'KUDU_REPORT_TEST_RESULTS')
+    forward_env_var(command, 'BUILD_CONFIG')
+    forward_env_var(command, 'BUILD_TAG')
+    forward_env_var(command, 'GIT_REVISION')
+    forward_env_var(command, 'TEST_RESULT_SERVER', is_required=False)
+
   if collect_tmpdir:
     command += ["--collect-tmpdir"]
   command.append('--')
@@ -387,6 +382,10 @@ def create_task_json(staging,
 
   If 'replicate_tasks' is higher than one, each .isolate file will be
   submitted multiple times. This can be useful for looping tests.
+
+  The test name is compared with the contents of 'flaky_test_set' to decide
+  how many times the execution service should retry the test on failure.
+  Alternatively, if 'retry_all_tests' is True, all tests will be retried.
   """
   tasks = []
   with file(staging.archive_dump_path(), "r") as isolate_dump:
@@ -396,9 +395,9 @@ def create_task_json(staging,
   # the dumped JSON. Others list it in an 'items' dictionary.
   items = inmap.get('items', inmap)
   for k, v in items.iteritems():
-    # The key is 'foo-test.<shard>'. So, chop off the last component
-    # to get the test name
-    test_name = ".".join(k.split(".")[:-1])
+    # The key may be 'foo-test.<shard>'. So, chop off the last component
+    # to get the test name.
+    test_name = ".".join(k.split(".")[:-1]) if TEST_SHARD_RE.search(k) else k
     max_retries = 0
     if test_name in flaky_test_set or retry_all_tests:
       max_retries = FLAKY_TEST_RETRIES
@@ -466,27 +465,50 @@ def get_flakies():
   path = os.getenv('KUDU_FLAKY_TEST_LIST')
   if not path:
     return set()
-  return set(l.strip() for l in file(path))
+
+  # dist-test can only retry tests on a per-class basis, but
+  # KUDU_FLAKY_TEST_LIST lists Java flakes on a per-method basis.
+  flaky_classes = []
+  with open(path) as f:
+    for l in f:
+      l = l.strip()
+      if '.' in l:
+        # "o.a.k.client.TestKuduClient.testFoo" -> "o.a.k.client.TestKuduClient"
+        flaky_classes.append('.'.join(l.split('.')[:-1]))
+      else:
+        flaky_classes.append(l)
+
+  return set(flaky_classes)
 
 def run_tests(parser, options):
   """
   Gets all of the test command lines from 'ctest', isolates them,
   creates a task list, and submits the tasks to the testing service.
   """
-  executions = get_test_executions(options.tests_regex)
+  flakies = get_flakies()
+  if RUN_FLAKY_ONLY:
+    if options.tests_regex:
+      raise Exception("Cannot use RUN_FLAKY_ONLY with --tests-regex")
+    tests_regex = "|".join(["^" + re.escape(f) for f in flakies])
+  else:
+    tests_regex = options.tests_regex
+  executions = get_test_executions(tests_regex)
+  if not executions:
+    raise Exception("No matching tests found for pattern %s" % tests_regex)
   if options.extra_args:
     if options.extra_args[0] == '--':
       del options.extra_args[0]
     for e in executions:
       e.argv.extend(options.extra_args)
   staging = StagingDir.new()
+  dep_extractor = create_dependency_extractor()
   for execution in executions:
-    create_archive_input(staging, execution,
+    create_archive_input(staging, execution, dep_extractor,
                          collect_tmpdir=options.collect_tmpdir)
   run_isolate(staging)
   retry_all = RETRY_ALL_TESTS > 0
   create_task_json(staging,
-                   flaky_test_set=get_flakies(),
+                   flaky_test_set=flakies,
                    replicate_tasks=options.num_instances,
                    retry_all_tests=retry_all)
   submit_tasks(staging, options)
@@ -529,6 +551,8 @@ def loop_test(parser, options):
   # 'ts_location_assignment-itest'.
   tests_regex = "^" + os.path.basename(options.cmd) + "(\.[0-9]+)?$"
   executions = get_test_executions(tests_regex, options.args)
+  if not executions:
+    raise Exception("No matching tests found for pattern %s" % tests_regex)
   staging = StagingDir.new()
   # The presence of the --gtest_filter flag means the user is interested in a
   # particular subset of tests provided by the binary. In that case it doesn't
@@ -545,13 +569,13 @@ def loop_test(parser, options):
     e = executions[0]
     e.env["GTEST_TOTAL_SHARDS"] = 1
     e.env["GTEST_SHARD_INDEX"] = 0
+  dep_extractor = create_dependency_extractor()
   for execution in executions:
-    create_archive_input(staging, execution,
+    create_archive_input(staging, execution, dep_extractor,
                          collect_tmpdir=options.collect_tmpdir)
   run_isolate(staging)
   create_task_json(staging, options.num_instances)
   submit_tasks(staging, options)
-
 
 def add_loop_test_subparser(subparsers):
   p = subparsers.add_parser("loop",
@@ -572,17 +596,32 @@ def add_loop_test_subparser(subparsers):
   p.add_argument("args", nargs=argparse.REMAINDER, help="test arguments")
   p.set_defaults(func=loop_test)
 
+def get_gradle_cmd_line(options):
+  cmd = [rel_to_abs("java/gradlew")]
+  cmd.extend(GRADLE_FLAGS.split())
+  cmd.append("distTest")
+  if options.collect_tmpdir:
+    cmd.append("--collect-tmpdir")
+  return cmd
 
 def run_java_tests(parser, options):
-  subprocess.check_call([rel_to_abs("java/gradlew")] + GRADLE_FLAGS.split() +
-                        ["distTest"],
-                        cwd=rel_to_abs("java"))
+  flakies = get_flakies()
+  cmd = get_gradle_cmd_line(options)
+  if RUN_FLAKY_ONLY:
+    for f in flakies:
+      # As per the Gradle docs[1], test classes are included by filename, so we
+      # need to convert the class names into file paths.
+      #
+      # 1. https://docs.gradle.org/current/javadoc/org/gradle/api/tasks/testing/Test.html
+      cmd.extend([ "--classes", "%s.class" % f.replace(".", "/") ])
+  subprocess.check_call(cmd, cwd=rel_to_abs("java"))
   staging = StagingDir(rel_to_abs("java/build/dist-test"))
   run_isolate(staging)
-  # TODO(ghenke): Add Java tests to the flaky dashboard
-  # KUDU_FLAKY_TEST_LIST doesn't included Java tests.
-  # Instead we will retry all Java tests in case they are flaky.
-  create_task_json(staging, 1, retry_all_tests=True)
+  retry_all = RETRY_ALL_TESTS > 0
+  create_task_json(staging,
+                   flaky_test_set=flakies,
+                   replicate_tasks=1,
+                   retry_all_tests=retry_all)
   submit_tasks(staging, options)
 
 def loop_java_test(parser, options):
@@ -591,14 +630,15 @@ def loop_java_test(parser, options):
   """
   if options.num_instances < 1:
     parser.error("--num-instances must be >= 1")
-  subprocess.check_call([rel_to_abs("java/gradlew")] + GRADLE_FLAGS.split() +
-                        ["distTest", "--classes", "**/%s" % options.pattern],
-                        cwd=rel_to_abs("java"))
+  cmd = get_gradle_cmd_line(options)
+  # Test classes are matched by filename, so unless we convert dots into forward
+  # slashes, package name prefixes will never match anything.
+  cmd.extend([ "--classes", "**/%s.class" % options.pattern.replace(".", "/") ])
+  subprocess.check_call(cmd, cwd=rel_to_abs("java"))
   staging = StagingDir(rel_to_abs("java/build/dist-test"))
   run_isolate(staging)
   create_task_json(staging, options.num_instances)
   submit_tasks(staging, options)
-
 
 def add_java_subparser(subparsers):
   p = subparsers.add_parser('java', help='Run java tests via dist-test')
@@ -614,15 +654,12 @@ def add_java_subparser(subparsers):
   loop.add_argument("pattern", help="Pattern matching a Java test class to run")
   loop.set_defaults(func=loop_java_test)
 
-
 def dump_base_deps(parser, options):
-  print json.dumps(get_base_deps())
-
+  print json.dumps(get_base_deps(create_dependency_extractor()))
 
 def add_internal_commands(subparsers):
   p = subparsers.add_parser('internal', help="[Internal commands not for users]")
   p.add_subparsers().add_parser('dump_base_deps').set_defaults(func=dump_base_deps)
-
 
 def main(argv):
   p = argparse.ArgumentParser()
@@ -637,7 +674,6 @@ def main(argv):
   add_internal_commands(sp)
   args = p.parse_args(argv)
   args.func(p, args)
-
 
 if __name__ == "__main__":
   init_logging()

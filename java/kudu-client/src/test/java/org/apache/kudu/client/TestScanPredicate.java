@@ -25,7 +25,6 @@ import java.util.TreeSet;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSortedSet;
-import org.apache.kudu.test.KuduTestHarness;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Rule;
@@ -35,6 +34,8 @@ import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.client.KuduPredicate.ComparisonOp;
+import org.apache.kudu.test.KuduTestHarness;
+import org.apache.kudu.util.CharUtil;
 import org.apache.kudu.util.DecimalUtil;
 
 public class TestScanPredicate {
@@ -53,7 +54,16 @@ public class TestScanPredicate {
 
   private Schema createTableSchema(Type type) {
     ColumnSchema key = new ColumnSchema.ColumnSchemaBuilder("key", Type.INT64).key(true).build();
-    ColumnSchema val = new ColumnSchema.ColumnSchemaBuilder("value", type).nullable(true).build();
+    ColumnSchema val;
+    switch (type) {
+      case VARCHAR:
+        val = new ColumnSchema.ColumnSchemaBuilder("value", type)
+          .typeAttributes(CharUtil.typeAttributes(10)).nullable(true).build();
+        break;
+      default:
+        val = new ColumnSchema.ColumnSchemaBuilder("value", type).nullable(true).build();
+        break;
+    }
     return new Schema(ImmutableList.of(key, val));
   }
 
@@ -62,7 +72,8 @@ public class TestScanPredicate {
   }
 
   private int countRows(KuduTable table, KuduPredicate... predicates) throws Exception {
-    KuduScanner.KuduScannerBuilder scanBuilder =  new KuduScanner.KuduScannerBuilder(asyncClient, table);
+    KuduScanner.KuduScannerBuilder scanBuilder =
+        new KuduScanner.KuduScannerBuilder(asyncClient, table);
     for (KuduPredicate predicate : predicates) {
       scanBuilder.addPredicate(predicate);
     }
@@ -138,9 +149,8 @@ public class TestScanPredicate {
         100.0F,
         Float.MAX_VALUE,
         Float.POSITIVE_INFINITY
-
-        // TODO: uncomment after fixing KUDU-1386
-        // Float.NaN
+    // TODO: uncomment after fixing KUDU-1386
+    // Float.NaN
     );
   }
 
@@ -182,8 +192,8 @@ public class TestScanPredicate {
         Double.MAX_VALUE,
         Double.POSITIVE_INFINITY
 
-        // TODO: uncomment after fixing KUDU-1386
-        // Double.NaN
+    // TODO: uncomment after fixing KUDU-1386
+    // Double.NaN
     );
   }
 
@@ -284,7 +294,7 @@ public class TestScanPredicate {
       session.apply(insert);
     }
     Insert nullInsert = table.newInsert();
-    nullInsert.getRow().addLong("key", i++);
+    nullInsert.getRow().addLong("key", i);
     nullInsert.getRow().setNull("value");
     session.apply(nullInsert);
     session.flush();
@@ -336,7 +346,7 @@ public class TestScanPredicate {
       session.apply(insert);
     }
     Insert nullInsert = table.newInsert();
-    nullInsert.getRow().addLong("key", i++);
+    nullInsert.getRow().addLong("key", i);
     nullInsert.getRow().setNull("value");
     session.apply(nullInsert);
     session.flush();
@@ -349,7 +359,7 @@ public class TestScanPredicate {
     Schema schema = createTableSchema(Type.INT16);
     client.createTable("short-table", schema,
                            new CreateTableOptions().setRangePartitionColumns(
-                               ImmutableList.<String>of()));
+                               ImmutableList.of()));
     KuduTable table = client.openTable("short-table");
 
     NavigableSet<Long> values = createIntegerValues(Type.INT16);
@@ -363,7 +373,7 @@ public class TestScanPredicate {
       session.apply(insert);
     }
     Insert nullInsert = table.newInsert();
-    nullInsert.getRow().addLong("key", i++);
+    nullInsert.getRow().addLong("key", i);
     nullInsert.getRow().setNull("value");
     session.apply(nullInsert);
     session.flush();
@@ -388,7 +398,7 @@ public class TestScanPredicate {
       session.apply(insert);
     }
     Insert nullInsert = table.newInsert();
-    nullInsert.getRow().addLong("key", i++);
+    nullInsert.getRow().addLong("key", i);
     nullInsert.getRow().setNull("value");
     session.apply(nullInsert);
     session.flush();
@@ -401,7 +411,7 @@ public class TestScanPredicate {
     Schema schema = createTableSchema(Type.INT64);
     client.createTable("long-table", schema,
                            new CreateTableOptions().setRangePartitionColumns(
-                               ImmutableList.<String>of()));
+                               ImmutableList.of()));
     KuduTable table = client.openTable("long-table");
 
     NavigableSet<Long> values = createIntegerValues(Type.INT64);
@@ -415,7 +425,7 @@ public class TestScanPredicate {
       session.apply(insert);
     }
     Insert nullInsert = table.newInsert();
-    nullInsert.getRow().addLong("key", i++);
+    nullInsert.getRow().addLong("key", i);
     nullInsert.getRow().setNull("value");
     session.apply(nullInsert);
     session.flush();
@@ -440,7 +450,7 @@ public class TestScanPredicate {
       session.apply(insert);
     }
     Insert nullInsert = table.newInsert();
-    nullInsert.getRow().addLong("key", i++);
+    nullInsert.getRow().addLong("key", i);
     nullInsert.getRow().setNull("value");
     session.apply(nullInsert);
     session.flush();
@@ -455,7 +465,7 @@ public class TestScanPredicate {
     KuduTable table = client.openTable("float-table");
 
     NavigableSet<Float> values = createFloatValues();
-    List<Float> testValues = createFloatTestValues();
+    final List<Float> testValues = createFloatTestValues();
     KuduSession session = client.newSession();
     session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
     long i = 0;
@@ -466,7 +476,7 @@ public class TestScanPredicate {
       session.apply(insert);
     }
     Insert nullInsert = table.newInsert();
-    nullInsert.getRow().addLong("key", i++);
+    nullInsert.getRow().addLong("key", i);
     nullInsert.getRow().setNull("value");
     session.apply(nullInsert);
     session.flush();
@@ -514,7 +524,7 @@ public class TestScanPredicate {
     KuduTable table = client.openTable("double-table");
 
     NavigableSet<Double> values = createDoubleValues();
-    List<Double> testValues = createDoubleTestValues();
+    final List<Double> testValues = createDoubleTestValues();
     KuduSession session = client.newSession();
     session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
     long i = 0;
@@ -525,7 +535,7 @@ public class TestScanPredicate {
       session.apply(insert);
     }
     Insert nullInsert = table.newInsert();
-    nullInsert.getRow().addLong("key", i++);
+    nullInsert.getRow().addLong("key", i);
     nullInsert.getRow().setNull("value");
     session.apply(nullInsert);
     session.flush();
@@ -577,7 +587,7 @@ public class TestScanPredicate {
     KuduTable table = client.openTable("decimal-table");
 
     NavigableSet<BigDecimal> values = createDecimalValues();
-    List<BigDecimal> testValues = createDecimalTestValues();
+    final List<BigDecimal> testValues = createDecimalTestValues();
     KuduSession session = client.newSession();
     session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
     long i = 0;
@@ -588,7 +598,7 @@ public class TestScanPredicate {
       session.apply(insert);
     }
     Insert nullInsert = table.newInsert();
-    nullInsert.getRow().addLong("key", i++);
+    nullInsert.getRow().addLong("key", i);
     nullInsert.getRow().setNull("value");
     session.apply(nullInsert);
     session.flush();
@@ -631,23 +641,41 @@ public class TestScanPredicate {
 
   @Test
   public void testStringPredicates() throws Exception {
-    Schema schema = createTableSchema(Type.STRING);
+    testVarlengthPredicates(Type.STRING);
+  }
+
+  @Test
+  public void testVarcharPredicates() throws Exception {
+    testVarlengthPredicates(Type.VARCHAR);
+  }
+
+  private void testVarlengthPredicates(Type type) throws Exception {
+    Schema schema = createTableSchema(type);
     client.createTable("string-table", schema, createTableOptions());
     KuduTable table = client.openTable("string-table");
 
     NavigableSet<String> values = createStringValues();
-    List<String> testValues = createStringTestValues();
+    final List<String> testValues = createStringTestValues();
     KuduSession session = client.newSession();
     session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
     long i = 0;
     for (String value : values) {
       Insert insert = table.newInsert();
       insert.getRow().addLong("key", i++);
-      insert.getRow().addString("value", value);
+      switch (type) {
+        case VARCHAR:
+          insert.getRow().addVarchar("value", value);
+          break;
+        case STRING:
+          insert.getRow().addString("value", value);
+          break;
+        default:
+          throw new IllegalArgumentException("CHAR/VARCHAR/STRING expected");
+      }
       session.apply(insert);
     }
     Insert nullInsert = table.newInsert();
-    nullInsert.getRow().addLong("key", i++);
+    nullInsert.getRow().addLong("key", i);
     nullInsert.getRow().setNull("value");
     session.apply(nullInsert);
     session.flush();
@@ -695,7 +723,7 @@ public class TestScanPredicate {
     KuduTable table = client.openTable("binary-table");
 
     NavigableSet<String> values = createStringValues();
-    List<String> testValues = createStringTestValues();
+    final List<String> testValues = createStringTestValues();
     KuduSession session = client.newSession();
     session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
     long i = 0;
@@ -706,7 +734,7 @@ public class TestScanPredicate {
       session.apply(insert);
     }
     Insert nullInsert = table.newInsert();
-    nullInsert.getRow().addLong("key", i++);
+    nullInsert.getRow().addLong("key", i);
     nullInsert.getRow().setNull("value");
     session.apply(nullInsert);
     session.flush();

@@ -20,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -32,6 +33,7 @@
 
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
 
@@ -46,6 +48,26 @@ RowIteratorOptions::RowIteratorOptions()
       snap_to_include(MvccSnapshot::CreateSnapshotIncludingAllTransactions()),
       order(OrderMode::UNORDERED),
       include_deleted_rows(false) {}
+
+Status RowSet::NewRowIteratorWithBounds(const RowIteratorOptions& opts,
+                                        IterWithBounds* out) const {
+  // Get the iterator.
+  unique_ptr<RowwiseIterator> iter;
+  RETURN_NOT_OK(NewRowIterator(opts, &iter));
+
+  // Get the bounds. Some rowsets (e.g. MRS) have no bounds; that's OK as the
+  // bounds aren't required.
+  string lower;
+  string upper;
+  Status s = GetBounds(&lower, &upper);
+  if (s.ok()) {
+    out->encoded_bounds = std::make_pair(std::move(lower), std::move(upper));
+  } else if (!s.IsNotSupported()) {
+    RETURN_NOT_OK(s);
+  }
+  out->iter = std::move(iter);
+  return Status::OK();
+}
 
 DuplicatingRowSet::DuplicatingRowSet(RowSetVector old_rowsets,
                                      RowSetVector new_rowsets)
@@ -84,28 +106,28 @@ string DuplicatingRowSet::ToString() const {
 }
 
 Status DuplicatingRowSet::NewRowIterator(const RowIteratorOptions& opts,
-                                         gscoped_ptr<RowwiseIterator>* out) const {
+                                         unique_ptr<RowwiseIterator>* out) const {
   // Use the original rowset.
   if (old_rowsets_.size() == 1) {
     return old_rowsets_[0]->NewRowIterator(opts, out);
   }
   // Union or merge between them
 
-  vector<shared_ptr<RowwiseIterator> > iters;
-  for (const shared_ptr<RowSet> &rowset : old_rowsets_) {
-    gscoped_ptr<RowwiseIterator> iter;
-    RETURN_NOT_OK_PREPEND(rowset->NewRowIterator(opts, &iter),
+  vector<IterWithBounds> iters;
+  for (const auto& rs : old_rowsets_) {
+    IterWithBounds iwb;
+    RETURN_NOT_OK_PREPEND(rs->NewRowIteratorWithBounds(opts, &iwb),
                           Substitute("Could not create iterator for rowset $0",
-                                     rowset->ToString()));
-    iters.push_back(shared_ptr<RowwiseIterator>(iter.release()));
+                                     rs->ToString()));
+    iters.emplace_back(std::move(iwb));
   }
 
   switch (opts.order) {
     case ORDERED:
-      out->reset(new MergeIterator(*opts.projection, std::move(iters)));
+      *out = NewMergeIterator(MergeIteratorOptions(opts.include_deleted_rows), std::move(iters));
       break;
     case UNORDERED:
-      out->reset(new UnionIterator(std::move(iters)));
+      *out = NewUnionIterator(std::move(iters));
       break;
     default:
       LOG(FATAL) << "unknown order: " << opts.order;
@@ -205,6 +227,15 @@ Status DuplicatingRowSet::CountRows(const IOContext* io_context, rowid_t *count)
     << "TODO: should make sure this is 64-bit safe - probably not right now"
     << " because rowid_t is only 32-bit.";
   *count = accumulated_count;
+  return Status::OK();
+}
+
+Status DuplicatingRowSet::CountLiveRows(uint64_t* count) const {
+  for (const shared_ptr<RowSet>& rs : old_rowsets_) {
+    uint64_t tmp = 0;
+    RETURN_NOT_OK(rs->CountLiveRows(&tmp));
+    *count += tmp;
+  }
   return Status::OK();
 }
 

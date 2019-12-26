@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-[[schema_design]]
 = Apache Kudu Schema Design
 :author: Kudu Team
 :imagesdir: ./images
@@ -26,6 +25,9 @@
 :backend: html5
 :sectlinks:
 :experimental:
+
+[[schema_design]]
+== Overview
 
 Kudu tables have a structured data model similar to tables in a traditional
 RDBMS. Schema design is critical for achieving the best performance and
@@ -76,6 +78,7 @@ column types include:
 * decimal (see <<decimal>> for details)
 * UTF-8 encoded string (up to 64KB uncompressed)
 * binary (up to 64KB uncompressed)
+* VARCHAR type with configurable maximum length (up to 64KB uncompressed)
 
 Kudu takes advantage of strongly-typed columns and a columnar on-disk storage
 format to provide efficient encoding and serialization. To make the most of
@@ -147,7 +150,7 @@ of the column.
 | int64, unixtime_micros  | plain, bitshuffle, run length  | bitshuffle
 | float, double, decimal  | plain, bitshuffle              | bitshuffle
 | bool                    | plain, run length              | run length
-| string, binary          | plain, prefix, dictionary      | dictionary
+| string, binary, varchar | plain, prefix, dictionary      | dictionary
 |===
 
 [[plain]]
@@ -186,9 +189,10 @@ tablets.
 === Column Compression
 
 Kudu allows per-column compression using the `LZ4`, `Snappy`, or `zlib`
-compression codecs. By default, columns are stored uncompressed. Consider using
-compression if reducing storage space is more important than raw scan
-performance.
+compression codecs. By default, columns that are Bitshuffle-encoded are
+inherently compressed with LZ4 compression. Otherwise, columns are stored
+uncompressed. Consider using compression if reducing storage space is more
+important than raw scan performance.
 
 Every data set will compress differently, but in general LZ4 is the most
 performant codec, while `zlib` will compress to the smallest data sizes.
@@ -400,7 +404,7 @@ CREATE TABLE metrics (
     metric STRING NOT NULL,
     time INT64 NOT NULL,
     value DOUBLE NOT NULL,
-    PRIMARY KEY (host, metric, time),
+    PRIMARY KEY (host, metric, time)
 );
 ----
 

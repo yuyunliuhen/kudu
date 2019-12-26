@@ -22,8 +22,8 @@
 
 #include <glog/logging.h>
 
-#include "kudu/fs/block_manager_util.h"
 #include "kudu/fs/data_dirs.h"
+#include "kudu/fs/dir_util.h"
 #include "kudu/fs/fs.pb.h"
 #include "kudu/gutil/callback.h"
 #include "kudu/gutil/port.h"
@@ -48,7 +48,7 @@ typedef Callback<void(const std::string&)> ErrorNotificationCb;
   } \
   HandleError(_s); \
   return _s; \
-} while (0);
+} while (0)
 
 // Evaluates the expression and runs 'err_handler' if it results in a disk
 // failure. Returns if the expression results in an error.
@@ -61,7 +61,7 @@ typedef Callback<void(const std::string&)> ErrorNotificationCb;
     (err_handler); \
   } \
   return _s; \
-} while (0);
+} while (0)
 
 // Evaluates the expression and runs 'err_handler' if it results in a
 // corruption. Returns if the expression results in an error.
@@ -74,7 +74,7 @@ typedef Callback<void(const std::string&)> ErrorNotificationCb;
     (err_handler); \
   } \
   return _s; \
-} while (0);
+} while (0)
 
 // Evaluates the expression and runs 'err_handler' if it results in a disk
 // failure.
@@ -83,7 +83,7 @@ typedef Callback<void(const std::string&)> ErrorNotificationCb;
   if (PREDICT_FALSE(_s.IsDiskFailure())) { \
     (err_handler); \
   } \
-} while (0);
+} while (0)
 
 enum ErrorHandlerType {
   // For disk failures.
@@ -147,9 +147,9 @@ class FsErrorManager {
   void RunErrorNotificationCb(ErrorHandlerType e, const std::string& uuid) const;
 
   // Runs the error notification callback with the UUID of 'dir'.
-  void RunErrorNotificationCb(ErrorHandlerType e, const DataDir* dir) const {
+  void RunErrorNotificationCb(ErrorHandlerType e, const Dir* dir) const {
     DCHECK_EQ(e, ErrorHandlerType::DISK_ERROR);
-    RunErrorNotificationCb(e, dir->instance()->metadata()->path_set().uuid());
+    RunErrorNotificationCb(e, dir->instance()->uuid());
   }
 
  private:

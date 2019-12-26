@@ -159,6 +159,15 @@ message KinitRequestPB {
   optional string username = 1 [ default = "test-admin" ];
 };
 
+// Call SetFlag() on the specific daemon.
+message SetDaemonFlagRequestPB {
+  // The identifier for the daemon to sent the request to.
+  optional DaemonIdentifierPB id = 1;
+  // The name of the flag to set.
+  optional string flag = 2;
+  // Value to set.
+  optional string value = 3;
+}
 
 // Sent by the control shell in response to a control shell command request.
 message ControlShellResponsePB {
@@ -194,6 +203,7 @@ message ControlShellRequestPB {
     GetKDCEnvVarsRequestPB get_kdc_env_vars = 9;
     KdestroyRequestPB kdestroy = 10;
     KinitRequestPB kinit = 11;
+    SetDaemonFlagRequestPB set_daemon_flag = 12;
   }
 }
 
@@ -202,20 +212,22 @@ message ControlShellRequestPB {
 message KsckResultsPB {
   repeated string errors = 1;
 
-  repeated KsckServerHealthSummaryPB master_summaries = 2;
-  repeated KsckServerHealthSummaryPB tserver_summaries = 3;
+  repeated ServerHealthSummaryPB master_summaries = 2;
+  repeated ServerHealthSummaryPB tserver_summaries = 3;
 
   repeated string master_uuids = 4;
   optional bool master_consensus_conflict = 5;
-  repeated KsckConsensusStatePB master_consensus_states = 6;
+  repeated ConsensusStatePB master_consensus_states = 6;
 
-  repeated KsckTabletSummaryPB tablet_summaries = 7;
-  repeated KsckTableSummaryPB table_summaries = 8;
+  repeated TabletSummaryPB tablet_summaries = 7;
+  repeated TableSummaryPB table_summaries = 8;
 
   optional KsckChecksumResultsPB checksum_results = 9;
+  repeated KsckVersionSummaryPB version_summaries = 10;
+  repeated KsckCountSummaryPB count_summaries = 11;
 }
 
-message KsckServerHealthSummaryPB {
+message ServerHealthSummaryPB {
   enum ServerHealth {
     UNKNOWN = 999;
     HEALTHY = 0;
@@ -231,7 +243,7 @@ message KsckServerHealthSummaryPB {
   optional string location = 6;
 }
 
-message KsckConsensusStatePB {
+message ConsensusStatePB {
   enum ConfigType {
     UNKNOWN = 999;
     MASTER = 0;
@@ -255,17 +267,17 @@ enum KsckTabletHealthPB {
   CONSENSUS_MISMATCH = 4;
 }
 
-message KsckTabletSummaryPB {
+message TabletSummaryPB {
   optional string id = 1;
   optional string table_id = 2;
   optional string table_name = 3;
   optional KsckTabletHealthPB health = 4;
   optional string status = 5;
-  optional KsckConsensusStatePB master_cstate = 6;
-  repeated KsckReplicaSummaryPB replicas = 7;
+  optional ConsensusStatePB master_cstate = 6;
+  repeated ReplicaSummaryPB replicas = 7;
 }
 
-message KsckReplicaSummaryPB {
+message ReplicaSummaryPB {
   optional string ts_uuid = 1;
   optional string ts_address = 2;
   optional bool ts_healthy = 3;
@@ -273,10 +285,10 @@ message KsckReplicaSummaryPB {
   optional bool is_voter = 5;
   optional tablet.TabletStatePB state = 6;
   optional tablet.TabletStatusPB status_pb = 7;
-  optional KsckConsensusStatePB consensus_state = 8;
+  optional ConsensusStatePB consensus_state = 8;
 }
 
-message KsckTableSummaryPB {
+message TableSummaryPB {
   optional string id = 1;
   optional string name = 2;
   optional KsckTabletHealthPB health = 3;
@@ -310,4 +322,137 @@ message KsckReplicaChecksumPB {
   optional string ts_uuid = 2;
   optional string status = 3;
   optional fixed64 checksum = 4;
+}
+
+message KsckVersionSummaryPB {
+  optional string version = 1;
+  repeated string servers = 2;
+}
+
+message KsckCountSummaryPB {
+  optional int32 masters = 1;
+  optional int32 tservers = 2;
+  optional int32 tables = 3;
+  optional int32 tablets = 4;
+  optional int32 replicas = 5;
+}
+
+message ColumnPB {
+  enum EncodingType {
+    AUTO_ENCODING = 0;
+    PLAIN_ENCODING = 1;
+    PREFIX_ENCODING = 2;
+    RLE = 3;
+    DICT_ENCODING = 4;
+    BIT_SHUFFLE = 5;
+  }
+  enum CompressionType {
+    DEFAULT_COMPRESSION = 0;
+    NO_COMPRESSION = 1;
+    SNAPPY = 2;
+    LZ4 = 3;
+    ZLIB = 4;
+  }
+  message ColumnAttributesPB {
+    // For decimal columns
+    optional int32 precision = 1;
+    optional int32 scale = 2;
+  }
+  optional string column_name = 1;
+  optional string column_type = 2;
+  optional bool is_nullable = 3;
+  // The default value takes the form of a literal string.
+  optional string default_value = 4;
+  optional string comment = 5;
+  optional EncodingType encoding = 6;
+  optional CompressionType compression = 7;
+  // Column's attribute, used for DECIMAL type column.
+  optional ColumnAttributesPB type_attributes = 8;
+  // The preferred block size for cfile blocks.
+  optional int32 cfile_block_size = 9;
+}
+
+message PartitionPB {
+  message RangePartitionPB {
+    message BoundPB {
+      enum Type {
+        UNKNOWN_BOUND = 0;
+        EXCLUSIVE = 1;
+        INCLUSIVE = 2;
+      }
+      // The type of range partition bound, "INCLUSIVE" or "EXCLUSIVE"
+      optional Type bound_type = 1;
+      // The start or end partition key values. Bounds value should be simply the
+      // exact string value for the bound.
+      repeated string bound_values = 2;
+    }
+    message RangeBoundPB {
+      // The lower bound.
+      optional BoundPB lower_bound = 1;
+      // The upper bound.
+      optional BoundPB upper_bound = 2;
+    }
+    message SplitValuePB {
+      // The split values of range partition keys. Split value should be simply the
+      // exact string value for the bound.
+      repeated string split_values = 1;
+    }
+
+    // Column names of columns included in the range. All columns must be
+    // a component of the primary key.
+    repeated string columns = 1;
+    // Range bound.
+    repeated RangeBoundPB range_bounds = 2;
+    // Range split.
+    repeated SplitValuePB range_splits = 3;
+  }
+
+  message HashPartitionPB {
+    // Column names of columns included in the hash. Every column must be
+    // a component of the primary key.
+    repeated string columns = 1;
+    // Number of buckets into which columns will be hashed. Must be at least 2.
+    optional int32 num_buckets = 2;
+    // Seed value for hash calculation. Administrators may set a seed value
+    // on a per-table basis in order to randomize the mapping of rows to
+    // buckets. Setting a seed provides some amount of protection against denial
+    // of service attacks when the hash bucket columns contain user provided
+    // input.
+    optional uint32 seed = 3;
+  }
+
+  // Hash partition message. Support zero or more hash partition levels .
+  repeated HashPartitionPB hash_partitions = 1;
+  // range partition message.
+  optional RangePartitionPB range_partition = 2;
+}
+
+message ExtraConfigPB {
+  map<string, string> configs = 1;
+}
+
+message SchemaPB {
+  // Representation of table's columns, include more than one column message.
+  repeated ColumnPB columns = 1;
+  // The table's primary keys.
+  repeated string key_column_names = 2;
+}
+
+// Create table protobuffer message. The JSON message provided by user
+// is converted to the PB. Used for creating a new table by kudu tool.
+message CreateTablePB {
+  optional string table_name = 1;
+  // Representation of a table's schema, include columns's message and
+  // primary keys.
+  optional SchemaPB schema = 2;
+  // The table partition message, include hash partition and range partition.
+  optional PartitionPB partition = 3;
+  //Number of tablet replica
+  optional int32 num_replicas = 4;
+  // The table's extra configuration properties.
+  optional ExtraConfigPB extra_configs = 5;
+  // The dimension label for tablets that were created during table creation. Used for
+  // dimension-specific placement of tablet replicas corresponding to the partitions of
+  // the newly created table.
+  optional string dimension_label = 6;
 }

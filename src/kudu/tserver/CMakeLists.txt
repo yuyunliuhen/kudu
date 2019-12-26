@@ -147,6 +147,13 @@ target_link_libraries(kudu-tserver
   tserver
   ${KUDU_BASE_LIBS})
 
+option(KUDU_TSERVER_INSTALL "Whether to install the Kudu Tablet Server executable" ON)
+if(KUDU_TSERVER_INSTALL)
+  install(TARGETS kudu-tserver RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR})
+else()
+  message(STATUS "Skipping install rule for the Kudu Tablet Server executable")
+endif()
+
 #########################################
 # tserver_test_util
 #########################################
@@ -177,5 +184,6 @@ ADD_KUDU_TEST(tablet_copy_source_session-test)
 ADD_KUDU_TEST(tablet_copy_service-test)
 ADD_KUDU_TEST(tablet_server-test PROCESSORS 3)
 ADD_KUDU_TEST(tablet_server-stress-test RUN_SERIAL true)
+ADD_KUDU_TEST(tablet_server_authorization-test NUM_SHARDS 2)
 ADD_KUDU_TEST(scanners-test)
 ADD_KUDU_TEST(ts_tablet_manager-test)

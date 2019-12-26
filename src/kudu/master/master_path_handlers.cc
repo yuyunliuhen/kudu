@@ -43,25 +43,29 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/quorum_util.h"
 #include "kudu/gutil/map-util.h"
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/ascii_ctype.h"
+#include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/walltime.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master_options.h"
 #include "kudu/master/sys_catalog.h"
+#include "kudu/master/table_metrics.h"
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
 #include "kudu/server/monitored_task.h"
 #include "kudu/server/webui_util.h"
+#include "kudu/tablet/metadata.pb.h"
 #include "kudu/util/cow_object.h"
 #include "kudu/util/easy_json.h"
 #include "kudu/util/jsonwriter.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
@@ -85,12 +89,29 @@ using strings::Substitute;
 
 namespace master {
 
+namespace {
+struct TServerStateInfo {
+  // The stringified version of the state.
+  string state;
+
+  // A human-readable version of the time the tablet server was put into this
+  // state.
+  string time_entered_state;
+
+  // The current status of the tserver (e.g. "Live", "Dead").
+  string status;
+
+  // A link to the tserver's web UI, if one exists.
+  string webserver;
+};
+} // anonymous namespace
+
 MasterPathHandlers::~MasterPathHandlers() {
 }
 
 void MasterPathHandlers::HandleTabletServers(const Webserver::WebRequest& /*req*/,
                                              Webserver::WebResponse* resp) {
-  EasyJson* output = resp->output;
+  EasyJson* output = &resp->output;
   vector<shared_ptr<TSDescriptor>> descs;
   master_->ts_manager()->GetAllDescriptors(&descs);
 
@@ -115,28 +136,75 @@ void MasterPathHandlers::HandleTabletServers(const Webserver::WebRequest& /*req*
   output->Set("live_tservers", EasyJson::kArray);
   output->Set("dead_tservers", EasyJson::kArray);
   map<string, array<int, 2>> version_counts;
+  map<string, TServerStateInfo> ts_state_infos;
+  // Pull out the tserver states so we can collect information about the
+  // relevant tservers as we go.
+  for (const auto& uuid_and_state_with_timestamp : master_->ts_manager()->GetTServerStates()) {
+    const auto& ts_uuid = uuid_and_state_with_timestamp.first;
+    const auto& state_with_timestamp = uuid_and_state_with_timestamp.second;
+    const string timestamp_secs = TimestampAsString(state_with_timestamp.second);
+    InsertOrDie(&ts_state_infos, ts_uuid,
+        { TServerStatePB_Name(state_with_timestamp.first), timestamp_secs, "Not registered" });
+  }
+  // Process the registered tservers.
   for (const auto& desc : descs) {
-    string ts_key = desc->PresumedDead() ? "dead_tservers" : "live_tservers";
+    const string& ts_uuid = desc->permanent_uuid();
+    string ts_key;
+    auto* ts_state_info = FindOrNull(ts_state_infos, ts_uuid);
+    bool presumed_dead = desc->PresumedDead();
+    if (presumed_dead) {
+      ts_key = "dead_tservers";
+      if (ts_state_info) {
+        ts_state_info->status = "Dead";
+      }
+    } else {
+      ts_key = "live_tservers";
+      if (ts_state_info) {
+        ts_state_info->status = "Live";
+      }
+    }
     EasyJson ts_json = (*output)[ts_key].PushBack(EasyJson::kObject);
 
     ServerRegistrationPB reg;
     desc->GetRegistration(&reg);
-    ts_json["uuid"] = desc->permanent_uuid();
+    ts_json["uuid"] = ts_uuid;
     if (!reg.http_addresses().empty()) {
-      ts_json["target"] = Substitute("$0://$1:$2/",
-                                     reg.https_enabled() ? "https" : "http",
-                                     reg.http_addresses(0).host(),
-                                     reg.http_addresses(0).port());
+      string webserver = Substitute("$0://$1:$2",
+                                    reg.https_enabled() ? "https" : "http",
+                                    reg.http_addresses(0).host(),
+                                    reg.http_addresses(0).port());
+      if (ts_state_info) {
+        ts_state_info->webserver = webserver;
+      }
+      ts_json["target"] = webserver;
     }
     ts_json["time_since_hb"] = StringPrintf("%.1fs", desc->TimeSinceHeartbeat().ToSeconds());
+    ts_json["start_time"] = StartTimeToString(reg);
+    reg.clear_start_time();  // Clear 'start_time' before dumping to string.
     ts_json["registration"] = pb_util::SecureShortDebugString(reg);
     ts_json["location"] = desc->location().get_value_or("<none>");
-    version_counts[reg.software_version()][desc->PresumedDead() ? 1 : 0]++;
-    has_no_live_ts &= desc->PresumedDead();
-    has_no_dead_ts &= !desc->PresumedDead();
+    version_counts[reg.software_version()][presumed_dead ? 1 : 0]++;
+    has_no_live_ts &= presumed_dead;
+    has_no_dead_ts &= !presumed_dead;
   }
   (*output)["has_no_live_ts"] = has_no_live_ts;
   (*output)["has_no_dead_ts"] = has_no_dead_ts;
+  (*output)["has_no_ts_states"] = ts_state_infos.empty();
+
+  output->Set("tserver_states", EasyJson::kArray);
+  for (const auto& uuid_and_state_info : ts_state_infos) {
+    const auto& uuid = uuid_and_state_info.first;
+    const auto& ts_state_info = uuid_and_state_info.second;
+    EasyJson state_json = (*output)["tserver_states"].PushBack(EasyJson::kObject);
+    state_json["uuid"] = uuid;
+    const string& webserver = ts_state_info.webserver;
+    if (!webserver.empty()) {
+      state_json["target"] = webserver;
+    }
+    state_json["state"] = ts_state_info.state;
+    state_json["time_entered_state"] = ts_state_info.time_entered_state;
+    state_json["status"] = ts_state_info.status;
+  }
 
   output->Set("version_counts", EasyJson::kArray);
   for (const auto& entry : version_counts) {
@@ -166,7 +234,7 @@ int ExtractRedirectsFromRequest(const Webserver::WebRequest& req) {
 
 void MasterPathHandlers::HandleCatalogManager(const Webserver::WebRequest& req,
                                               Webserver::WebResponse* resp) {
-  EasyJson* output = resp->output;
+  EasyJson* output = &resp->output;
   CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
   if (!l.catalog_status().ok()) {
     (*output)["error"] = Substitute("Master is not ready: $0",  l.catalog_status().ToString());
@@ -196,6 +264,22 @@ void MasterPathHandlers::HandleCatalogManager(const Webserver::WebRequest& req,
     table_json["id"] = EscapeForHtmlToString(table->id());
     table_json["state"] = state;
     table_json["message"] = EscapeForHtmlToString(l.data().pb.state_msg());
+    table_json["tablet_count"] = HumanReadableInt::ToString(table->num_tablets());
+    const TableMetrics* table_metrics = table->GetMetrics();
+    if (table_metrics) {
+      table_json["on_disk_size"] =
+          HumanReadableNumBytes::ToString(table_metrics->on_disk_size->value());
+    }
+    std::string str_create_time;
+    if (l.data().pb.has_create_timestamp()) {
+      str_create_time = TimestampAsString(l.data().pb.create_timestamp());
+    }
+    table_json["create_time"] = EscapeForHtmlToString(str_create_time);
+    std::string str_alter_time;
+    if (l.data().pb.has_alter_timestamp()) {
+      str_alter_time = TimestampAsString(l.data().pb.alter_timestamp());
+    }
+    table_json["alter_time"] = EscapeForHtmlToString(str_alter_time);
   }
   (*output).Set<int64_t>("num_tables", num_running_tables);
 }
@@ -228,7 +312,7 @@ bool CompareByRole(const pair<TabletDetailPeerInfo, RaftPeerPB::Role>& a,
 
 void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
                                          Webserver::WebResponse* resp) {
-  EasyJson* output = resp->output;
+  EasyJson* output = &resp->output;
   // Parse argument.
   string table_id;
   if (!FindCopy(req.parsed_args, "id", &table_id)) {
@@ -268,6 +352,7 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
 
   Schema schema;
   PartitionSchema partition_schema;
+  map<string, string> extra_configs;
   vector<scoped_refptr<TabletInfo>> tablets;
   {
     TableMetadataLock l(table.get(), LockMode::READ);
@@ -314,10 +399,22 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
       (*output)["error"] = Substitute("Unable to decode schema: $0", s.ToString());
       return;
     }
+    // On platforms where !std::is_same<size_t, uint64_t>::value
+    // (e.g., on macOS 'size_t' is a typedef for 'unsigned long',
+    // but 'uint64_t' is a typedef for 'unsigned long long'),
+    // EasyJson does not have appropriate assignment operator defined. Adding
+    // a static_cast<uint64_t> here is a reasonable stopgap for those cases.
+    (*output)["column_count"] = static_cast<uint64_t>(schema.num_columns());
     s = PartitionSchema::FromPB(l.data().pb.partition_schema(), schema, &partition_schema);
     if (!s.ok()) {
       (*output)["error"] =
           Substitute("Unable to decode partition schema: $0", s.ToString());
+      return;
+    }
+    s = ExtraConfigPBToMap(l.data().pb.extra_config(), &extra_configs);
+    if (!s.ok()) {
+      (*output)["error"] =
+          Substitute("Unable to decode extra configuration properties: $0", s.ToString());
       return;
     }
     table->GetAllTablets(&tablets);
@@ -385,6 +482,8 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
     Capitalize(&state);
     tablet_detail_json["state"] = state;
     tablet_detail_json["state_msg"] = l.data().pb.state_msg();
+    tablet_detail_json["on_disk_size"] =
+        HumanReadableNumBytes::ToString(tablet->GetStats().on_disk_size());
     EasyJson peers_json = tablet_detail_json.Set("peers", EasyJson::kArray);
     for (const auto& e : sorted_replicas) {
       EasyJson peer_json = peers_json.PushBack(EasyJson::kObject);
@@ -397,7 +496,23 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
     }
   }
 
+  const TableMetrics* table_metrics = table->GetMetrics();
+  if (table_metrics) {
+    // If the table doesn't support live row counts, the value will be negative.
+    // But the value of disk size will never be negative.
+    (*output)["table_disk_size"] =
+        HumanReadableNumBytes::ToString(table_metrics->on_disk_size->value());
+    if (table_metrics->TableSupportsLiveRowCount()) {
+      (*output)["table_live_row_count"] = table_metrics->live_row_count->value();
+    } else {
+      (*output)["table_live_row_count"] = "N/A";
+    }
+  }
   (*output)["partition_schema"] = partition_schema.DisplayString(schema, range_partitions);
+
+  string str_extra_configs;
+  JoinMapKeysAndValues(extra_configs, " : ", "\n", &str_extra_configs);
+  (*output)["extra_config"] = str_extra_configs;
 
   EasyJson summary_json = output->Set("tablets_summary", EasyJson::kArray);
   for (const auto& entry : summary_states) {
@@ -434,7 +549,7 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
 
 void MasterPathHandlers::HandleMasters(const Webserver::WebRequest& /*req*/,
                                        Webserver::WebResponse* resp) {
-  EasyJson* output = resp->output;
+  EasyJson* output = &resp->output;
   vector<ServerEntryPB> masters;
   Status s = master_->ListMasters(&masters);
   if (!s.ok()) {
@@ -458,16 +573,18 @@ void MasterPathHandlers::HandleMasters(const Webserver::WebRequest& /*req*/,
       continue;
     }
     EasyJson master_json = (*output)["masters"].PushBack(EasyJson::kObject);
-    const ServerRegistrationPB& reg = master.registration();
+    ServerRegistrationPB reg = master.registration();
     master_json["uuid"] = master.instance_id().permanent_uuid();
     if (!reg.http_addresses().empty()) {
-      master_json["target"] = Substitute("$0://$1:$2/",
+      master_json["target"] = Substitute("$0://$1:$2",
                                          reg.https_enabled() ? "https" : "http",
                                          reg.http_addresses(0).host(),
                                          reg.http_addresses(0).port());
     }
     master_json["role"] = master.has_role() ? RaftPeerPB_Role_Name(master.role()) : "N/A";
-    master_json["registration"] = pb_util::SecureShortDebugString(master.registration());
+    master_json["start_time"] = StartTimeToString(reg);
+    reg.clear_start_time();  // Clear 'start_time' before dumping to string.
+    master_json["registration"] = pb_util::SecureShortDebugString(reg);
   }
 }
 
@@ -495,7 +612,7 @@ class JsonDumper : public TableVisitor, public TabletVisitor {
   }
 
   Status VisitTable(const std::string& table_id,
-                    const SysTablesEntryPB& metadata) OVERRIDE {
+                    const SysTablesEntryPB& metadata) override {
     if (metadata.state() != SysTablesEntryPB::RUNNING) {
       return Status::OK();
     }
@@ -516,7 +633,7 @@ class JsonDumper : public TableVisitor, public TabletVisitor {
 
   Status VisitTablet(const std::string& table_id,
                      const std::string& tablet_id,
-                     const SysTabletsEntryPB& metadata) OVERRIDE {
+                     const SysTabletsEntryPB& metadata) override {
     if (metadata.state() != SysTabletsEntryPB::RUNNING) {
       return Status::OK();
     }
@@ -578,7 +695,7 @@ void JsonError(const Status& s, ostringstream* out) {
 
 void MasterPathHandlers::HandleDumpEntities(const Webserver::WebRequest& /*req*/,
                                             Webserver::PrerenderedWebResponse* resp) {
-  ostringstream* output = resp->output;
+  ostringstream* output = &resp->output;
   Status s = master_->catalog_manager()->CheckOnline();
   if (!s.ok()) {
     JsonError(s, output);
@@ -644,6 +761,9 @@ void MasterPathHandlers::HandleDumpEntities(const Webserver::WebRequest& /*req*/
 
     jw.String("version");
     jw.String(reg.software_version());
+
+    jw.String("start_time");
+    jw.String(StartTimeToString(reg));
 
     jw.EndObject();
   }

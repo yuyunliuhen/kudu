@@ -14,13 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
 
-import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
-import static org.apache.kudu.test.junit.AssertHelpers.assertEventuallyTrue;
 import static org.apache.kudu.test.ClientTestUtil.countRowsInScan;
 import static org.apache.kudu.test.ClientTestUtil.createBasicSchemaInsert;
 import static org.apache.kudu.test.ClientTestUtil.getBasicCreateTableOptions;
+import static org.apache.kudu.test.KuduTestHarness.DEFAULT_SLEEP;
+import static org.apache.kudu.test.junit.AssertHelpers.assertEventuallyTrue;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 
@@ -28,15 +29,16 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.util.List;
 
-import org.apache.kudu.Schema;
-import org.apache.kudu.test.KuduTestHarness;
-import org.apache.kudu.test.junit.AssertHelpers.BooleanExpression;
-import org.apache.kudu.test.CapturingLogAppender;
-import org.apache.kudu.test.ClientTestUtil;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+
+import org.apache.kudu.Schema;
+import org.apache.kudu.test.CapturingLogAppender;
+import org.apache.kudu.test.ClientTestUtil;
+import org.apache.kudu.test.KuduTestHarness;
+import org.apache.kudu.test.junit.AssertHelpers.BooleanExpression;
 
 public class TestClientFailoverSupport {
 
@@ -78,8 +80,8 @@ public class TestClientFailoverSupport {
           @Override
           public boolean get() throws Exception {
             AsyncKuduScanner scanner = asyncClient.newScannerBuilder(table).build();
-            int read_count = countRowsInScan(scanner);
-            return read_count == rowCount;
+            int readCount = countRowsInScan(scanner);
+            return readCount == rowCount;
           }
         }, timeoutMs);
   }
@@ -104,9 +106,9 @@ public class TestClientFailoverSupport {
    * If we can successfully read back the rows written, that shows the client handled the failover
    * correctly.
    */
+  @SuppressWarnings("deprecation")
   private void doTestMasterFailover(MasterFailureType failureType) throws Exception {
-    final String TABLE_NAME = TestClientFailoverSupport.class.getName()
-        + "-" + failureType;
+    final String TABLE_NAME = TestClientFailoverSupport.class.getName() + "-" + failureType;
     client.createTable(TABLE_NAME, basicSchema, getBasicCreateTableOptions());
 
     KuduTable table = client.openTable(TABLE_NAME);
@@ -122,12 +124,14 @@ public class TestClientFailoverSupport {
 
     // Kill or restart the leader master.
     switch (failureType) {
-    case KILL:
-      harness.killLeaderMasterServer();
-      break;
-    case RESTART:
-      harness.restartLeaderMaster();
-      break;
+      case KILL:
+        harness.killLeaderMasterServer();
+        break;
+      case RESTART:
+        harness.restartLeaderMaster();
+        break;
+      default:
+        throw new IllegalArgumentException("Unexpected failure type: " + failureType);
     }
 
     // Kill the tablet server leader. This will force us to go back to the
@@ -139,10 +143,10 @@ public class TestClientFailoverSupport {
     harness.killTabletLeader(tablets.get(0));
 
     // Insert some more rows.
-    for (int i = TOTAL_ROWS_TO_INSERT; i < 2*TOTAL_ROWS_TO_INSERT; i++) {
+    for (int i = TOTAL_ROWS_TO_INSERT; i < 2 * TOTAL_ROWS_TO_INSERT; i++) {
       session.apply(createBasicSchemaInsert(table, i));
     }
-    waitUntilRowCount(table, 2*TOTAL_ROWS_TO_INSERT, DEFAULT_SLEEP);
+    waitUntilRowCount(table, 2 * TOTAL_ROWS_TO_INSERT, DEFAULT_SLEEP);
     client.deleteTable(TABLE_NAME);
     assertFalse(client.tableExists(TABLE_NAME));
   }

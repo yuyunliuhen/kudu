@@ -50,6 +50,7 @@
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
@@ -92,6 +93,7 @@ using kudu::rpc::RpcController;
 using kudu::tserver::TabletServerErrorPB;
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 using std::weak_ptr;
 using strings::Substitute;
@@ -242,7 +244,7 @@ void Peer::SendNextRequest(bool even_if_queue_empty) {
       // Capture a shared_ptr reference into the RPC callback so that we're guaranteed
       // that this object outlives the RPC.
       shared_ptr<Peer> s_this = shared_from_this();
-      proxy_->StartTabletCopyAsync(&tc_request_, &tc_response_, &controller_,
+      proxy_->StartTabletCopyAsync(tc_request_, &tc_response_, &controller_,
                                    [s_this]() {
                                      s_this->ProcessTabletCopyResponse();
                                    });
@@ -281,24 +283,38 @@ void Peer::SendNextRequest(bool even_if_queue_empty) {
   // Capture a shared_ptr reference into the RPC callback so that we're guaranteed
   // that this object outlives the RPC.
   shared_ptr<Peer> s_this = shared_from_this();
-  proxy_->UpdateAsync(&request_, &response_, &controller_,
+  proxy_->UpdateAsync(request_, &response_, &controller_,
                       [s_this]() {
                         s_this->ProcessResponse();
                       });
 }
 
-Status Peer::StartElection() {
+void Peer::StartElection() {
+  // The async proxy contract is such that the response and RPC controller must
+  // stay in scope until the callback is invoked. Unlike other Peer methods, we
+  // can't guarantee that there's only one outstanding StartElection call at a
+  // time, so we can't store the response and controller as a class member.
+  // Instead, we have to pass them into the callback and free them there.
   RunLeaderElectionRequestPB req;
-  RunLeaderElectionResponsePB resp;
-  RpcController controller;
-  req.set_dest_uuid(peer_pb().permanent_uuid());
+  unique_ptr<RunLeaderElectionResponsePB> resp_uniq(new RunLeaderElectionResponsePB());
+  unique_ptr<RpcController> controller_uniq(new RpcController());
+  string peer_uuid = peer_pb().permanent_uuid();
+  req.set_dest_uuid(peer_uuid);
   req.set_tablet_id(tablet_id_);
-  RETURN_NOT_OK(proxy_->StartElection(&req, &resp, &controller));
-  RETURN_NOT_OK(controller.status());
-  if (resp.has_error()) {
-    return StatusFromPB(response_.error().status());
-  }
-  return Status::OK();
+
+  // TODO(adar): lack of C++14 move capture makes for ugly code.
+  RunLeaderElectionResponsePB* resp = resp_uniq.release();
+  RpcController* controller = controller_uniq.release();
+  proxy_->StartElectionAsync(req, resp, controller, [resp, controller, peer_uuid]() {
+      unique_ptr<RunLeaderElectionResponsePB> r(resp);
+      unique_ptr<RpcController> c(controller);
+      string error_msg = Substitute("unable to start election on peer $0", peer_uuid);
+      if (!c->status().ok()) {
+        WARN_NOT_OK(c->status(), error_msg);
+      } else if (r->has_error()) {
+        WARN_NOT_OK(StatusFromPB(r->error().status()), error_msg);
+      }
+    });
 }
 
 void Peer::ProcessResponse() {
@@ -479,7 +495,7 @@ void Peer::Close() {
     if (closed_) return;
     closed_ = true;
   }
-  LOG_WITH_PREFIX_UNLOCKED(INFO) << "Closing peer: " << peer_pb_.permanent_uuid();
+  VLOG_WITH_PREFIX_UNLOCKED(1) << "Closing peer: " << peer_pb_.permanent_uuid();
 
   queue_->UntrackPeer(peer_pb_.permanent_uuid());
 }
@@ -500,34 +516,35 @@ RpcPeerProxy::RpcPeerProxy(gscoped_ptr<HostPort> hostport,
       consensus_proxy_(std::move(DCHECK_NOTNULL(consensus_proxy))) {
 }
 
-void RpcPeerProxy::UpdateAsync(const ConsensusRequestPB* request,
+void RpcPeerProxy::UpdateAsync(const ConsensusRequestPB& request,
                                ConsensusResponsePB* response,
                                rpc::RpcController* controller,
                                const rpc::ResponseCallback& callback) {
   controller->set_timeout(MonoDelta::FromMilliseconds(FLAGS_consensus_rpc_timeout_ms));
-  consensus_proxy_->UpdateConsensusAsync(*request, response, controller, callback);
+  consensus_proxy_->UpdateConsensusAsync(request, response, controller, callback);
 }
 
-Status RpcPeerProxy::StartElection(const RunLeaderElectionRequestPB* request,
-                                 RunLeaderElectionResponsePB* response,
-                                 rpc::RpcController* controller) {
+void RpcPeerProxy::StartElectionAsync(const RunLeaderElectionRequestPB& request,
+                                      RunLeaderElectionResponsePB* response,
+                                      rpc::RpcController* controller,
+                                      const rpc::ResponseCallback& callback) {
   controller->set_timeout(MonoDelta::FromMilliseconds(FLAGS_consensus_rpc_timeout_ms));
-  return consensus_proxy_->RunLeaderElection(*request, response, controller);
+  consensus_proxy_->RunLeaderElectionAsync(request, response, controller, callback);
 }
 
-void RpcPeerProxy::RequestConsensusVoteAsync(const VoteRequestPB* request,
+void RpcPeerProxy::RequestConsensusVoteAsync(const VoteRequestPB& request,
                                              VoteResponsePB* response,
                                              rpc::RpcController* controller,
                                              const rpc::ResponseCallback& callback) {
-  consensus_proxy_->RequestConsensusVoteAsync(*request, response, controller, callback);
+  consensus_proxy_->RequestConsensusVoteAsync(request, response, controller, callback);
 }
 
-void RpcPeerProxy::StartTabletCopyAsync(const StartTabletCopyRequestPB* request,
+void RpcPeerProxy::StartTabletCopyAsync(const StartTabletCopyRequestPB& request,
                                         StartTabletCopyResponsePB* response,
                                         rpc::RpcController* controller,
                                         const rpc::ResponseCallback& callback) {
   controller->set_timeout(MonoDelta::FromMilliseconds(FLAGS_consensus_rpc_timeout_ms));
-  consensus_proxy_->StartTabletCopyAsync(*request, response, controller, callback);
+  consensus_proxy_->StartTabletCopyAsync(request, response, controller, callback);
 }
 
 string RpcPeerProxy::PeerName() const {
@@ -536,15 +553,17 @@ string RpcPeerProxy::PeerName() const {
 
 namespace {
 
-Status CreateConsensusServiceProxyForHost(const shared_ptr<Messenger>& messenger,
-                                          const HostPort& hostport,
-                                          gscoped_ptr<ConsensusServiceProxy>* new_proxy) {
+Status CreateConsensusServiceProxyForHost(
+    const HostPort& hostport,
+    const shared_ptr<Messenger>& messenger,
+    DnsResolver* dns_resolver,
+    gscoped_ptr<ConsensusServiceProxy>* new_proxy) {
   vector<Sockaddr> addrs;
-  RETURN_NOT_OK(hostport.ResolveAddresses(&addrs));
+  RETURN_NOT_OK(dns_resolver->ResolveAddresses(hostport, &addrs));
   if (addrs.size() > 1) {
-    LOG(WARNING)<< "Peer address '" << hostport.ToString() << "' "
-    << "resolves to " << addrs.size() << " different addresses. Using "
-    << addrs[0].ToString();
+    LOG(WARNING) << Substitute(
+        "Peer address '$0' resolves to $1 different addresses. "
+        "Using $2", hostport.ToString(), addrs.size(), addrs[0].ToString());
   }
   new_proxy->reset(new ConsensusServiceProxy(messenger, addrs[0], hostport.host()));
   return Status::OK();
@@ -552,28 +571,33 @@ Status CreateConsensusServiceProxyForHost(const shared_ptr<Messenger>& messenger
 
 } // anonymous namespace
 
-RpcPeerProxyFactory::RpcPeerProxyFactory(shared_ptr<Messenger> messenger)
-    : messenger_(std::move(messenger)) {}
+RpcPeerProxyFactory::RpcPeerProxyFactory(shared_ptr<Messenger> messenger,
+                                         DnsResolver* dns_resolver)
+    : messenger_(std::move(messenger)),
+      dns_resolver_(dns_resolver) {
+}
 
 Status RpcPeerProxyFactory::NewProxy(const RaftPeerPB& peer_pb,
                                      gscoped_ptr<PeerProxy>* proxy) {
   gscoped_ptr<HostPort> hostport(new HostPort);
   RETURN_NOT_OK(HostPortFromPB(peer_pb.last_known_addr(), hostport.get()));
   gscoped_ptr<ConsensusServiceProxy> new_proxy;
-  RETURN_NOT_OK(CreateConsensusServiceProxyForHost(messenger_, *hostport, &new_proxy));
+  RETURN_NOT_OK(CreateConsensusServiceProxyForHost(
+      *hostport, messenger_, dns_resolver_, &new_proxy));
   proxy->reset(new RpcPeerProxy(std::move(hostport), std::move(new_proxy)));
   return Status::OK();
 }
 
-RpcPeerProxyFactory::~RpcPeerProxyFactory() {}
-
-Status SetPermanentUuidForRemotePeer(const shared_ptr<Messenger>& messenger,
-                                     RaftPeerPB* remote_peer) {
+Status SetPermanentUuidForRemotePeer(
+    const shared_ptr<rpc::Messenger>& messenger,
+    DnsResolver* resolver,
+    RaftPeerPB* remote_peer) {
   DCHECK(!remote_peer->has_permanent_uuid());
   HostPort hostport;
   RETURN_NOT_OK(HostPortFromPB(remote_peer->last_known_addr(), &hostport));
   gscoped_ptr<ConsensusServiceProxy> proxy;
-  RETURN_NOT_OK(CreateConsensusServiceProxyForHost(messenger, hostport, &proxy));
+  RETURN_NOT_OK(CreateConsensusServiceProxyForHost(
+      hostport, messenger, resolver, &proxy));
   GetNodeInstanceRequestPB req;
   GetNodeInstanceResponsePB resp;
   rpc::RpcController controller;

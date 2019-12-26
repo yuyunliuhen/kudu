@@ -106,6 +106,21 @@ string RowChangeList::ToString(const Schema &schema) const {
   return ret;
 }
 
+const char* RowChangeList::ChangeType_Name(RowChangeList::ChangeType t) {
+  switch (t) {
+    case kUninitialized:
+      return "UNINITIALIZED";
+    case kUpdate:
+      return "UPDATE";
+    case kDelete:
+      return "DELETE";
+    case kReinsert:
+      return "REINSERT";
+    default:
+      return "UNKNOWN";
+  }
+}
+
 void RowChangeListEncoder::AddColumnUpdate(const ColumnSchema& col_schema,
                                            int col_id,
                                            const void* cell_ptr) {
@@ -151,6 +166,7 @@ void RowChangeListEncoder::EncodeColumnMutationRaw(int col_id, bool is_null, Sli
 }
 
 Status RowChangeListDecoder::Init() {
+  DCHECK_EQ(type_, RowChangeList::kUninitialized) << "Already called Init()";
   if (PREDICT_FALSE(remaining_.empty())) {
     return Status::Corruption("empty changelist - expected type");
   }
@@ -223,7 +239,7 @@ Status RowChangeListDecoder::MutateRowAndCaptureChanges(RowBlockRow* dst_row,
     DecodedUpdate dec;
     RETURN_NOT_OK(DecodeNext(&dec));
     int col_idx;
-    const void* value;
+    const void* value = nullptr;
     RETURN_NOT_OK(dec.Validate(*dst_schema, &col_idx, &value));
     // Reinserts don't update keys so they shouldn't include the key columns.
     DCHECK(!dst_schema->is_key_column(col_idx));

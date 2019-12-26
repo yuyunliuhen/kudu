@@ -49,6 +49,7 @@
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
+#include "kudu/util/random_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/thread.h"
 #include "kudu/util/thread_restrictions.h"
@@ -80,13 +81,30 @@ DEFINE_bool(rpc_reopen_outbound_connections, false,
 TAG_FLAG(rpc_reopen_outbound_connections, unsafe);
 TAG_FLAG(rpc_reopen_outbound_connections, runtime);
 
+DEFINE_int32(tcp_keepalive_probe_period_s, 60,
+             "The duration in seconds after an outbound connection has gone idle "
+             "before a TCP keepalive probe is sent to the peer. Set to 0 to disable "
+             "TCP keepalive probes from being sent.");
+DEFINE_int32(tcp_keepalive_retry_period_s, 3,
+             "The duration in seconds between successive keepalive probes from an "
+             "outbound connection if the previous probes are not acknowledged. "
+             "Effective only if --tcp_keepalive_probe_period_s is not 0.");
+DEFINE_int32(tcp_keepalive_retry_count, 10,
+             "The maximum number of keepalive probes sent before declaring the remote "
+             "end as dead. Effective only if --tcp_keepalive_probe_period_s is not 0.");
+TAG_FLAG(tcp_keepalive_probe_period_s, advanced);
+TAG_FLAG(tcp_keepalive_retry_period_s, advanced);
+TAG_FLAG(tcp_keepalive_retry_count, advanced);
+
 METRIC_DEFINE_histogram(server, reactor_load_percent,
                         "Reactor Thread Load Percentage",
                         kudu::MetricUnit::kUnits,
                         "The percentage of time that the reactor is busy "
                         "(not blocked awaiting network activity). If this metric "
                         "shows significant samples nears 100%, increasing the "
-                        "number of reactors may be beneficial.", 100, 2);
+                        "number of reactors may be beneficial.",
+                        kudu::MetricLevel::kInfo,
+                        100, 2);
 
 METRIC_DEFINE_histogram(server, reactor_active_latency_us,
                         "Reactor Thread Active Latency",
@@ -95,6 +113,7 @@ METRIC_DEFINE_histogram(server, reactor_active_latency_us,
                         "The reactor thread is responsible for all network I/O and "
                         "therefore outliers in this latency histogram directly contribute "
                         "to the latency of both inbound and outbound RPCs.",
+                        kudu::MetricLevel::kInfo,
                         1000000, 2);
 
 namespace kudu {
@@ -133,7 +152,8 @@ ReactorThread::ReactorThread(Reactor *reactor, const MessengerBuilder& bld)
     connection_keepalive_time_(bld.connection_keepalive_time_),
     coarse_timer_granularity_(bld.coarse_timer_granularity_),
     total_client_conns_cnt_(0),
-    total_server_conns_cnt_(0) {
+    total_server_conns_cnt_(0),
+    rng_(GetRandomSeed32()) {
 
   if (bld.metric_entity_) {
     invoke_us_histogram_ =
@@ -273,8 +293,8 @@ Status ReactorThread::GetMetrics(ReactorMetrics* metrics) {
   return Status::OK();
 }
 
-Status ReactorThread::DumpRunningRpcs(const DumpRunningRpcsRequestPB& req,
-                                      DumpRunningRpcsResponsePB* resp) {
+Status ReactorThread::DumpConnections(const DumpConnectionsRequestPB& req,
+                                      DumpConnectionsResponsePB* resp) {
   DCHECK(IsCurrentThread());
   for (const scoped_refptr<Connection>& conn : server_conns_) {
     RETURN_NOT_OK(conn->DumpPB(req, resp->add_inbound_connections()));
@@ -608,6 +628,20 @@ void ReactorThread::CompleteConnectionNegotiation(
     return;
   }
 
+  if (FLAGS_tcp_keepalive_probe_period_s > 0) {
+    // Try spreading out the idle poll period to avoid thundering herd in case connections
+    // are all created at the same time (e.g. after a cluster is restarted).
+    Status keepalive_status = conn->SetTcpKeepAlive(
+        FLAGS_tcp_keepalive_probe_period_s + rng_.Uniform32(4),
+        FLAGS_tcp_keepalive_retry_period_s, FLAGS_tcp_keepalive_retry_count);
+    if (PREDICT_FALSE(!keepalive_status.ok())) {
+      LOG(DFATAL) << "Unable to set TCP keepalive for connection: "
+                  << keepalive_status.ToString();
+      DestroyConnection(conn.get(), keepalive_status, std::move(rpc_error));
+      return;
+    }
+  }
+
   conn->MarkNegotiationComplete();
   conn->EpollRegister(loop_);
 }
@@ -800,10 +834,10 @@ Status Reactor::RunOnReactorThread(const boost::function<Status()>& f) {
   return task.Wait();
 }
 
-Status Reactor::DumpRunningRpcs(const DumpRunningRpcsRequestPB& req,
-                                DumpRunningRpcsResponsePB* resp) {
-  return RunOnReactorThread(boost::bind(&ReactorThread::DumpRunningRpcs, &thread_,
-                                        boost::ref(req), resp));
+Status Reactor::DumpConnections(const DumpConnectionsRequestPB& req,
+                                DumpConnectionsResponsePB* resp) {
+  return RunOnReactorThread(boost::bind(&ReactorThread::DumpConnections,
+                                        &thread_, boost::ref(req), resp));
 }
 
 class RegisterConnectionTask : public ReactorTask {

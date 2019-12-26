@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
@@ -435,9 +436,7 @@ class TabletBootstrap {
 };
 
 void TabletBootstrap::SetStatusMessage(const string& status) {
-  LOG(INFO) << "T " << tablet_meta_->tablet_id()
-            << " P " << tablet_meta_->fs_manager()->uuid() << ": "
-            << status;
+  LOG_WITH_PREFIX(INFO) << status;
   if (tablet_replica_) tablet_replica_->SetStatusMessage(status);
 }
 
@@ -566,7 +565,6 @@ Status TabletBootstrap::RunBootstrap(shared_ptr<Tablet>* rebuilt_tablet,
     VLOG_WITH_PREFIX(1) << "Tablet Metadata: " << SecureDebugString(super_block);
   }
 
-
   // Ensure the tablet's data dirs are present and healthy before it is opened.
   DataDirGroupPB data_dir_group;
   RETURN_NOT_OK_PREPEND(
@@ -611,7 +609,7 @@ Status TabletBootstrap::RunBootstrap(shared_ptr<Tablet>* rebuilt_tablet,
   RETURN_NOT_OK_PREPEND(PlaySegments(&io_context, consensus_info), "Failed log replay. Reason");
 
   RETURN_NOT_OK(Log::RemoveRecoveryDirIfExists(tablet_->metadata()->fs_manager(),
-                                               tablet_->metadata()->tablet_id()))
+                                               tablet_->metadata()->tablet_id()));
   RETURN_NOT_OK(FinishBootstrap("Bootstrap complete.", rebuilt_log, rebuilt_tablet));
 
   return Status::OK();
@@ -835,9 +833,7 @@ Status TabletBootstrap::HandleEntry(const IOContext* io_context,
                                     unique_ptr<LogEntryPB> entry,
                                     string* entry_debug_info) {
   DCHECK(entry);
-  if (VLOG_IS_ON(1)) {
-    VLOG_WITH_PREFIX(1) << "Handling entry: " << SecureShortDebugString(*entry);
-  }
+  VLOG_WITH_PREFIX(1) << "Handling entry: " << SecureShortDebugString(*entry);
 
   const auto entry_type = entry->type();
   switch (entry_type) {
@@ -909,10 +905,10 @@ Status TabletBootstrap::HandleReplicateMessage(ReplayState* state,
     DCHECK(OpIdEquals(iter->second->replicate().id(), existing_entry->replicate().id()));
 
     const auto& last_entry = state->pending_replicates.rbegin()->second;
-    LOG_WITH_PREFIX(INFO) << "Overwriting operations starting at: "
-                          << existing_entry->replicate().id()
-                          << " up to: " << last_entry->replicate().id()
-                          << " with operation: " << replicate.id();
+    VLOG_WITH_PREFIX(1) << "Overwriting operations starting at: "
+                        << existing_entry->replicate().id()
+                        << " up to: " << last_entry->replicate().id()
+                        << " with operation: " << replicate.id();
 
     while (iter != state->pending_replicates.end()) {
       iter = state->pending_replicates.erase(iter);
@@ -1158,7 +1154,7 @@ Status TabletBootstrap::PlaySegments(const IOContext* io_context,
                                      ConsensusBootstrapInfo* consensus_info) {
   ReplayState state;
   log::SegmentSequence segments;
-  RETURN_NOT_OK(log_reader_->GetSegmentsSnapshot(&segments));
+  log_reader_->GetSegmentsSnapshot(&segments);
 
   // The first thing to do is to rewind the tablet's schema back to the schema
   // as of the point in time where the logs begin. We must replay the writes
@@ -1383,7 +1379,7 @@ Status TabletBootstrap::PlayWriteRequest(const IOContext* io_context,
 
   // If the results are being tracked and this write has a request id, register
   // it with the result tracker.
-  ResultTracker::RpcState state;
+  ResultTracker::RpcState state = ResultTracker::RpcState::NEW;
   if (tracking_results) {
     VLOG(1) << result_tracker_.get() << " Boostrapping request for tablet: "
         << write->tablet_id() << ". State: " << 0 << " id: "
@@ -1448,6 +1444,29 @@ Status TabletBootstrap::PlayWriteRequest(const IOContext* io_context,
 Status TabletBootstrap::PlayAlterSchemaRequest(const IOContext* /*io_context*/,
                                                ReplicateMsg* replicate_msg,
                                                const CommitMsg& commit_msg) {
+  // There are three potential outcomes to expect with this replay:
+  // 1. There is no 'result' in the commit message. The alter succeeds, and the
+  //    log updates its schema.
+  // 2. There is no 'result' in the commit message. The alter fails, and the
+  //    log doesn't update its schema. This can happen if trying to replay an
+  //    invalid alter schema request from before we started putting the results
+  //    in the commit message. Note that we'll leave the commit message as is;
+  //    it's harmless since replaying the operation should be a no-op anyway.
+  // 3. The commit message contains a 'result', which should only happen if the
+  //    alter resulted in a failure. Exit out without attempting the alter.
+  if (commit_msg.has_result()) {
+    // If we put a result in the commit message, it should be an error and we
+    // don't need to replay it. In case, in the future, we decide to put
+    // positive results in the commit messages, just filter ops that have
+    // failed statuses instead of D/CHECKing.
+    DCHECK_EQ(1, commit_msg.result().ops_size());
+    const OperationResultPB& op = commit_msg.result().ops(0);
+    if (op.has_failed_status()) {
+      Status error = StatusFromPB(op.failed_status());
+      VLOG(1) << "Played a failed alter request: " << error.ToString();
+      return AppendCommitMsg(commit_msg);
+    }
+  }
   AlterSchemaRequestPB* alter_schema = replicate_msg->mutable_alter_schema_request();
 
   // Decode schema
@@ -1455,19 +1474,16 @@ Status TabletBootstrap::PlayAlterSchemaRequest(const IOContext* /*io_context*/,
   RETURN_NOT_OK(SchemaFromPB(alter_schema->schema(), &schema));
 
   AlterSchemaTransactionState tx_state(nullptr, alter_schema, nullptr);
-
-  // TODO(KUDU-860): we should somehow distinguish if an alter table failed on its original
-  // attempt (e.g due to being an invalid request, or a request with a too-early
-  // schema version).
-
   RETURN_NOT_OK(tablet_->CreatePreparedAlterSchema(&tx_state, &schema));
 
   // Apply the alter schema to the tablet
   RETURN_NOT_OK_PREPEND(tablet_->AlterSchema(&tx_state), "Failed to AlterSchema:");
 
-  // Also update the log information. Normally, the AlterSchema() call above
-  // takes care of this, but our new log isn't hooked up to the tablet yet.
-  log_->SetSchemaForNextLogSegment(schema, tx_state.schema_version());
+  if (!tx_state.error()) {
+    // If the alter completed successfully, update the log segment header. Note
+    // that our new log isn't hooked up to the tablet yet.
+    log_->SetSchemaForNextLogSegment(std::move(schema), tx_state.schema_version());
+  }
 
   return AppendCommitMsg(commit_msg);
 }
@@ -1570,7 +1586,7 @@ Status TabletBootstrap::ApplyOperations(const IOContext* io_context,
     // Actually apply it.
     ProbeStats stats; // we don't use this, but tablet internals require non-NULL.
     RETURN_NOT_OK(tablet_->ApplyRowOperation(io_context, tx_state, op, &stats));
-    DCHECK(op->result != nullptr);
+    DCHECK(op->has_result());
 
     // We expect that the above Apply() will always succeed, because we're
     // applying an operation that we know succeeded before the server

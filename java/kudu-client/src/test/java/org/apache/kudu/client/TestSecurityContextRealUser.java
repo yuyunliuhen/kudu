@@ -17,19 +17,20 @@
 
 package org.apache.kudu.client;
 
-import org.apache.kudu.test.cluster.MiniKuduCluster.MiniKuduClusterBuilder;
-import org.apache.kudu.test.KuduTestHarness;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.Test;
-
-import java.util.ArrayList;
-
 import static org.apache.kudu.test.ClientTestUtil.getBasicSchema;
 import static org.apache.kudu.test.ClientTestUtil.scanTableToStrings;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+
+import java.util.ArrayList;
+
+import org.junit.Before;
+import org.junit.Rule;
+import org.junit.Test;
+
+import org.apache.kudu.test.KuduTestHarness;
+import org.apache.kudu.test.cluster.MiniKuduCluster.MiniKuduClusterBuilder;
 
 /**
  * Tests that the 'real user' field of the security context is used for
@@ -38,7 +39,8 @@ import static org.junit.Assert.fail;
 public class TestSecurityContextRealUser {
   private String tableName;
 
-  private static final MiniKuduClusterBuilder clusterBuilder = KuduTestHarness.getBaseClusterBuilder()
+  private static final MiniKuduClusterBuilder clusterBuilder =
+      KuduTestHarness.getBaseClusterBuilder()
       // This test requires a delicate setup. We enable Kerberos, make
       // authentication optional, and set the superuser ACL to test-admin so that
       // the external mini-cluster is able to connect to the master while creating
@@ -89,7 +91,7 @@ public class TestSecurityContextRealUser {
       // Smoke-test tserver connection by scanning a table.
       KuduTable table = client.createTable(tableName, getBasicSchema(),
                                            new CreateTableOptions().setRangePartitionColumns(
-                                               new ArrayList<String>()));
+                                               new ArrayList<>()));
       assertEquals(0, scanTableToStrings(table).size());
     }
   }

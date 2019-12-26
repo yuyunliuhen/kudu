@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/tablet/compaction.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -52,7 +54,6 @@
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/tablet/compaction.h"
 #include "kudu/tablet/diskrowset.h"
 #include "kudu/tablet/local_tablet_writer.h"
 #include "kudu/tablet/memrowset.h"
@@ -111,7 +112,7 @@ class TestCompaction : public KuduRowSetTest {
   TestCompaction()
     : KuduRowSetTest(CreateSchema()),
       op_id_(consensus::MaximumOpId()),
-      row_builder_(schema_),
+      row_builder_(&schema_),
       arena_(32*1024),
       clock_(clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)),
       log_anchor_registry_(new log::LogAnchorRegistry()) {
@@ -160,9 +161,9 @@ class TestCompaction : public KuduRowSetTest {
                               int row_key,
                               int32_t val) {
     BuildRow(row_key, val);
-    if (!mrs->schema().Equals(row_builder_.schema())) {
+    if (!mrs->schema().Equals(*row_builder_.schema())) {
       // The MemRowSet is not projecting the row, so must be done by the caller
-      RowProjector projector(&row_builder_.schema(), &mrs->schema());
+      RowProjector projector(row_builder_.schema(), &mrs->schema());
       uint8_t rowbuf[ContiguousRowHelper::row_size(mrs->schema())];
       ContiguousRow dst_row(&mrs->schema(), rowbuf);
       ASSERT_OK_FAST(projector.Init());
@@ -216,7 +217,8 @@ class TestCompaction : public KuduRowSetTest {
                              nullable_col_id, &new_val);
     }
 
-    RowBuilder rb(schema_.CreateKeyProjection());
+    Schema proj_key = schema_.CreateKeyProjection();
+    RowBuilder rb(&proj_key);
     rb.AddString(Slice(keybuf));
     RowSetKeyProbe probe(rb.row());
     ProbeStats stats;
@@ -231,10 +233,13 @@ class TestCompaction : public KuduRowSetTest {
   }
 
   void DeleteRows(RowSet* rowset, int n_rows) {
-    faststring update_buf;
+    DeleteRows(rowset, n_rows, 0);
+  }
+
+  void DeleteRows(RowSet* rowset, int n_rows, int delta) {
     for (uint32_t i = 0; i < n_rows; i++) {
       SCOPED_TRACE(i);
-      DeleteRow(rowset, i * 10);
+      DeleteRow(rowset, i * 10 + delta);
     }
   }
 
@@ -253,7 +258,8 @@ class TestCompaction : public KuduRowSetTest {
     RowChangeListEncoder update(&update_buf);
     update.SetToDelete();
 
-    RowBuilder rb(schema_.CreateKeyProjection());
+    Schema proj_key = schema_.CreateKeyProjection();
+    RowBuilder rb(&proj_key);
     rb.AddString(Slice(keybuf));
     RowSetKeyProbe probe(rb.row());
     ProbeStats stats;
@@ -383,7 +389,7 @@ class TestCompaction : public KuduRowSetTest {
       // Flush it to disk and re-open it.
       shared_ptr<DiskRowSet> rs;
       FlushMRSAndReopenNoRoll(*mrs, schema, &rs);
-      ASSERT_NO_FATAL_FAILURE();
+      NO_FATALS();
       rowsets.push_back(rs);
 
       // Perform some updates into DMS
@@ -393,7 +399,7 @@ class TestCompaction : public KuduRowSetTest {
 
     // Merge them.
     shared_ptr<DiskRowSet> result_rs;
-    ASSERT_NO_FATAL_FAILURE(CompactAndReopenNoRoll(rowsets, projection, &result_rs));
+    NO_FATALS(CompactAndReopenNoRoll(rowsets, projection, &result_rs));
 
     // Verify the resulting compaction output has the right number
     // of rows.
@@ -432,7 +438,7 @@ class TestCompaction : public KuduRowSetTest {
         }
         shared_ptr<DiskRowSet> rs;
         FlushMRSAndReopenNoRoll(*mrs, schema_, &rs);
-        ASSERT_NO_FATAL_FAILURE();
+        NO_FATALS();
         rowsets.push_back(rs);
       }
     } else {
@@ -551,7 +557,7 @@ TEST_F(TestCompaction, TestRowSetInput) {
                                 mem_trackers_.tablet_tracker, &mrs));
     InsertRows(mrs.get(), 10, 0);
     FlushMRSAndReopenNoRoll(*mrs, schema_, &rs);
-    ASSERT_NO_FATAL_FAILURE();
+    NO_FATALS();
   }
 
   // Update the rows in the rowset.
@@ -591,7 +597,7 @@ TEST_F(TestCompaction, TestDuplicatedGhostRowsMerging) {
                                 mem_trackers_.tablet_tracker, &mrs));
     InsertRows(mrs.get(), 10, 0);
     FlushMRSAndReopenNoRoll(*mrs, schema_, &rs1);
-    ASSERT_NO_FATAL_FAILURE();
+    NO_FATALS();
   }
   // Now delete the rows, this will make the rs report them as deleted and
   // so we would reinsert them into the MRS.
@@ -605,19 +611,19 @@ TEST_F(TestCompaction, TestDuplicatedGhostRowsMerging) {
     InsertRows(mrs.get(), 10, 0);
     UpdateRows(mrs.get(), 10, 0, 1);
     FlushMRSAndReopenNoRoll(*mrs, schema_, &rs2);
-    ASSERT_NO_FATAL_FAILURE();
+    NO_FATALS();
   }
   DeleteRows(rs2.get(), 10);
 
   shared_ptr<DiskRowSet> rs3;
   {
     shared_ptr<MemRowSet> mrs;
-    ASSERT_OK(MemRowSet::Create(1, schema_, log_anchor_registry_.get(),
+    ASSERT_OK(MemRowSet::Create(2, schema_, log_anchor_registry_.get(),
                                 mem_trackers_.tablet_tracker, &mrs));
     InsertRows(mrs.get(), 10, 0);
     UpdateRows(mrs.get(), 10, 0, 2);
     FlushMRSAndReopenNoRoll(*mrs, schema_, &rs3);
-    ASSERT_NO_FATAL_FAILURE();
+    NO_FATALS();
   }
 
   shared_ptr<DiskRowSet> result;
@@ -775,7 +781,7 @@ TEST_F(TestCompaction, TestDuplicatedRowsRandomCompaction) {
 
   }
 
-  RowBlock block(schema_, kBaseNumRowSets * kNumRowsPerRowSet, &arena_);
+  RowBlock block(&schema_, kBaseNumRowSets * kNumRowsPerRowSet, &arena_);
   // Go through the expected compaction input rows, flip the last undo into a redo and
   // build the base. This will give us the final version that we'll expect the result
   // of the real compaction to match.
@@ -841,7 +847,7 @@ TEST_F(TestCompaction, TestMRSCompactionDoesntOutputUnobservableRows) {
                                 mem_trackers_.tablet_tracker, &mrs));
     InsertRow(mrs.get(), 1, 1);
     FlushMRSAndReopenNoRoll(*mrs, schema_, &rs1);
-    ASSERT_NO_FATAL_FAILURE();
+    NO_FATALS();
   }
 
   // Now make the row a ghost in rs1 in the same transaction as we reinsert it in the mrs then
@@ -862,7 +868,7 @@ TEST_F(TestCompaction, TestMRSCompactionDoesntOutputUnobservableRows) {
     InsertRowInTransaction(mrs.get(), tx, 2, 0);
     tx.Commit();
     FlushMRSAndReopenNoRoll(*mrs, schema_, &rs2);
-    ASSERT_NO_FATAL_FAILURE();
+    NO_FATALS();
   }
 
   MvccSnapshot all_snap = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
@@ -906,7 +912,7 @@ TEST_F(TestCompaction, TestOneToOne) {
   // Flush it to disk and re-open.
   shared_ptr<DiskRowSet> rs;
   FlushMRSAndReopenNoRoll(*mrs, schema_, &rs);
-  ASSERT_NO_FATAL_FAILURE();
+  NO_FATALS();
 
   // Update the rows with some updates that weren't in the snapshot.
   UpdateRows(mrs.get(), 1000, 0, 2);
@@ -951,7 +957,7 @@ TEST_F(TestCompaction, TestKUDU102) {
   InsertRows(mrs.get(), 10, 0);
   shared_ptr<DiskRowSet> rs;
   FlushMRSAndReopenNoRoll(*mrs, schema_, &rs);
-  ASSERT_NO_FATAL_FAILURE();
+  NO_FATALS();
 
   shared_ptr<MemRowSet> mrs_b;
   ASSERT_OK(MemRowSet::Create(1, schema_, log_anchor_registry_.get(),
@@ -960,7 +966,7 @@ TEST_F(TestCompaction, TestKUDU102) {
   MvccSnapshot snap(mvcc_);
   shared_ptr<DiskRowSet> rs_b;
   FlushMRSAndReopenNoRoll(*mrs_b, schema_, &rs_b);
-  ASSERT_NO_FATAL_FAILURE();
+  NO_FATALS();
 
   // Update all the rows in the second row set
   UpdateRows(mrs_b.get(), 10, 100, 2);
@@ -1052,7 +1058,7 @@ TEST_F(TestCompaction, BenchmarkMergeWithoutOverlap) {
     LOG(INFO) << "Skipped: must enable slow tests.";
     return;
   }
-  ASSERT_NO_FATAL_FAILURE(DoBenchmark<false>());
+  NO_FATALS(DoBenchmark<false>());
 }
 
 // Benchmark for the compaction merge input when the inputs are entirely
@@ -1062,7 +1068,7 @@ TEST_F(TestCompaction, BenchmarkMergeWithOverlap) {
     LOG(INFO) << "Skipped: must enable slow tests.";
     return;
   }
-  ASSERT_NO_FATAL_FAILURE(DoBenchmark<true>());
+  NO_FATALS(DoBenchmark<true>());
 }
 #endif
 
@@ -1179,6 +1185,74 @@ TEST_F(TestCompaction, TestEmptyFlushDoesntLeakBlocks) {
   std::sort(after_block_ids.begin(), after_block_ids.end(), BlockIdCompare());
 
   ASSERT_EQ(after_block_ids, before_block_ids);
+}
+
+TEST_F(TestCompaction, TestCountLiveRowsOfMemRowSetFlush) {
+  shared_ptr<MemRowSet> mrs;
+  ASSERT_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
+                              mem_trackers_.tablet_tracker, &mrs));
+  NO_FATALS(InsertRows(mrs.get(), 100, 0));
+  NO_FATALS(UpdateRows(mrs.get(), 80, 0, 1));
+  NO_FATALS(DeleteRows(mrs.get(), 50));
+  NO_FATALS(InsertRows(mrs.get(), 10, 0));
+  uint64_t count = 0;
+  ASSERT_OK(mrs->CountLiveRows(&count));
+  ASSERT_EQ(100 - 50 + 10, count);
+
+  shared_ptr<DiskRowSet> rs;
+  NO_FATALS(FlushMRSAndReopenNoRoll(*mrs, schema_, &rs));
+  ASSERT_OK(rs->CountLiveRows(&count));
+  ASSERT_EQ(100 - 50 + 10, count);
+}
+
+TEST_F(TestCompaction, TestCountLiveRowsOfDiskRowSetsCompact) {
+  shared_ptr<DiskRowSet> rs1;
+  {
+    shared_ptr<MemRowSet> mrs;
+    ASSERT_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
+                                mem_trackers_.tablet_tracker, &mrs));
+    NO_FATALS(InsertRows(mrs.get(), 100, 0));
+    NO_FATALS(UpdateRows(mrs.get(), 80, 0, 1));
+    NO_FATALS(DeleteRows(mrs.get(), 50, 0));
+    NO_FATALS(InsertRows(mrs.get(), 10, 0));
+    NO_FATALS(FlushMRSAndReopenNoRoll(*mrs, schema_, &rs1));
+  }
+  shared_ptr<DiskRowSet> rs2;
+  {
+    shared_ptr<MemRowSet> mrs;
+    ASSERT_OK(MemRowSet::Create(1, schema_, log_anchor_registry_.get(),
+                                mem_trackers_.tablet_tracker, &mrs));
+    NO_FATALS(InsertRows(mrs.get(), 100, 1));
+    NO_FATALS(UpdateRows(mrs.get(), 80, 1, 1));
+    NO_FATALS(DeleteRows(mrs.get(), 50, 1));
+    NO_FATALS(InsertRows(mrs.get(), 10, 1));
+    NO_FATALS(FlushMRSAndReopenNoRoll(*mrs, schema_, &rs2));
+  }
+  shared_ptr<DiskRowSet> rs3;
+  {
+    shared_ptr<MemRowSet> mrs;
+    ASSERT_OK(MemRowSet::Create(2, schema_, log_anchor_registry_.get(),
+                                mem_trackers_.tablet_tracker, &mrs));
+    NO_FATALS(InsertRows(mrs.get(), 100, 2));
+    NO_FATALS(UpdateRows(mrs.get(), 80, 2, 2));
+    NO_FATALS(DeleteRows(mrs.get(), 50, 2));
+    NO_FATALS(InsertRows(mrs.get(), 10, 2));
+    NO_FATALS(FlushMRSAndReopenNoRoll(*mrs, schema_, &rs3));
+  }
+
+  shared_ptr<DiskRowSet> result;
+  vector<shared_ptr<DiskRowSet>> all_rss;
+  all_rss.emplace_back(std::move(rs3));
+  all_rss.emplace_back(std::move(rs1));
+  all_rss.emplace_back(std::move(rs2));
+
+  SeedRandom();
+  std::random_shuffle(all_rss.begin(), all_rss.end());
+  NO_FATALS(CompactAndReopenNoRoll(all_rss, schema_, &result));
+
+  uint64_t count = 0;
+  ASSERT_OK(result->CountLiveRows(&count));
+  ASSERT_EQ((100 - 50 + 10) * 3, count);
 }
 
 } // namespace tablet

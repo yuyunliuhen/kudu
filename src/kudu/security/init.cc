@@ -48,6 +48,13 @@
 #include "kudu/util/status.h"
 #include "kudu/util/thread.h"
 
+#if defined(__APPLE__)
+// Almost all functions in the krb5 API are marked as deprecated in favor
+// of GSS.framework in macOS.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif // #if defined(__APPLE__)
+
 #ifndef __APPLE__
 static constexpr bool kDefaultSystemAuthToLocal = true;
 #else
@@ -56,6 +63,7 @@ static constexpr bool kDefaultSystemAuthToLocal = true;
 // implementation.
 static constexpr bool kDefaultSystemAuthToLocal = false;
 #endif
+
 DEFINE_bool(use_system_auth_to_local, kDefaultSystemAuthToLocal,
             "When enabled, use the system krb5 library to map Kerberos principal "
             "names to local (short) usernames. If not enabled, the first component "
@@ -151,6 +159,18 @@ void InitKrb5Ctx() {
   static std::once_flag once;
   std::call_once(once, [&]() {
       CHECK_EQ(krb5_init_context(&g_krb5_ctx), 0);
+      // Work around the lack of thread safety in krb5_parse_name() by implicitly
+      // initializing g_krb5_ctx->default_realm once. The assumption is that this
+      // function is called once in a single thread environment during initialization.
+      //
+      // TODO(KUDU-2706): Fix unsafe sharing of 'g_krb5_ctx'.
+      // According to Kerberos documentation
+      // (https://github.com/krb5/krb5/blob/master/doc/threads.txt), any use of
+      // krb5_context must be confined to one thread at a time by the application code.
+      // The current way of sharing of 'g_krb5_ctx' between threads is actually unsafe.
+      char* unused_realm;
+      CHECK_EQ(krb5_get_default_realm(g_krb5_ctx, &unused_realm), 0);
+      krb5_free_default_realm(g_krb5_ctx, unused_realm);
     });
 }
 
@@ -432,6 +452,24 @@ boost::optional<string> GetLoggedInUsernameFromKeytab() {
   return g_kinit_ctx->username_str();
 }
 
+Status Krb5ParseName(const string& principal, string* service_name,
+                     string* hostname, string* realm) {
+  krb5_principal princ;
+  KRB5_RETURN_NOT_OK_PREPEND(krb5_parse_name(g_krb5_ctx, principal.c_str(), &princ),
+      "could not parse principal");
+  SCOPED_CLEANUP({
+      krb5_free_principal(g_krb5_ctx, princ);
+    });
+  if (princ->length != 2) {
+    return Status::InvalidArgument(Substitute("$0: principal should include "
+                                              "service name, hostname and realm", principal));
+  }
+  realm->assign(princ->realm.data, princ->realm.length);
+  service_name->assign(princ->data[0].data, princ->data[0].length);
+  hostname->assign(princ->data[1].data, princ->data[1].length);
+  return Status::OK();
+}
+
 Status InitKerberosForServer(const std::string& raw_principal, const std::string& keytab_file,
     const std::string& krb5ccname, bool disable_krb5_replay_cache) {
   if (keytab_file.empty()) return Status::OK();
@@ -463,3 +501,7 @@ Status InitKerberosForServer(const std::string& raw_principal, const std::string
 
 } // namespace security
 } // namespace kudu
+
+#if defined(__APPLE__)
+#pragma GCC diagnostic pop
+#endif // #if defined(__APPLE__)

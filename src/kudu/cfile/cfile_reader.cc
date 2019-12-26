@@ -536,12 +536,6 @@ Status CFileReader::ReadBlock(const IOContext* io_context, const BlockPointer &p
 
     // Set the result block to our decompressed data.
     block = Slice(buf, uncompressed_size);
-  } else {
-    // Some of the File implementations from LevelDB attempt to be tricky
-    // and just return a Slice into an mmapped region (or in-memory region).
-    // But, this is hard to program against in terms of cache management, etc,
-    // so we memcpy into our scratch buffer if necessary.
-    block.relocate(scratch.get());
   }
 
   // It's possible that one of the TryAllocateFromCache() calls above
@@ -596,9 +590,10 @@ void CFileReader::HandleCorruption(const fs::IOContext* io_context) const {
       ErrorHandlerType::CFILE_CORRUPTION, io_context->tablet_id);
 }
 
-Status CFileReader::NewIterator(CFileIterator** iter, CacheControl cache_control,
+Status CFileReader::NewIterator(unique_ptr<CFileIterator>* iter,
+                                CacheControl cache_control,
                                 const IOContext* io_context) {
-  *iter = new CFileIterator(this, cache_control, io_context);
+  iter->reset(new CFileIterator(this, cache_control, io_context));
   return Status::OK();
 }
 

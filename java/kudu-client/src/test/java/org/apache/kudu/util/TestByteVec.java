@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.util;
 
 import static org.junit.Assert.assertEquals;
@@ -25,13 +26,21 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Random;
 
+import org.junit.Rule;
 import org.junit.Test;
+
+import org.apache.kudu.test.junit.RetryRule;
 
 public class TestByteVec {
   private static final Random RAND = new Random();
 
+  @Rule
+  public RetryRule retryRule = new RetryRule();
+
   private void assertBytesEqual(byte a, byte b) {
-    if (a != b) throw new AssertionError(String.format("%s != %s", a, b));
+    if (a != b) {
+      throw new AssertionError(String.format("%s != %s", a, b));
+    }
   }
 
   private List<Byte> random() {

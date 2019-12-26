@@ -14,7 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 package org.apache.kudu.client;
+
+import static org.apache.kudu.test.ClientTestUtil.getBasicCreateTableOptions;
 
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -23,14 +26,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 import com.google.common.collect.Lists;
-import org.apache.kudu.Schema;
-import org.apache.kudu.test.cluster.MiniKuduCluster.MiniKuduClusterBuilder;
-import org.apache.kudu.test.KuduTestHarness;
-import org.apache.kudu.test.ClientTestUtil;
 import org.junit.Rule;
 import org.junit.Test;
 
-import static org.apache.kudu.test.ClientTestUtil.getBasicCreateTableOptions;
+import org.apache.kudu.Schema;
+import org.apache.kudu.test.ClientTestUtil;
+import org.apache.kudu.test.KuduTestHarness;
+import org.apache.kudu.test.cluster.MiniKuduCluster.MiniKuduClusterBuilder;
 
 /**
  * Tests which provoke RPC queue overflow errors on the server side
@@ -41,7 +43,8 @@ public class TestHandleTooBusy {
 
   private static final Schema basicSchema = ClientTestUtil.getBasicSchema();
 
-  private static final MiniKuduClusterBuilder clusterBuilder = KuduTestHarness.getBaseClusterBuilder()
+  private static final MiniKuduClusterBuilder clusterBuilder =
+      KuduTestHarness.getBaseClusterBuilder()
       // Short queue to provoke overflow.
       .addMasterServerFlag("--rpc_service_queue_length=1")
       // Low number of service threads, so things stay in the queue.
@@ -56,7 +59,7 @@ public class TestHandleTooBusy {
    * Provoke overflows in the master RPC queue while connecting to the master
    * and performing location lookups.
    */
-  @Test(timeout=60000)
+  @Test(timeout = 60000)
   public void testMasterLookupOverflow() throws Exception {
     harness.getClient().createTable(TABLE_NAME, basicSchema, getBasicCreateTableOptions());
     ExecutorService exec = Executors.newCachedThreadPool();
@@ -66,8 +69,9 @@ public class TestHandleTooBusy {
         @Override
         public Void call() throws Exception {
           for (int i = 0; i < 5; i++) {
-            try (KuduClient c = new KuduClient.KuduClientBuilder(harness.getMasterAddressesAsString())
-                .build()) {
+            try (KuduClient c =
+                     new KuduClient.KuduClientBuilder(harness.getMasterAddressesAsString())
+                         .build()) {
               KuduTable table = c.openTable(TABLE_NAME);
               for (int j = 0; j < 5; j++) {
                 KuduScanToken.KuduScanTokenBuilder scanBuilder = c.newScanTokenBuilder(table);

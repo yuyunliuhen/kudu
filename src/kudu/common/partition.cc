@@ -27,6 +27,7 @@
 #include <vector>
 
 #include <glog/logging.h>
+#include <google/protobuf/stubs/port.h>
 
 #include "kudu/common/common.pb.h"
 #include "kudu/common/key_encoder.h"
@@ -198,7 +199,8 @@ void PartitionSchema::ToPB(PartitionSchemaPB* pb) const {
   SetColumnIdentifiers(range_schema_.column_ids, pb->mutable_range_schema()->mutable_columns());
 }
 
-Status PartitionSchema::EncodeKey(const KuduPartialRow& row, string* buf) const {
+template<typename Row>
+Status PartitionSchema::EncodeKeyImpl(const Row& row, string* buf) const {
   const KeyEncoder<string>& hash_encoder = GetKeyEncoder<string>(GetTypeInfo(UINT32));
 
   for (const HashBucketSchema& hash_bucket_schema : hash_bucket_schemas_) {
@@ -210,16 +212,12 @@ Status PartitionSchema::EncodeKey(const KuduPartialRow& row, string* buf) const 
   return EncodeColumns(row, range_schema_.column_ids, buf);
 }
 
+Status PartitionSchema::EncodeKey(const KuduPartialRow& row, string* buf) const {
+  return EncodeKeyImpl(row, buf);
+}
+
 Status PartitionSchema::EncodeKey(const ConstContiguousRow& row, string* buf) const {
-  const KeyEncoder<string>& hash_encoder = GetKeyEncoder<string>(GetTypeInfo(UINT32));
-
-  for (const HashBucketSchema& hash_bucket_schema : hash_bucket_schemas_) {
-    int32_t bucket;
-    RETURN_NOT_OK(BucketForRow(row, hash_bucket_schema, &bucket));
-    hash_encoder.Encode(&bucket, buf);
-  }
-
-  return EncodeColumns(row, range_schema_.column_ids, buf);
+  return EncodeKeyImpl(row, buf);
 }
 
 Status PartitionSchema::EncodeRangeKey(const KuduPartialRow& row,
@@ -502,11 +500,10 @@ Status PartitionSchema::DecodeRangeKey(Slice* encoded_key,
                                        Arena* arena) const {
   ContiguousRow cont_row(row->schema(), row->row_data_);
   for (int i = 0; i < range_schema_.column_ids.size(); i++) {
-
     if (encoded_key->empty()) {
       // This can happen when decoding partition start and end keys, since they
       // are truncated to simulate absolute upper and lower bounds.
-      continue;
+      break;
     }
 
     int32_t column_idx = row->schema()->find_column_by_id(range_schema_.column_ids[i]);
@@ -1017,6 +1014,12 @@ namespace {
       case UNIXTIME_MICROS:
         RETURN_NOT_OK(row->SetInt64(idx, INT64_MIN + 1));
         break;
+      case DATE:
+        RETURN_NOT_OK(row->SetDate(idx, DataTypeTraits<DATE>::kMinValue + 1));
+        break;
+      case VARCHAR:
+        RETURN_NOT_OK(row->SetVarchar(idx, Slice("\0", 1)));
+        break;
       case STRING:
         RETURN_NOT_OK(row->SetStringCopy(idx, Slice("\0", 1)));
         break;
@@ -1093,6 +1096,16 @@ namespace {
         }
         break;
       }
+      case DATE: {
+        int32_t value;
+        RETURN_NOT_OK(row->GetDate(idx, &value));
+        if (value < DataTypeTraits<DATE>::kMaxValue) {
+          RETURN_NOT_OK(row->SetDate(idx, value + 1));
+        } else {
+          *success = false;
+        }
+        break;
+      }
       case DECIMAL32:
       case DECIMAL64:
       case DECIMAL128: {
@@ -1111,6 +1124,14 @@ namespace {
         string incremented = value.ToString();
         incremented.push_back('\0');
         RETURN_NOT_OK(row->SetBinaryCopy(idx, incremented));
+        break;
+      }
+      case VARCHAR: {
+        Slice value;
+        RETURN_NOT_OK(row->GetVarchar(idx, &value));
+        string incremented = value.ToString();
+        incremented.push_back('\0');
+        RETURN_NOT_OK(row->SetVarchar(idx, incremented));
         break;
       }
       case STRING: {
@@ -1236,6 +1257,20 @@ Status PartitionSchema::MakeUpperBoundRangePartitionKeyExclusive(KuduPartialRow*
     }
   }
 
+  return Status::OK();
+}
+
+Status PartitionSchema::GetRangeSchemaColumnIndexes(const Schema& schema,
+                                                    vector<int32_t>* range_column_idxs) const {
+  for (const ColumnId& column_id : range_schema_.column_ids) {
+    int32_t idx = schema.find_column_by_id(column_id);
+    if (idx == Schema::kColumnNotFound) {
+      return Status::InvalidArgument(Substitute("range partition column ID $0 "
+                                                "not found in range partition key schema.",
+                                                column_id));
+    }
+    range_column_idxs->push_back(idx);
+  }
   return Status::OK();
 }
 

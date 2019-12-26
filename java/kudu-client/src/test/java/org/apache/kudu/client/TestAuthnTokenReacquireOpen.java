@@ -24,13 +24,14 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
-import org.apache.kudu.Schema;
-import org.apache.kudu.test.cluster.MiniKuduCluster.MiniKuduClusterBuilder;
-import org.apache.kudu.test.KuduTestHarness;
-import org.apache.kudu.test.ClientTestUtil;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+
+import org.apache.kudu.Schema;
+import org.apache.kudu.test.ClientTestUtil;
+import org.apache.kudu.test.KuduTestHarness;
+import org.apache.kudu.test.cluster.MiniKuduCluster.MiniKuduClusterBuilder;
 
 /**
  * This test contains a special scenario to make sure the automatic authn token re-acquisition works
@@ -48,18 +49,22 @@ public class TestAuthnTokenReacquireOpen {
 
   private static final Schema basicSchema = ClientTestUtil.getBasicSchema();
 
-  private static final MiniKuduClusterBuilder clusterBuilder = KuduTestHarness.getBaseClusterBuilder()
-      // We want to have a cluster with a single master.
-      .numMasterServers(1)
-      // Set appropriate TTL for authn token and connection keep-alive property, so the client could
-      // keep an open connection to the master when its authn token is already expired. Inject
-      // additional INVALID_AUTHENTICATION_TOKEN responses from the tablet server even for
-      // not-yet-expired tokens for an extra stress on the client.
-      .enableKerberos()
-      .addMasterServerFlag(String.format("--authn_token_validity_seconds=%d", TOKEN_TTL_SEC))
-      .addMasterServerFlag(String.format("--rpc_default_keepalive_time_ms=%d", KEEPALIVE_TIME_MS))
-      .addTabletServerFlag(String.format("--rpc_default_keepalive_time_ms=%d", KEEPALIVE_TIME_MS))
-      .addTabletServerFlag("--rpc_inject_invalid_authn_token_ratio=0.5");
+  private static final MiniKuduClusterBuilder clusterBuilder =
+      KuduTestHarness.getBaseClusterBuilder()
+          // We want to have a cluster with a single master.
+          .numMasterServers(1)
+          // Set appropriate TTL for authn token and connection keep-alive property, so the client
+          // could keep an open connection to the master when its authn token is already expired.
+          // Inject additional INVALID_AUTHENTICATION_TOKEN responses from the tablet server even
+          // for not-yet-expired tokens for an extra stress on the client.
+          .enableKerberos()
+          .addMasterServerFlag(
+              String.format("--authn_token_validity_seconds=%d", TOKEN_TTL_SEC))
+          .addMasterServerFlag(
+              String.format("--rpc_default_keepalive_time_ms=%d", KEEPALIVE_TIME_MS))
+          .addTabletServerFlag(
+              String.format("--rpc_default_keepalive_time_ms=%d", KEEPALIVE_TIME_MS))
+          .addTabletServerFlag("--rpc_inject_invalid_authn_token_ratio=0.5");
 
   private KuduClient client;
   private AsyncKuduClient asyncClient;

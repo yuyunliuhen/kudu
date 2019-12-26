@@ -19,6 +19,8 @@
 
 #include <algorithm>
 #include <ostream>
+#include <set>
+#include <utility>
 
 #include <boost/optional/optional.hpp>
 #include <glog/logging.h>
@@ -39,12 +41,19 @@
 #include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
+#include "kudu/master/sentry_authz_provider-test-base.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/security/test/mini_kdc.h"
+#include "kudu/sentry/sentry_client.h"
+#include "kudu/sentry/sentry_policy_service_types.h"
 #include "kudu/tablet/tablet.pb.h"
+#include "kudu/thrift/client.h"
 #include "kudu/tserver/tablet_copy.proxy.h"
 #include "kudu/tserver/tablet_server_test_util.h"
 #include "kudu/tserver/tserver_admin.pb.h"
@@ -62,40 +71,52 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
-namespace kudu {
-namespace itest {
-
-using client::KuduSchema;
-using client::KuduSchemaBuilder;
-using consensus::BulkChangeConfigRequestPB;
-using consensus::ChangeConfigRequestPB;
-using consensus::ChangeConfigResponsePB;
-using consensus::ConsensusStatePB;
-using consensus::CountVoters;
-using consensus::EXCLUDE_HEALTH_REPORT;
-using consensus::GetConsensusStateRequestPB;
-using consensus::GetConsensusStateResponsePB;
-using consensus::GetLastOpIdRequestPB;
-using consensus::GetLastOpIdResponsePB;
-using consensus::IncludeHealthReport;
-using consensus::LeaderStepDownRequestPB;
-using consensus::LeaderStepDownResponsePB;
-using consensus::OpId;
-using consensus::OpIdType;
-using consensus::RaftPeerPB;
-using consensus::RunLeaderElectionResponsePB;
-using consensus::RunLeaderElectionRequestPB;
-using consensus::VoteRequestPB;
-using consensus::VoteResponsePB;
-using consensus::kInvalidOpIdIndex;
-using master::ListTabletServersResponsePB_Entry;
-using master::MasterServiceProxy;
-using master::TabletLocationsPB;
-using pb_util::SecureDebugString;
-using pb_util::SecureShortDebugString;
+using ::sentry::TSentryGrantOption;
+using ::sentry::TSentryPrivilege;
+using boost::optional;
+using kudu::client::KuduSchema;
+using kudu::client::KuduSchemaBuilder;
+using kudu::cluster::ExternalTabletServer;
+using kudu::consensus::BulkChangeConfigRequestPB;
+using kudu::consensus::ChangeConfigRequestPB;
+using kudu::consensus::ChangeConfigResponsePB;
+using kudu::consensus::ConsensusStatePB;
+using kudu::consensus::CountVoters;
+using kudu::consensus::EXCLUDE_HEALTH_REPORT;
+using kudu::consensus::GetConsensusStateRequestPB;
+using kudu::consensus::GetConsensusStateResponsePB;
+using kudu::consensus::GetLastOpIdRequestPB;
+using kudu::consensus::GetLastOpIdResponsePB;
+using kudu::consensus::IncludeHealthReport;
+using kudu::consensus::LeaderStepDownRequestPB;
+using kudu::consensus::LeaderStepDownResponsePB;
+using kudu::consensus::OpId;
+using kudu::consensus::OpIdType;
+using kudu::consensus::RaftPeerPB;
+using kudu::consensus::RunLeaderElectionResponsePB;
+using kudu::consensus::RunLeaderElectionRequestPB;
+using kudu::consensus::VoteRequestPB;
+using kudu::consensus::VoteResponsePB;
+using kudu::consensus::kInvalidOpIdIndex;
+using kudu::master::ListTabletServersResponsePB_Entry;
+using kudu::master::MasterServiceProxy;
+using kudu::pb_util::SecureDebugString;
+using kudu::pb_util::SecureShortDebugString;
+using kudu::rpc::Messenger;
+using kudu::rpc::RpcController;
+using kudu::sentry::SentryClient;
+using kudu::tablet::TabletDataState;
+using kudu::tserver::CreateTsClientProxies;
+using kudu::tserver::ListTabletsResponsePB;
+using kudu::tserver::DeleteTabletRequestPB;
+using kudu::tserver::DeleteTabletResponsePB;
+using kudu::tserver::BeginTabletCopySessionRequestPB;
+using kudu::tserver::BeginTabletCopySessionResponsePB;
+using kudu::tserver::TabletCopyErrorPB;
+using kudu::tserver::TabletServerErrorPB;
+using kudu::tserver::WriteRequestPB;
+using kudu::tserver::WriteResponsePB;
 using rapidjson::Value;
-using rpc::Messenger;
-using rpc::RpcController;
 using std::min;
 using std::shared_ptr;
 using std::string;
@@ -103,17 +124,9 @@ using std::unique_ptr;
 using std::unordered_map;
 using std::vector;
 using strings::Substitute;
-using tablet::TabletDataState;
-using tserver::CreateTsClientProxies;
-using tserver::ListTabletsResponsePB;
-using tserver::DeleteTabletRequestPB;
-using tserver::DeleteTabletResponsePB;
-using tserver::BeginTabletCopySessionRequestPB;
-using tserver::BeginTabletCopySessionResponsePB;
-using tserver::TabletCopyErrorPB;
-using tserver::TabletServerErrorPB;
-using tserver::WriteRequestPB;
-using tserver::WriteResponsePB;
+
+namespace kudu {
+namespace itest {
 
 const string& TServerDetails::uuid() const {
   return instance_id.permanent_uuid();
@@ -491,15 +504,13 @@ Status WaitForReplicasReportedToMaster(
     WaitForLeader wait_for_leader,
     master::ReplicaTypeFilter filter,
     bool* has_leader,
-    master::TabletLocationsPB* tablet_locations) {
+    master::GetTabletLocationsResponsePB* tablet_locations) {
   MonoTime deadline(MonoTime::Now() + timeout);
   while (true) {
-    RETURN_NOT_OK(GetTabletLocations(
-        master_proxy, tablet_id, timeout, filter, tablet_locations));
+    RETURN_NOT_OK(GetTabletLocations(master_proxy, tablet_id, timeout, filter, tablet_locations));
     *has_leader = false;
-    if (tablet_locations->replicas_size() == num_replicas) {
-      for (const master::TabletLocationsPB_ReplicaPB& replica :
-                    tablet_locations->replicas()) {
+    if (tablet_locations->tablet_locations(0).interned_replicas_size() == num_replicas) {
+      for (const auto& replica : tablet_locations->tablet_locations(0).interned_replicas()) {
         if (replica.role() == RaftPeerPB::LEADER) {
           *has_leader = true;
         }
@@ -516,17 +527,18 @@ Status WaitForReplicasReportedToMaster(
     }
     SleepFor(MonoDelta::FromMilliseconds(20));
   }
-  if (num_replicas != tablet_locations->replicas_size()) {
+  if (num_replicas != tablet_locations->tablet_locations(0).interned_replicas_size()) {
       return Status::NotFound(Substitute("Number of replicas for tablet $0 "
           "reported to master $1:$2",
-          tablet_id, tablet_locations->replicas_size(),
+          tablet_id, tablet_locations->tablet_locations(0).interned_replicas_size(),
           SecureDebugString(*tablet_locations)));
   }
   if (wait_for_leader == WAIT_FOR_LEADER && !(*has_leader)) {
-    return Status::NotFound(Substitute("Leader for tablet $0 not found on master, "
-                                       "number of replicas $1:$2",
-                                       tablet_id, tablet_locations->replicas_size(),
-                                       SecureDebugString(*tablet_locations)));
+    return Status::NotFound(Substitute(
+        "Leader for tablet $0 not found on master, number of replicas $1:$2",
+        tablet_id,
+        tablet_locations->tablet_locations(0).interned_replicas_size(),
+        SecureDebugString(*tablet_locations)));
   }
   return Status::OK();
 }
@@ -633,19 +645,103 @@ Status FindTabletLeader(const TabletServerMap& tablet_servers,
                                      s.ToString()));
 }
 
+// Fills the out parameter "followers" with the tablet servers hosting the "tablet_id".
+// Non-empty "tablet_servers" is expected to include all the tablet servers and not subset
+// of tablet servers that host the "tablet_id".
+// Returns an error if the tablet servers do not have consensus or cannot be reached.
 Status FindTabletFollowers(const TabletServerMap& tablet_servers,
                            const string& tablet_id,
                            const MonoDelta& timeout,
                            vector<TServerDetails*>* followers) {
-  vector<TServerDetails*> tservers;
-  AppendValuesFromMap(tablet_servers, &tservers);
-  TServerDetails* leader;
-  RETURN_NOT_OK(FindTabletLeader(tablet_servers, tablet_id, timeout, &leader));
-  for (TServerDetails* ts : tservers) {
-    if (ts->uuid() != leader->uuid()) {
-      followers->push_back(ts);
+  DCHECK(!tablet_servers.empty());
+
+  // Sorted sets allow for set intersection needed below.
+  // uuids of all supplied tablet servers.
+  std::set<string> tablet_server_uuids;
+  // uuids of the tablet server peers that host the specified tablet_id.
+  std::set<string> peer_uuids;
+  // uuid of the leader tablet server hosting the specified tablet_id.
+  string leader_uuid;
+  const MonoTime start = MonoTime::Now();
+  const MonoTime deadline = MonoTime::Now() + timeout;
+  bool no_leader_or_peers_found = false;
+  for (const auto& entry : tablet_servers) {
+    const auto now = MonoTime::Now();
+    if (now > deadline) {
+      return Status::TimedOut(Substitute("Unable to find followers for tablet $0 after $1.",
+                                         tablet_id, (now - start).ToString()));
+    }
+    const auto& tserver_uuid = entry.first;
+    const auto* tserver = entry.second;
+    tablet_server_uuids.emplace(tserver_uuid);
+
+    const MonoDelta remaining_timeout = deadline - now;
+    ConsensusStatePB cstate;
+    Status s = GetConsensusState(tserver, tablet_id, remaining_timeout, EXCLUDE_HEALTH_REPORT,
+                                 &cstate);
+    if (!s.ok()) {
+      // Failure could be due to tablet server not hosting the tablet which is okay or other issue.
+      // If all the tablet servers return error then the failure is reported back. See below.
+      continue;
+    }
+    // At this point tablet server does host the tablet but it's possible there is no leader
+    // or peers are unknown.
+    if (cstate.committed_config().peers_size() == 0 || !cstate.has_leader_uuid()) {
+      no_leader_or_peers_found = true;
+      continue;
+    }
+
+    std::set<string> curr_peer_uuids;
+    for (const auto& peer : cstate.committed_config().peers()) {
+      curr_peer_uuids.emplace(peer.permanent_uuid());
+    }
+    DCHECK(!curr_peer_uuids.empty());
+    DCHECK(!cstate.leader_uuid().empty());
+    if (!leader_uuid.empty()) {
+      DCHECK(!peer_uuids.empty());
+      // Sanity checking that tablet servers with the specified tablet are reporting
+      // the same leader and set of peers.
+      if (leader_uuid != cstate.leader_uuid()) {
+        return Status::IllegalState(Substitute(
+            "Leader $0 reported by tablet server $1 for tablet $2 doesn't match with leader $3 "
+            "reported by other tablet servers.", cstate.leader_uuid(), tserver_uuid, tablet_id,
+            leader_uuid));
+      }
+      if (peer_uuids != curr_peer_uuids) {
+        return Status::IllegalState(Substitute(
+            "Peers reported by tablet server $0 for tablet $1 don't match with peers reported by "
+            "other tablet servers.", tserver_uuid, tablet_id));
+      }
+    } else {
+      DCHECK(peer_uuids.empty());
+      leader_uuid = cstate.leader_uuid();
+      peer_uuids.swap(curr_peer_uuids);
     }
   }
+
+  // Unable to get leader and peer information from multiple supplied tablet servers.
+  if (leader_uuid.empty()) {
+    DCHECK(peer_uuids.empty());
+
+    return no_leader_or_peers_found ?
+           Status::IllegalState(
+               Substitute("No leader or peers found for tablet $0.", tablet_id)) :
+           Status::NotFound(
+               Substitute("No tablet server found with tablet $0 or tablet servers not reachable.",
+                          tablet_id));
+  }
+
+  if (peer_uuids != STLSetIntersection(peer_uuids, tablet_server_uuids)) {
+    return Status::InvalidArgument(Substitute(
+        "Not all peers reported by tablet servers are part of the supplied tablet servers."));
+  }
+
+  for (const auto& tserver_uuid : peer_uuids) {
+    if (tserver_uuid != leader_uuid) {
+      followers->emplace_back(FindOrDie(tablet_servers, tserver_uuid));
+    }
+  }
+
   return Status::OK();
 }
 
@@ -896,24 +992,24 @@ Status GetTabletLocations(const shared_ptr<MasterServiceProxy>& master_proxy,
                           const string& tablet_id,
                           const MonoDelta& timeout,
                           master::ReplicaTypeFilter filter,
-                          master::TabletLocationsPB* tablet_locations) {
+                          master::GetTabletLocationsResponsePB* tablet_locations) {
   master::GetTabletLocationsRequestPB req;
   *req.add_tablet_ids() = tablet_id;
   req.set_replica_type_filter(filter);
-
-  master::GetTabletLocationsResponsePB resp;
+  req.set_intern_ts_infos_in_response(true);
   rpc::RpcController rpc;
   rpc.set_timeout(timeout);
-  RETURN_NOT_OK(master_proxy->GetTabletLocations(req, &resp, &rpc));
-  if (resp.has_error()) {
-    return StatusFromPB(resp.error().status());
+  RETURN_NOT_OK(master_proxy->GetTabletLocations(req, tablet_locations, &rpc));
+  if (tablet_locations->has_error()) {
+    return StatusFromPB(tablet_locations->error().status());
   }
-  if (resp.errors_size() > 0) {
-    CHECK_EQ(1, resp.errors_size()) << SecureShortDebugString(resp);
-    return StatusFromPB(resp.errors(0).status());
+  if (tablet_locations->errors_size() > 0) {
+    CHECK_EQ(1, tablet_locations->errors_size())
+        << SecureShortDebugString(*tablet_locations);
+    return StatusFromPB(tablet_locations->errors(0).status());
   }
-  CHECK_EQ(1, resp.tablet_locations_size()) << SecureShortDebugString(resp);
-  *tablet_locations = resp.tablet_locations(0);
+  CHECK_EQ(1, tablet_locations->tablet_locations_size())
+      << SecureShortDebugString(*tablet_locations);
   return Status::OK();
 }
 
@@ -921,11 +1017,16 @@ Status GetTableLocations(const shared_ptr<MasterServiceProxy>& master_proxy,
                          const string& table_name,
                          const MonoDelta& timeout,
                          master::ReplicaTypeFilter filter,
+                         optional<const string&> table_id,
                          master::GetTableLocationsResponsePB* table_locations) {
   master::GetTableLocationsRequestPB req;
   req.mutable_table()->set_table_name(table_name);
+  if (table_id) {
+    req.mutable_table()->set_table_id(*table_id);
+  }
   req.set_replica_type_filter(filter);
   req.set_max_returned_locations(1000);
+  req.set_intern_ts_infos_in_response(true);
   rpc::RpcController rpc;
   rpc.set_timeout(timeout);
   RETURN_NOT_OK(master_proxy->GetTableLocations(req, table_locations, &rpc));
@@ -943,13 +1044,13 @@ Status WaitForNumVotersInConfigOnMaster(const shared_ptr<MasterServiceProxy>& ma
   MonoTime deadline = MonoTime::Now() + timeout;
   int num_voters_found = 0;
   while (true) {
-    TabletLocationsPB tablet_locations;
+    master::GetTabletLocationsResponsePB tablet_locations;
     MonoDelta time_remaining = deadline - MonoTime::Now();
     s = GetTabletLocations(master_proxy, tablet_id, time_remaining,
                            master::VOTER_REPLICA, &tablet_locations);
     if (s.ok()) {
       num_voters_found = 0;
-      for (const TabletLocationsPB::ReplicaPB& r : tablet_locations.replicas()) {
+      for (const auto& r : tablet_locations.tablet_locations(0).interned_replicas()) {
         if (r.role() == RaftPeerPB::LEADER || r.role() == RaftPeerPB::FOLLOWER) num_voters_found++;
       }
       if (num_voters_found == num_voters) break;
@@ -966,7 +1067,7 @@ Status WaitForNumVotersInConfigOnMaster(const shared_ptr<MasterServiceProxy>& ma
   return Status::OK();
 }
 
-Status WaitForNumTabletsOnTS(TServerDetails* ts,
+Status WaitForNumTabletsOnTS(const TServerDetails* ts,
                              int count,
                              const MonoDelta& timeout,
                              vector<ListTabletsResponsePB::StatusAndSchemaPB>* tablets,
@@ -1002,7 +1103,7 @@ Status WaitForNumTabletsOnTS(TServerDetails* ts,
   return Status::OK();
 }
 
-Status CheckIfTabletInState(TServerDetails* ts,
+Status CheckIfTabletInState(const TServerDetails* ts,
                             const std::string& tablet_id,
                             tablet::TabletStatePB expected_state,
                             const MonoDelta& timeout) {
@@ -1022,13 +1123,13 @@ Status CheckIfTabletInState(TServerDetails* ts,
   return Status::NotFound("Tablet " + tablet_id + " not found");
 }
 
-Status CheckIfTabletRunning(TServerDetails* ts,
+Status CheckIfTabletRunning(const TServerDetails* ts,
                             const std::string& tablet_id,
                             const MonoDelta& timeout) {
   return CheckIfTabletInState(ts, tablet_id, tablet::RUNNING, timeout);
 }
 
-Status WaitUntilTabletInState(TServerDetails* ts,
+Status WaitUntilTabletInState(const TServerDetails* ts,
                               const std::string& tablet_id,
                               tablet::TabletStatePB state,
                               const MonoDelta& timeout) {
@@ -1057,7 +1158,7 @@ Status WaitUntilTabletInState(TServerDetails* ts,
 }
 
 // Wait until the specified tablet is in RUNNING state.
-Status WaitUntilTabletRunning(TServerDetails* ts,
+Status WaitUntilTabletRunning(const TServerDetails* ts,
                               const std::string& tablet_id,
                               const MonoDelta& timeout) {
   return WaitUntilTabletInState(ts, tablet_id, tablet::RUNNING, timeout);
@@ -1221,6 +1322,81 @@ Status GetInt64Metric(const HostPort& http_hp,
                      entity_proto->name(), metric_proto->name());
   }
   return Status::NotFound(msg);
+}
+
+Status GetTsCounterValue(ExternalTabletServer* ets,
+                         MetricPrototype* metric,
+                         int64_t* value) {
+  return GetInt64Metric(ets->bound_http_hostport(),
+                        &METRIC_ENTITY_server,
+                        "kudu.tabletserver",
+                        metric,
+                        "value",
+                        value);
+}
+
+Status SetupAdministratorPrivileges(MiniKdc* kdc,
+                                    const HostPort& address) {
+  DCHECK(kdc);
+  RETURN_NOT_OK(kdc->CreateUserPrincipal("kudu"));
+  RETURN_NOT_OK(kdc->Kinit("kudu"));
+
+  thrift::ClientOptions sentry_opts;
+  sentry_opts.service_principal = "sentry";
+  sentry_opts.enable_kerberos = true;
+  unique_ptr<SentryClient> sentry_client(
+      new SentryClient(address, sentry_opts));
+  RETURN_NOT_OK(sentry_client->Start());
+
+  // Create an admin role for the "admin" group specified in mini_sentry.cc.
+  // Grant this role all privileges for the server so the admin user can
+  // perform any operations required in tests.
+  RETURN_NOT_OK(master::CreateRoleAndAddToGroups(sentry_client.get(), "admin-role", "admin"));
+  TSentryPrivilege privilege = master::GetServerPrivilege("ALL", TSentryGrantOption::DISABLED);
+  RETURN_NOT_OK(master::AlterRoleGrantPrivilege(sentry_client.get(), "admin-role", privilege));
+  return kdc->Kinit("test-admin");
+}
+
+Status AlterTableName(const shared_ptr<MasterServiceProxy>& master_proxy,
+                      const string& table_id,
+                      const string& old_table_name,
+                      const string& new_table_name,
+                      const MonoDelta& timeout) {
+  master::AlterTableRequestPB req;
+  req.mutable_table()->set_table_id(table_id);
+  req.mutable_table()->set_table_name(old_table_name);
+  req.set_new_table_name(new_table_name);
+  master::AlterTableResponsePB resp;
+  RpcController controller;
+  controller.set_timeout(timeout);
+
+  RETURN_NOT_OK(master_proxy->AlterTable(req, &resp, &controller));
+  RETURN_NOT_OK(controller.status());
+  if (resp.has_error()) {
+    return Status::RemoteError("Response had an error", SecureShortDebugString(resp.error()));
+  }
+
+  return Status::OK();
+}
+
+Status DeleteTable(const std::shared_ptr<master::MasterServiceProxy>& master_proxy,
+                   const std::string& table_id,
+                   const std::string& table_name,
+                   const MonoDelta& timeout) {
+  master::DeleteTableRequestPB req;
+  req.mutable_table()->set_table_id(table_id);
+  req.mutable_table()->set_table_name(table_name);
+  master::DeleteTableResponsePB resp;
+  RpcController controller;
+  controller.set_timeout(timeout);
+
+  RETURN_NOT_OK(master_proxy->DeleteTable(req, &resp, &controller));
+  RETURN_NOT_OK(controller.status());
+  if (resp.has_error()) {
+    return Status::RemoteError("Response had an error", SecureShortDebugString(resp.error()));
+  }
+
+  return Status::OK();
 }
 
 } // namespace itest

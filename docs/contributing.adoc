@@ -38,11 +38,16 @@ for an overview of using Gerrit for code review.
 
 === Initial Setup for Gerrit
 
-. Sign in to link:http://gerrit.cloudera.org:8080[Gerrit] using your Github username.
+. Sign in to link:https://gerrit.cloudera.org/[Gerrit] using your Github username.
 
-. Go to link:http://gerrit.cloudera.org:8080/#/settings/[Settings]. Update your name
-and email address on the *Contact Information* page, and upload a SSH public key.
-If you do not update your name, it will show up as "Anonymous Coward" in Gerrit reviews.
+. Go to link:https://gerrit.cloudera.org/settings/[Settings]. Update your name
+and email address on the *Contact Information* page, and upload a SSH public
+key under *SSH Public Keys* if you would like to use SSH to connect to Gerrit.
+Generate an HTTP password under *HTTP Password* if you would like to use HTTP
+or HTTPS to connect to Gerrit. (Most Kudu developers use the SSH option.)
++
+NOTE: If you do not update your name, it will appear as "Anonymous Coward" in
+Gerrit reviews.
 
 . If you have not done so, clone the main Kudu repository. By default, the main remote
 is called `origin`. When you fetch or pull, you will do so from `origin`.
@@ -54,16 +59,40 @@ git clone https://github.com/apache/kudu
 
 . Change to the new `kudu` directory.
 
-. Add a `gerrit` remote. In the following command, substitute <username> with your
-Github username.
+. Add a `gerrit` remote.
++
+If using SSH to connect to Gerrit, use the following command to add the Gerrit
+remote (substitute <username> with your Github username):
 +
 [source,bash]
 ----
 git remote add gerrit ssh://<username>@gerrit.cloudera.org:29418/kudu
 ----
++
+If using HTTP or HTTPS to connect to Gerrit, use the following command to add
+the Gerrit remote (http:// also works):
++
+[source,bash]
+----
+git remote add gerrit https://gerrit.cloudera.org/a/kudu
+----
++
+[TIP]
+====
+If you are using Gerrit's HTTP or HTTPS endpoints and prefer not to type a
+username and password each time you submit a patch, you can put your login and
+password into a `.netrc` file located at `$HOME/.netrc` and Git will use it.
+The password is stored as plaintext and the file format is as follows:
 
-. Run the following command to install the
-Gerrit `commit-msg` hook. Use the following command:
+[source]
+----
+machine <hostname>
+  login <username>
+  password <password>
+----
+====
+
+. Run the following command to install the Gerrit `commit-msg` hook:
 +
 ----
 cd kudu
@@ -288,16 +317,28 @@ in many places. When interfacing with that code, you can continue to use `shared
 
 ==== Function Binding and Callbacks
 
-Existing code uses `boost::bind` and `boost::function` for function binding and
-callbacks. For new code, use the `Callback` and `Bind` classes in `gutil` instead.
-While less full-featured (`Bind` doesn't support argument
-place holders, wrapped function pointers, or function objects), they provide
-more options by the way of argument lifecycle management. For example, a
-bound argument whose class extends `RefCounted` will be incremented during `Bind`
-and decremented when the `Callback` goes out of scope.
+Existing code uses `boost::bind` and `boost::function` to capture and manage
+functors. For new code, use `std::bind` and `std::function`, which are
+functionally equivalent.
 
-See the large file comment in _gutil/callback.h_ for more details, and
-_util/callback_bind-test.cc_ for examples.
+Alternatively, the `Bind` and `Callback` classes in `gutil` may also be used to
+capture functors. See _gutil/callback.h_ for more details and
+_util/callback_bind-test.cc_ for examples. While less full-featured, they
+provide different options from their counterparts by the way of argument
+lifecycle management. The benefits of each are described below:
+
+.`std::bind` and `std::function`
+[none]
+* natively supports binding `shared_ptr` and `weak_ptr` objects, so a bound
+smartpointer argument will increment its count during `bind`, and decrement it
+when the `function` leaves scope
+* supports argument placeholders, wrapped function pointers, and function objects
+
+.`Bind` and `Callback`
+[none]
+* natively supports binding `RefCounted` objects, so a bound argument whose
+class extends `RefCounted` will increment its count during `Bind` and decrement
+it when the `Callback` goes out of scope
 
 ==== GFlags
 
@@ -422,6 +463,52 @@ message(STATUS "message goes here")
 ----
 ADD_KUDU_TEST(some-test)
 ----
+
+== Third-party dependencies
+
+Like many complex applications, Kudu depends on a number of third-party
+dependencies. Some (such as OpenSSL) are expected to be found on the build
+system itself. However, the vast majority are "vendored" in the `thirdparty/`
+tree. These dependencies are all versioned and pinned. They are also
+source-based; the dependencies are built before the rest of Kudu is built using
+the `build-if-necessary.sh` script.
+
+Third-party dependencies and their versions are defined in `vars.sh`. The source
+code for each dependency is located in a tarball, typically named
+`<dependency>-<version>.tar.gz`. The tarballs are stored in an Amazon S3 bucket
+operated by Cloudera. The bucket is cached in Amazon CloudFront to maximize
+download performance and reliability.
+
+If as part of your contribution you need to add a new third-party dependency,
+here's what you need to do:
+
+. Begin by preparing a source tarball for the new dependency. Ideally it should
+be a vanilla tarball obtained directly from an upstream project, but sometimes
+either its name or the contents need to be massaged to meet Kudu's expectations.
+
+. Add the new dependency to the third-party build. You'll need to modify
+`vars.sh`, `download-thirdparty.sh`, `build-definitions.sh`, and
+`build-thirdparty.sh`.
+
+. On your local machine, extract the source tarball into `thirdparty/src`.
+
+. Test the dependency's build by running `build-thirdparty.sh <dependency>`.
+This should build and install the dependency into `thirdparty/installed`, making
+it available for the Kudu build.
+
+. Test the Kudu build using the new dependency. You will need to pass
+`NO_REBUILD_THIRDPARTY=1` in the environment to prevent the Kudu build from
+rebuilding the `thirdparty/` tree (whereupon it'll fail to download the new
+dependency).
+
+. When everything checks out, contact a Kudu committer who is also a Cloudera
+employee and ask them to upload your source tarball to S3.
+
+. After the tarball has been uploaded, test the entire third-party build
+end-to-end by running `build-if-necessary.sh`.
+
+. Publish your patch to gerrit. With the tarball uploaded, the precommit builds
+should download and build the new dependency successfully.
 
 == Testing
 

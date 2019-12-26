@@ -22,7 +22,6 @@
 #include <memory>
 #include <string>
 #include <tuple>
-#include <unordered_map>
 #include <vector>
 
 #include <boost/algorithm/string/predicate.hpp>
@@ -32,20 +31,21 @@
 #include <glog/logging.h>
 
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/map-util.h"
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/rebalance/cluster_status.h"
+#include "kudu/rebalance/rebalancer.h"
 #include "kudu/tools/ksck.h"
 #include "kudu/tools/ksck_remote.h"
 #include "kudu/tools/ksck_results.h"
-#include "kudu/tools/rebalancer.h"
+#include "kudu/tools/rebalancer_tool.h"
 #include "kudu/tools/tool_action.h"
 #include "kudu/tools/tool_action_common.h"
 #include "kudu/tools/tool_replica_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/version_util.h"
 
+using kudu::rebalance::Rebalancer;
 using std::cout;
 using std::endl;
 using std::make_tuple;
@@ -56,17 +56,23 @@ using std::vector;
 using strings::Split;
 using strings::Substitute;
 
-#define PUSH_PREPEND_NOT_OK(s, statuses, msg) do { \
-  ::kudu::Status _s = (s); \
-  if (PREDICT_FALSE(!_s.ok())) { \
-    (statuses).push_back(string((msg)) + ": " + _s.message().ToString()); \
-  } \
-} while (0);
-
 DECLARE_string(tables);
-DEFINE_string(tablets, "",
-              "Tablets to check (comma-separated list of IDs) "
-              "If not specified, checks all tablets.");
+DECLARE_string(tablets);
+
+DEFINE_string(ignored_tservers, "",
+              "UUIDs of tablet servers to ignore while rebalancing the cluster "
+              "(comma-separated list). If specified, the tablet servers are "
+              "effectively ignored by the rebalancer tool, they are not considered "
+              "as a part of the cluster as well as the replicas on them. "
+              "If not specified, the rebalancer tool will run on all the tablet servers "
+              "in the cluster.");
+
+DEFINE_string(sections, "*",
+              "Sections to print (comma-separated list of sections, "
+              "available sections are: MASTER_SUMMARIES, TSERVER_SUMMARIES, "
+              "VERSION_SUMMARIES, TABLET_SUMMARIES, TABLE_SUMMARIES, "
+              "CHECKSUM_RESULTS and TOTAL_COUNT.) "
+              "If not specified, print all sections.");
 
 DEFINE_uint32(max_moves_per_server, 5,
               "Maximum number of replica moves to perform concurrently on one "
@@ -120,6 +126,30 @@ DEFINE_bool(disable_intra_location_rebalancing, false,
             "replica distribution within each location. "
             "This setting is applicable to multi-location clusters only.");
 
+DEFINE_bool(move_replicas_from_ignored_tservers, false,
+            "Whether to move replicas from the specified 'ignored_tservers' to other "
+            "servers when the source tablet server is healthy. "
+            "This setting is effective only if the '--ignored_tservers' flag "
+            "is specified as well. "
+            "If set true, then all ignored tablet servers must be placed into "
+            "the 'maintenance mode'.");
+
+DEFINE_double(load_imbalance_threshold,
+              kudu::rebalance::Rebalancer::Config::kLoadImbalanceThreshold,
+              "The threshold for the per-table location load imbalance. "
+              "The threshold is used during the cross-location rebalancing "
+              "phase. If the measured cross-location load imbalance for a "
+              "table is greater than the specified threshold, the rebalancer "
+              "tries to move table's replicas to reduce the imbalance. "
+              "The recommended range for the threshold is [0.5, ...) with the "
+              "default value of 1.0. The threshold represents a policy "
+              "wrt what to prefer: either ideal balance of the cross-location "
+              "load on per-table basis (lower threshold value) or minimum "
+              "number of replica movements between locations "
+              "(greater threshold value). The default value is empirically "
+              "proven to be a good choice between 'ideal' and 'good enough' "
+              "replica distributions.");
+
 static bool ValidateMoveSingleReplicas(const char* flag_name,
                                        const string& flag_value) {
   const vector<string> allowed_values = { "auto", "enabled", "disabled" };
@@ -147,15 +177,16 @@ namespace tools {
 namespace {
 
 Status RunKsck(const RunnerContext& context) {
-  vector<string> master_addresses = Split(
-      FindOrDie(context.required_args, kMasterAddressesArg), ",");
+  vector<string> master_addresses;
+  RETURN_NOT_OK(ParseMasterAddresses(context, &master_addresses));
   shared_ptr<KsckCluster> cluster;
   RETURN_NOT_OK_PREPEND(RemoteKsckCluster::Build(master_addresses, &cluster),
                         "unable to build KsckCluster");
+  cluster->set_table_filters(Split(FLAGS_tables, ",", strings::SkipEmpty()));
+  cluster->set_tablet_id_filters(Split(FLAGS_tablets, ",", strings::SkipEmpty()));
   shared_ptr<Ksck> ksck(new Ksck(cluster));
 
-  ksck->set_table_filters(Split(FLAGS_tables, ",", strings::SkipEmpty()));
-  ksck->set_tablet_id_filters(Split(FLAGS_tablets, ",", strings::SkipEmpty()));
+  ksck->set_print_sections(Split(FLAGS_sections, ",", strings::SkipEmpty()));
 
   return ksck->RunAndPrintResults();
 }
@@ -206,8 +237,8 @@ Status EvaluateMoveSingleReplicasFlag(const vector<string>& master_addresses,
   ignore_result(ksck->Run());
   const auto& ksck_results = ksck->results();
 
-  for (const auto& summaries : { ksck_results.tserver_summaries,
-                                 ksck_results.master_summaries }) {
+  for (const auto& summaries : { ksck_results.cluster_status.tserver_summaries,
+                                 ksck_results.cluster_status.master_summaries }) {
     for (const auto& summary : summaries) {
       if (summary.version) {
         if (!VersionSupportsRF1Movement(*summary.version)) {
@@ -236,8 +267,8 @@ Status EvaluateMoveSingleReplicasFlag(const vector<string>& master_addresses,
   // available. The idea is to reduce the risk of unintended unavailability
   // unless it's explicitly requested by the operator.
   boost::optional<string> tid;
-  if (!ksck_results.tablet_summaries.empty()) {
-    tid = ksck_results.tablet_summaries.front().id;
+  if (!ksck_results.cluster_status.tablet_summaries.empty()) {
+    tid = ksck_results.cluster_status.tablet_summaries.front().id;
   }
   bool is_343_scheme = false;
   auto s = Is343SchemeCluster(master_addresses, tid, &is_343_scheme);
@@ -261,8 +292,10 @@ Status EvaluateMoveSingleReplicasFlag(const vector<string>& master_addresses,
 // can be the source and the destination of no more than the specified number of
 // move operations.
 Status RunRebalance(const RunnerContext& context) {
-  const vector<string> master_addresses = Split(
-      FindOrDie(context.required_args, kMasterAddressesArg), ",");
+  const vector<string> ignored_tservers =
+      Split(FLAGS_ignored_tservers, ",", strings::SkipEmpty());
+  vector<string> master_addresses;
+  RETURN_NOT_OK(ParseMasterAddresses(context, &master_addresses));
   const vector<string> table_filters =
       Split(FLAGS_tables, ",", strings::SkipEmpty());
 
@@ -272,17 +305,20 @@ Status RunRebalance(const RunnerContext& context) {
   bool move_single_replicas = false;
   RETURN_NOT_OK(EvaluateMoveSingleReplicasFlag(master_addresses,
                                                &move_single_replicas));
-  Rebalancer rebalancer(Rebalancer::Config(
+  RebalancerTool rebalancer(Rebalancer::Config(
+      ignored_tservers,
       master_addresses,
       table_filters,
       FLAGS_max_moves_per_server,
       FLAGS_max_staleness_interval_sec,
       FLAGS_max_run_time_sec,
+      FLAGS_move_replicas_from_ignored_tservers,
       move_single_replicas,
       FLAGS_output_replica_distribution_details,
       !FLAGS_disable_policy_fixer,
       !FLAGS_disable_cross_location_rebalancing,
-      !FLAGS_disable_intra_location_rebalancing));
+      !FLAGS_disable_intra_location_rebalancing,
+      FLAGS_load_imbalance_threshold));
 
   // Print info on pre-rebalance distribution of replicas.
   RETURN_NOT_OK(rebalancer.PrintStats(cout));
@@ -291,17 +327,17 @@ Status RunRebalance(const RunnerContext& context) {
     return Status::OK();
   }
 
-  Rebalancer::RunStatus result_status;
+  RebalancerTool::RunStatus result_status;
   size_t moves_count;
   RETURN_NOT_OK(rebalancer.Run(&result_status, &moves_count));
 
   const string msg_template = "rebalancing is complete: $0 (moved $1 replicas)";
   string msg_result_status;
   switch (result_status) {
-    case Rebalancer::RunStatus::CLUSTER_IS_BALANCED:
+    case RebalancerTool::RunStatus::CLUSTER_IS_BALANCED:
       msg_result_status = "cluster is balanced";
       break;
-    case Rebalancer::RunStatus::TIMED_OUT:
+    case RebalancerTool::RunStatus::TIMED_OUT:
       msg_result_status = "time is up";
       break;
     default:
@@ -348,7 +384,9 @@ unique_ptr<Mode> BuildClusterMode() {
         .AddOptionalParameter("checksum_timeout_sec")
         .AddOptionalParameter("color")
         .AddOptionalParameter("consensus")
+        .AddOptionalParameter("fetch_info_concurrency")
         .AddOptionalParameter("ksck_format")
+        .AddOptionalParameter("sections")
         .AddOptionalParameter("tables")
         .AddOptionalParameter("tablets")
         .Build();
@@ -371,9 +409,13 @@ unique_ptr<Mode> BuildClusterMode() {
         .AddOptionalParameter("disable_policy_fixer")
         .AddOptionalParameter("disable_cross_location_rebalancing")
         .AddOptionalParameter("disable_intra_location_rebalancing")
+        .AddOptionalParameter("fetch_info_concurrency")
+        .AddOptionalParameter("ignored_tservers")
+        .AddOptionalParameter("load_imbalance_threshold")
         .AddOptionalParameter("max_moves_per_server")
         .AddOptionalParameter("max_run_time_sec")
         .AddOptionalParameter("max_staleness_interval_sec")
+        .AddOptionalParameter("move_replicas_from_ignored_tservers")
         .AddOptionalParameter("move_single_replicas")
         .AddOptionalParameter("output_replica_distribution_details")
         .AddOptionalParameter("report_only")

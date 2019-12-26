@@ -17,6 +17,7 @@
 
 #include <set>
 #include <string>
+#include <vector>
 
 #include <glog/stl_logging.h>
 #include <gtest/gtest.h>
@@ -26,6 +27,7 @@
 
 using std::set;
 using std::string;
+using std::vector;
 
 namespace sentry {
 
@@ -41,7 +43,17 @@ void AssertCompareRequirements(const T& a, const T& b) {
   }
 }
 
-TEST(ThriftOperatorsTest, TestOperatorLt) {
+// Asserts the contains orderings are the same.
+template<typename T>
+void AssertContainersOrdered(const vector<T>& ordered_vec_t, const set<T>& set_t) {
+  ASSERT_EQ(ordered_vec_t.size(), set_t.size());
+  int i = 0;
+  for (const auto& t : set_t) {
+    ASSERT_EQ(ordered_vec_t[i++], t);
+  }
+}
+
+TEST(ThriftOperatorsTest, TestRoleOperatorLt) {
   // TSentryRole::operator<
   TSentryRole role_a;
   role_a.__set_roleName("a");
@@ -49,10 +61,17 @@ TEST(ThriftOperatorsTest, TestOperatorLt) {
   TSentryRole role_b;
   role_b.__set_roleName("b");
 
-  NO_FATALS(AssertCompareRequirements(role_a, role_b));
-  set<TSentryRole> roles { role_a, role_b };
-  ASSERT_EQ(2, roles.size()) << roles;
+  TSentryRole role_without_name;
+  role_without_name.__set_grantorPrincipal("grantor");
 
+  NO_FATALS(AssertCompareRequirements(role_a, role_b));
+  NO_FATALS(AssertCompareRequirements(role_a, role_without_name));
+  vector<TSentryRole> ordered_roles { role_without_name, role_a, role_b };
+  set<TSentryRole> roles(ordered_roles.begin(), ordered_roles.end());
+  NO_FATALS(AssertContainersOrdered(ordered_roles, roles));
+}
+
+TEST(ThriftOperatorsTest, TestGroupOperatorLt) {
   // TSentryGroup::operator<
   TSentryGroup group_a;
   group_a.__set_groupName("a");
@@ -61,12 +80,16 @@ TEST(ThriftOperatorsTest, TestOperatorLt) {
   group_b.__set_groupName("b");
 
   NO_FATALS(AssertCompareRequirements(group_a, group_b));
-  set<TSentryGroup> groups { group_a, group_b };
-  ASSERT_EQ(2, groups.size()) << groups;
+  vector<TSentryGroup> ordered_groups { group_a, group_b };
+  set<TSentryGroup> groups(ordered_groups.begin(), ordered_groups.end());
+  NO_FATALS(AssertContainersOrdered(ordered_groups, groups));
+}
 
+TEST(ThriftOperatorsTest, TestPrivilegeOperatorLt) {
   // TSentryPrivilege::operator<
   const string kServer = "server1";
   const string kDatabase = "db1";
+  const string kTable = "tbl1";
 
   TSentryPrivilege db_priv;
   db_priv.__set_serverName(kServer);
@@ -75,7 +98,11 @@ TEST(ThriftOperatorsTest, TestOperatorLt) {
   TSentryPrivilege tbl1_priv;
   tbl1_priv.__set_serverName(kServer);
   tbl1_priv.__set_dbName(kDatabase);
-  tbl1_priv.__set_tableName("tbl1");
+  tbl1_priv.__set_tableName(kTable);
+
+  TSentryPrivilege tbl1_priv_no_db;
+  tbl1_priv_no_db.__set_serverName(kServer);
+  tbl1_priv_no_db.__set_tableName(kTable);
 
   TSentryPrivilege tbl2_priv;
   tbl2_priv.__set_serverName(kServer);
@@ -84,11 +111,17 @@ TEST(ThriftOperatorsTest, TestOperatorLt) {
 
   NO_FATALS(AssertCompareRequirements(db_priv, tbl1_priv));
   NO_FATALS(AssertCompareRequirements(db_priv, tbl2_priv));
+  NO_FATALS(AssertCompareRequirements(db_priv, tbl1_priv_no_db));
   NO_FATALS(AssertCompareRequirements(tbl1_priv, tbl2_priv));
-  set<TSentryPrivilege> privileges { db_priv, tbl1_priv, tbl2_priv };
-  ASSERT_EQ(3, privileges.size()) << privileges;
+  vector<TSentryPrivilege> ordered_privileges { tbl1_priv_no_db, db_priv, tbl1_priv, tbl2_priv };
+  set<TSentryPrivilege> privileges(ordered_privileges.begin(), ordered_privileges.end());
+  NO_FATALS(AssertContainersOrdered(ordered_privileges, privileges));
+}
 
+TEST(ThriftOperatorsTest, TestAuthorizableOperatorLt) {
   // TSentryAuthorizable::operator<
+  const string kServer = "server1";
+  const string kDatabase = "db1";
   TSentryAuthorizable db_authorizable;
   db_authorizable.__set_server(kServer);
   db_authorizable.__set_db(kDatabase);
@@ -103,10 +136,29 @@ TEST(ThriftOperatorsTest, TestOperatorLt) {
   tbl2_authorizable.__set_db(kDatabase);
   tbl2_authorizable.__set_table("tbl2");
 
+  TSentryAuthorizable server_authorizable;
+  server_authorizable.__set_server("server2");
+
+  TSentryAuthorizable uri_authorizable;
+  uri_authorizable.__set_server(kServer);
+  uri_authorizable.__set_uri("http://uri");
+
+  NO_FATALS(AssertCompareRequirements(server_authorizable, db_authorizable));
+  NO_FATALS(AssertCompareRequirements(uri_authorizable, db_authorizable));
   NO_FATALS(AssertCompareRequirements(db_authorizable, tbl1_authorizable));
   NO_FATALS(AssertCompareRequirements(db_authorizable, tbl2_authorizable));
   NO_FATALS(AssertCompareRequirements(tbl1_authorizable, tbl2_authorizable));
-  set<TSentryAuthorizable> authorizables { db_authorizable, tbl1_authorizable, tbl2_authorizable };
-  ASSERT_EQ(3, authorizables.size()) << authorizables;
+  vector<TSentryAuthorizable> ordered_authorizables {
+      db_authorizable,
+      tbl1_authorizable,
+      tbl2_authorizable,
+      uri_authorizable,
+      server_authorizable,
+  };
+  set<TSentryAuthorizable> authorizables(
+      ordered_authorizables.begin(), ordered_authorizables.end());
+  ASSERT_EQ(5, authorizables.size()) << authorizables;
+  NO_FATALS(AssertContainersOrdered(ordered_authorizables, authorizables));
 }
+
 } // namespace sentry

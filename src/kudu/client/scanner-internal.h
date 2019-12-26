@@ -85,9 +85,13 @@ struct ScanRpcStatus {
     // on other hosts.
     RPC_DEADLINE_EXCEEDED,
 
-    // The authentication token supplied by the client is invalid. Most likely,
-    // the token has expired.
+    // The authentication token supplied by the client is invalid. The token
+    // has likely expired.
     RPC_INVALID_AUTHENTICATION_TOKEN,
+
+    // The authorization token supplied by the client is invalid. The token has
+    // likely expired.
+    RPC_INVALID_AUTHORIZATION_TOKEN,
 
     // The requestor was not authorized to make the request.
     SCAN_NOT_AUTHORIZED,
@@ -311,6 +315,9 @@ class KuduScanBatch::Data {
         << row_format_flags_;
     DCHECK_GE(idx, 0);
     DCHECK_LT(idx, num_rows());
+    if (direct_data_.empty()) {
+      return KuduRowResult(projection_, nullptr);
+    }
     int offset = idx * projected_row_size_;
     return KuduRowResult(projection_, &direct_data_[offset]);
   }

@@ -25,7 +25,6 @@
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #include "kudu/cfile/block_cache.h"
@@ -34,11 +33,15 @@
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/raft_consensus.h"
+#include "kudu/fs/error_manager.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/bind.h"
 #include "kudu/gutil/bind_helpers.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/catalog_manager.h"
+#include "kudu/master/location_cache.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/master_cert_authority.h"
@@ -54,7 +57,6 @@
 #include "kudu/tserver/tablet_copy_service.h"
 #include "kudu/tserver/tablet_service.h"
 #include "kudu/util/flag_tags.h"
-#include "kudu/util/flag_validators.h"
 #include "kudu/util/maintenance_manager.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
@@ -85,8 +87,14 @@ DEFINE_int64(authz_token_validity_seconds, 60 * 5,
              "validity period expires.");
 TAG_FLAG(authz_token_validity_seconds, experimental);
 
-DECLARE_bool(hive_metastore_sasl_enabled);
-DECLARE_string(keytab_file);
+DEFINE_string(location_mapping_cmd, "",
+              "A Unix command which takes a single argument, the IP address or "
+              "hostname of a tablet server or client, and returns the location "
+              "string for the tablet server. A location string begins with a / "
+              "and consists of /-separated tokens each of which contains only "
+              "characters from the set [a-zA-Z0-9_-.]. If the cluster is not "
+              "using location awareness features this flag should not be set.");
+
 
 using std::min;
 using std::shared_ptr;
@@ -94,6 +102,7 @@ using std::string;
 using std::vector;
 
 using kudu::consensus::RaftPeerPB;
+using kudu::fs::ErrorHandlerType;
 using kudu::rpc::ServiceIf;
 using kudu::security::TokenSigner;
 using kudu::tserver::ConsensusServiceImpl;
@@ -103,43 +112,22 @@ using strings::Substitute;
 namespace kudu {
 namespace master {
 
-namespace {
-// Validates that if the HMS is configured with SASL enabled, the server has a
-// keytab available. This is located in master.cc because the HMS module (where
-// --hive_metastore_sasl_enabled is defined) doesn't link to the server module
-// (where --keytab_file is defined), and vice-versa. The master module is the
-// first module which links to both.
-bool ValidateHiveMetastoreSaslEnabled() {
-  if (FLAGS_hive_metastore_sasl_enabled && FLAGS_keytab_file.empty()) {
-    LOG(ERROR) << "When the Hive Metastore has SASL enabled "
-                  "(--hive_metastore_sasl_enabled), Kudu must be configured with "
-                  "a keytab (--keytab_file).";
-    return false;
-  }
-  return true;
-}
-GROUP_FLAG_VALIDATOR(hive_metastore_sasl_enabled, ValidateHiveMetastoreSaslEnabled);
-} // anonymous namespace
-
 Master::Master(const MasterOptions& opts)
   : KuduServer("Master", opts, "kudu.master"),
     state_(kStopped),
-    ts_manager_(new TSManager(metric_entity_)),
     catalog_manager_(new CatalogManager(this)),
     path_handlers_(new MasterPathHandlers(this)),
     opts_(opts),
     registration_initialized_(false) {
+  const auto& location_cmd = FLAGS_location_mapping_cmd;
+  if (!location_cmd.empty()) {
+    location_cache_.reset(new LocationCache(location_cmd, metric_entity_.get()));
+  }
+  ts_manager_.reset(new TSManager(location_cache_.get(), metric_entity_));
 }
 
 Master::~Master() {
   CHECK_NE(kRunning, state_);
-}
-
-string Master::ToString() const {
-  if (state_ != kRunning) {
-    return "Master (stopped)";
-  }
-  return strings::Substitute("Master@$0", first_rpc_address().ToString());
 }
 
 Status Master::Init() {
@@ -182,14 +170,19 @@ Status Master::Start() {
 
 Status Master::StartAsync() {
   CHECK_EQ(kInitialized, state_);
+  fs_manager_->SetErrorNotificationCb(ErrorHandlerType::DISK_ERROR,
+                                      Bind(&Master::CrashMasterOnDiskError, Unretained(this)));
+  fs_manager_->SetErrorNotificationCb(ErrorHandlerType::CFILE_CORRUPTION,
+                                      Bind(&Master::CrashMasterOnCFileCorruption,
+                                           Unretained(this)));
 
   RETURN_NOT_OK(maintenance_manager_->Start());
 
   gscoped_ptr<ServiceIf> impl(new MasterServiceImpl(this));
-  gscoped_ptr<ServiceIf> consensus_service(new ConsensusServiceImpl(
-      this, catalog_manager_.get()));
-  gscoped_ptr<ServiceIf> tablet_copy_service(new TabletCopyServiceImpl(
-      this, catalog_manager_.get()));
+  gscoped_ptr<ServiceIf> consensus_service(
+      new ConsensusServiceImpl(this, catalog_manager_.get()));
+  gscoped_ptr<ServiceIf> tablet_copy_service(
+      new TabletCopyServiceImpl(this, catalog_manager_.get()));
 
   RETURN_NOT_OK(RegisterService(std::move(impl)));
   RETURN_NOT_OK(RegisterService(std::move(consensus_service)));
@@ -202,7 +195,6 @@ Status Master::StartAsync() {
   // Start initializing the catalog manager.
   RETURN_NOT_OK(init_pool_->SubmitClosure(Bind(&Master::InitCatalogManagerTask,
                                                Unretained(this))));
-
   state_ = kRunning;
 
   return Status::OK();
@@ -252,8 +244,8 @@ Status Master::WaitUntilCatalogManagerIsLeaderAndReadyForTests(const MonoDelta& 
 
 void Master::Shutdown() {
   if (state_ == kRunning) {
-    string name = ToString();
-    LOG(INFO) << name << " shutting down...";
+    const string name = rpc_server_->ToString();
+    LOG(INFO) << "Master@" << name << " shutting down...";
 
     // 1. Stop accepting new RPCs.
     UnregisterAllServices();
@@ -261,10 +253,12 @@ void Master::Shutdown() {
     // 2. Shut down the master's subsystems.
     maintenance_manager_->Shutdown();
     catalog_manager_->Shutdown();
+    fs_manager_->UnsetErrorNotificationCb(ErrorHandlerType::DISK_ERROR);
+    fs_manager_->UnsetErrorNotificationCb(ErrorHandlerType::CFILE_CORRUPTION);
 
     // 3. Shut down generic subsystems.
     KuduServer::Shutdown();
-    LOG(INFO) << name << " shutdown complete.";
+    LOG(INFO) << "Master@" << name << " shutdown complete.";
   }
   state_ = kStopped;
 }
@@ -293,6 +287,7 @@ Status Master::InitMasterRegistration() {
     reg.set_https_enabled(web_server()->IsSecure());
   }
   reg.set_software_version(VersionInfo::GetVersionInfo());
+  reg.set_start_time(start_time_);
 
   registration_.Swap(&reg);
   registration_initialized_.store(true);
@@ -300,9 +295,17 @@ Status Master::InitMasterRegistration() {
   return Status::OK();
 }
 
+void Master::CrashMasterOnDiskError(const string& uuid) {
+  LOG(FATAL) << Substitute("Disk error detected on data directory $0", uuid);
+}
+
+void Master::CrashMasterOnCFileCorruption(const string& tablet_id) {
+  LOG(FATAL) << Substitute("CFile corruption detected on system catalog $0", tablet_id);
+}
+
 namespace {
 
-// TODO this method should be moved to a separate class (along with
+// TODO(Alex Feinberg) this method should be moved to a separate class (along with
 // ListMasters), so that it can also be used in TS and client when
 // bootstrapping.
 Status GetMasterEntryForHost(const shared_ptr<rpc::Messenger>& messenger,
@@ -327,7 +330,7 @@ Status GetMasterEntryForHost(const shared_ptr<rpc::Messenger>& messenger,
 
 } // anonymous namespace
 
-Status Master::ListMasters(std::vector<ServerEntryPB>* masters) const {
+Status Master::ListMasters(vector<ServerEntryPB>* masters) const {
   if (!opts_.IsDistributed()) {
     ServerEntryPB local_entry;
     local_entry.mutable_instance_id()->CopyFrom(catalog_manager_->NodeInstance());
@@ -370,7 +373,7 @@ Status Master::ListMasters(std::vector<ServerEntryPB>* masters) const {
   return Status::OK();
 }
 
-Status Master::GetMasterHostPorts(std::vector<HostPortPB>* hostports) const {
+Status Master::GetMasterHostPorts(vector<HostPortPB>* hostports) const {
   auto consensus = catalog_manager_->master_consensus();
   if (!consensus) {
     return Status::IllegalState("consensus not running");

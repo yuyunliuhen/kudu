@@ -1,19 +1,19 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 package org.apache.kudu.spark.kudu
 
@@ -26,6 +26,7 @@ import org.apache.kudu.test.KuduTestHarness.TabletServerConfig
 import org.apache.spark.SparkException
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Row
+import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class KuduRDDTest extends KuduTestSuite {
@@ -34,7 +35,8 @@ class KuduRDDTest extends KuduTestSuite {
   def testCollectRows() {
     insertRows(table, 100)
     val rdd = kuduContext.kuduRDD(ss.sparkContext, tableName, List("key"))
-    assert(rdd.collect.length == 100)
+    assertEquals(100, rdd.collect().length)
+    assertEquals(100L, rdd.asInstanceOf[KuduRDD].rowsRead.value)
   }
 
   @Test
@@ -46,7 +48,7 @@ class KuduRDDTest extends KuduTestSuite {
     ))
   def testKeepAlive() {
     val rowCount = 500
-    val shortScannerTtlMs = 5000
+    val shortScannerTtlMs = 5000L
 
     // Create a simple table with a single partition.
     val tableName = "testKeepAlive"
@@ -80,7 +82,7 @@ class KuduRDDTest extends KuduTestSuite {
         // a new scan request. It also ensures a single row doesn't go
         // longer than the ttl.
         if (i < 5) {
-          Thread.sleep(shortScannerTtlMs / 2) // Sleep for half the ttl.
+          Thread.sleep(shortScannerTtlMs / 2L) // Sleep for half the ttl.
           i = i + 1
         }
       }
@@ -93,7 +95,7 @@ class KuduRDDTest extends KuduTestSuite {
       List("key"),
       KuduReadOptions(
         batchSize = 100, // Set a small batch size so the first scan doesn't read all the rows.
-        keepAlivePeriodMs = shortScannerTtlMs / 4)
+        keepAlivePeriodMs = shortScannerTtlMs / 4L)
     )
     processRDD(goodRdd)
 
@@ -104,7 +106,7 @@ class KuduRDDTest extends KuduTestSuite {
       List("key"),
       KuduReadOptions(
         batchSize = 100, // Set a small batch size so the first scan doesn't read all the rows.
-        keepAlivePeriodMs = shortScannerTtlMs * 2)
+        keepAlivePeriodMs = shortScannerTtlMs * 2L)
     )
     try {
       processRDD(badRdd)

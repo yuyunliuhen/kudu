@@ -28,7 +28,6 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #include "kudu/clock/clock.h"
@@ -43,6 +42,7 @@
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/strcat.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/walltime.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/remote_user.h"
 #include "kudu/rpc/result_tracker.h"
@@ -73,9 +73,13 @@
 #include "kudu/util/metrics.h"
 #include "kudu/util/minidump.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
+#ifdef TCMALLOC_ENABLED
+#include "kudu/util/process_memory.h"
+#endif
 #include "kudu/util/slice.h"
 #include "kudu/util/spinlock_profiling.h"
 #include "kudu/util/thread.h"
@@ -127,7 +131,6 @@ TAG_FLAG(principal, experimental);
 // as a different one would end up with a cluster that can't be connected to.
 // See KUDU-1884.
 TAG_FLAG(principal, unsafe);
-
 
 DEFINE_string(keytab_file, "",
               "Path to the Kerberos Keytab file for this server. Specifying a "
@@ -204,7 +207,17 @@ DEFINE_int32(rpc_default_keepalive_time_ms, 65000,
              "always alive.");
 TAG_FLAG(rpc_default_keepalive_time_ms, advanced);
 
+DEFINE_uint64(gc_tcmalloc_memory_interval_seconds, 30,
+             "Interval seconds to GC tcmalloc memory, 0 means disabled.");
+TAG_FLAG(gc_tcmalloc_memory_interval_seconds, advanced);
+TAG_FLAG(gc_tcmalloc_memory_interval_seconds, runtime);
+
 DECLARE_bool(use_hybrid_clock);
+DECLARE_int32(dns_resolver_max_threads_num);
+DECLARE_uint32(dns_resolver_cache_capacity_mb);
+DECLARE_uint32(dns_resolver_cache_ttl_sec);
+
+METRIC_DECLARE_gauge_size(merged_entities_count_of_server);
 
 using kudu::security::RpcAuthentication;
 using kudu::security::RpcEncryption;
@@ -354,8 +367,14 @@ ServerBase::ServerBase(string name, const ServerBaseOptions& options,
       result_tracker_(new rpc::ResultTracker(shared_ptr<MemTracker>(
           MemTracker::CreateTracker(-1, "result-tracker", mem_tracker_)))),
       is_first_run_(false),
+      dns_resolver_(new DnsResolver(
+          FLAGS_dns_resolver_max_threads_num,
+          FLAGS_dns_resolver_cache_capacity_mb * 1024 * 1024,
+          MonoDelta::FromSeconds(FLAGS_dns_resolver_cache_ttl_sec))),
       options_(options),
       stop_background_threads_latch_(1) {
+  METRIC_merged_entities_count_of_server.InstantiateHidden(metric_entity_, 1);
+
   FsManagerOpts fs_opts;
   fs_opts.metric_entity = metric_entity_;
   fs_opts.parent_mem_tracker = mem_tracker_;
@@ -428,16 +447,13 @@ Status ServerBase::Init() {
 
   fs::FsReport report;
   Status s = fs_manager_->Open(&report);
+  // No instance files existed. Try creating a new FS layout.
   if (s.IsNotFound()) {
     LOG(INFO) << "Could not load existing FS layout: " << s.ToString();
     LOG(INFO) << "Attempting to create new FS layout instead";
     is_first_run_ = true;
     s = fs_manager_->CreateInitialFileSystemLayout();
     if (s.IsAlreadyPresent()) {
-      // The operator is likely trying to start up with an extra entry in their
-      // `fs_data_dirs` configuration.
-      LOG(INFO) << "To start Kudu with a different FS layout, the `kudu fs "
-                   "update_dirs` tool must be run first";
       return s.CloneAndPrepend("FS layout already exists; not overwriting existing layout");
     }
     RETURN_NOT_OK_PREPEND(s, "Could not create new FS layout");
@@ -483,6 +499,9 @@ Status ServerBase::Init() {
 
   result_tracker_->StartGCThread();
   RETURN_NOT_OK(StartExcessLogFileDeleterThread());
+#ifdef TCMALLOC_ENABLED
+  RETURN_NOT_OK(StartTcmallocMemoryGcThread());
+#endif
 
   return Status::OK();
 }
@@ -566,9 +585,12 @@ void ServerBase::LogUnauthorizedAccess(rpc::RpcContext* rpc) const {
                << " from " << rpc->requestor_string();
 }
 
+bool ServerBase::IsFromSuperUser(const rpc::RpcContext* rpc) {
+  return superuser_acl_.UserAllowed(rpc->remote_user().username());
+}
+
 bool ServerBase::Authorize(rpc::RpcContext* rpc, uint32_t allowed_roles) {
-  if ((allowed_roles & SUPER_USER) &&
-      superuser_acl_.UserAllowed(rpc->remote_user().username())) {
+  if ((allowed_roles & SUPER_USER) && IsFromSuperUser(rpc)) {
     return true;
   }
 
@@ -627,7 +649,6 @@ Status ServerBase::StartMetricsLogging() {
   return Status::OK();
 }
 
-
 Status ServerBase::StartExcessLogFileDeleterThread() {
   // Try synchronously deleting excess log files once at startup to make sure it
   // works, then start a background thread to continue deleting them in the
@@ -651,6 +672,25 @@ void ServerBase::ExcessLogFileDeleterThread() {
                 "Unable to delete excess minidump files");
   }
 }
+
+#ifdef TCMALLOC_ENABLED
+Status ServerBase::StartTcmallocMemoryGcThread() {
+  return Thread::Create("server", "tcmalloc-memory-gc", &ServerBase::TcmallocMemoryGcThread,
+                        this, &tcmalloc_memory_gc_thread_);
+}
+
+void ServerBase::TcmallocMemoryGcThread() {
+  MonoDelta check_interval;
+  do {
+    // If GC is disabled, wake up every 60 seconds anyway to recheck the value of the flag.
+    check_interval = MonoDelta::FromSeconds(FLAGS_gc_tcmalloc_memory_interval_seconds > 0
+      ? FLAGS_gc_tcmalloc_memory_interval_seconds : 60);
+    if (FLAGS_gc_tcmalloc_memory_interval_seconds > 0) {
+      kudu::process_memory::GcTcmalloc();
+    }
+  } while (!stop_background_threads_latch_.WaitFor(check_interval));
+}
+#endif
 
 std::string ServerBase::FooterHtml() const {
   return Substitute("<pre>$0\nserver uuid $1</pre>",
@@ -679,6 +719,8 @@ Status ServerBase::Start() {
                           "Failed to dump server info to " + options_.dump_info_path);
   }
 
+  start_time_ = WallTime_Now();
+
   return Status::OK();
 }
 
@@ -704,6 +746,11 @@ void ServerBase::Shutdown() {
   if (excess_log_deleter_thread_) {
     excess_log_deleter_thread_->Join();
   }
+#ifdef TCMALLOC_ENABLED
+  if (tcmalloc_memory_gc_thread_) {
+    tcmalloc_memory_gc_thread_->Join();
+  }
+#endif
 }
 
 void ServerBase::UnregisterAllServices() {

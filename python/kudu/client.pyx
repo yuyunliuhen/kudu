@@ -85,7 +85,8 @@ cdef dict _type_names = {
     KUDU_DOUBLE : "KUDU_DOUBLE",
     KUDU_BINARY : "KUDU_BINARY",
     KUDU_UNIXTIME_MICROS : "KUDU_UNIXTIME_MICROS",
-    KUDU_DECIMAL : "KUDU_DECIMAL"
+    KUDU_DECIMAL : "KUDU_DECIMAL",
+    KUDU_VARCHAR : "KUDU_VARCHAR"
 }
 
 # Range Partition Bound Type enums
@@ -290,10 +291,11 @@ cdef class Client:
         # whether _ssl is present, and if we can import it, we disable
         # Kudu's initialization to avoid a conflict.
         try:
-          import _ssl
-          DisableOpenSSLInitialization()
+            import _ssl
         except:
-          pass
+            pass
+        else:
+            check_status(DisableOpenSSLInitialization())
 
         if isinstance(addr_or_addrs, six.string_types):
             addr_or_addrs = [addr_or_addrs]
@@ -1544,6 +1546,12 @@ cdef class Row:
         scale = self.parent.batch.projection_schema().Column(i).type_attributes().scale()
         return from_unscaled_decimal(self.__get_unscaled_decimal(i), scale)
 
+    cdef inline get_varchar(self, int i):
+        cdef Slice val
+        check_status(self.row.GetVarchar(i, &val))
+        return cpython.PyBytes_FromStringAndSize(<char*> val.mutable_data(),
+                                                 val.size())
+
     cdef inline get_slot(self, int i):
         cdef:
             Status s
@@ -1571,6 +1579,8 @@ cdef class Row:
             return from_unixtime_micros(self.get_unixtime_micros(i))
         elif t == KUDU_DECIMAL:
             return self.get_decimal(i)
+        elif t == KUDU_VARCHAR:
+            return frombytes(self.get_varchar(i))
         else:
             raise TypeError("Cannot get kudu type <{0}>"
                                 .format(_type_names[t]))
@@ -2769,6 +2779,11 @@ cdef class PartialRow:
 
             slc = Slice(<char*> value, len(value))
             check_status(self.row.SetBinaryCopy(i, slc))
+        elif t == KUDU_VARCHAR:
+            if isinstance(value, unicode):
+                value = value.encode('utf8')
+            slc = Slice(<char*> value, len(value))
+            check_status(self.row.SetVarchar(i, slc))
         elif t == KUDU_UNIXTIME_MICROS:
             check_status(self.row.SetUnixTimeMicros(i, <int64_t>
                 to_unixtime_micros(value)))
@@ -2882,6 +2897,8 @@ cdef inline cast_pyvalue(DataType t, object o):
     elif t == KUDU_UNIXTIME_MICROS:
         return UnixtimeMicrosVal(o)
     elif t == KUDU_BINARY:
+        return StringVal(o)
+    elif t == KUDU_VARCHAR:
         return StringVal(o)
     else:
         raise TypeError("Cannot cast kudu type <{0}>".format(_type_names[t]))
